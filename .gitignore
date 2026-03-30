@@ -9,6 +9,11 @@ outputs/
 # Local user workspaces.
 workspace/
 
+# Local profile artifacts.
+test/*.sqlite
+test/*.sqlite3
+test/*.nsys-rep
+
 # Python cache and build artifacts.
 __pycache__/
 *.py[cod]
