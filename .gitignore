@@ -1,0 +1,27 @@
+.DS_Store
+
+# Local reference project; do not publish as part of this repo.
+nsys-ai/
+
+# Generated analysis outputs.
+outputs/
+
+# Local user workspaces.
+workspace/
+
+# Python cache and build artifacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Virtual environments and editor state.
+.venv/
+venv/
+.python-version
+.vscode/
+.idea/
