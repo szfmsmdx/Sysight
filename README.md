@@ -14,14 +14,14 @@ The normal usage is conversational: put a profile file into the project, then as
 
 - Torch-first analysis for training and inference profiles
 - SQLite-based analysis pipeline with low-context, skill-oriented decomposition
-- Upstream-inspired analysis coverage without carrying over the heavy web-first surface area
+- Agent-oriented analysis backend focused on concise findings, attribution hints, and follow-up actions
 - Built-in skills for kernel hotspots, iteration timing, idle gaps, launch overhead, memory transfers, NCCL anomalies, overlap, NVTX attribution, code-location hints, MFU, and theoretical FLOPs
 - Markdown and JSON outputs that are easy to hand off to a follow-up agent or investigation step
 - Early multi-worker orchestration demo for running several analysis tasks in parallel
 
 ## Current Status
 
-The repository is currently focused on the analysis backend: lightweight profile inspection, skill-oriented analysis, MFU/FLOPs helpers, and report generation on top of Nsight Systems data. The goal is to stay close to the useful analysis functionality in `nsys-ai` without inheriting its heavier web/TUI/chat surface by default. Automated profiling around user projects, a more natural agent-facing interaction loop, and deeper investigation workflows are still roadmap items.
+The repository is currently focused on the analysis backend: lightweight profile inspection, skill-oriented analysis, MFU/FLOPs helpers, and report generation on top of Nsight Systems data. Automated profiling around user projects, a more natural agent-facing interaction loop, and deeper investigation workflows are still roadmap items.
 
 ## Quick Start
 
@@ -39,30 +39,83 @@ or:
 帮我分析一下 /abs/path/to/profile.sqlite
 ```
 
+or hand it an Nsight Systems capture directly:
+
+```text
+帮我分析一下 test/basemodel_8gpu.nsys-rep
+```
+
 3. The agent will run the analysis backend automatically and return a short terminal report with three sections:
 
 - `结论`
 - `问题`
 - `下一步行动建议`
 
-4. At the same time, it will generate a full Markdown report under `outputs/`, for example:
+4. Accepted input files are:
+
+- `*.sqlite`
+- `*.sqlite3`
+- `*.nsys-rep`
+
+5. If the input is `*.nsys-rep`, Sysight will first try to export a sibling `*.sqlite` automatically by running:
+
+```bash
+nsys export --type=sqlite -o <same-stem>.sqlite --force-overwrite=true <file.nsys-rep>
+```
+
+This requires `nsys` on `PATH`. If `nsys` is not available, export manually first or use the helper script:
+
+```bash
+scripts/export-nsys-sqlite.sh path/to/profile.nsys-rep
+```
+
+6. At the same time, Sysight will generate analysis artifacts, for example:
 
 ```text
+<profile>.sqlite                 # only when input was .nsys-rep and conversion was needed
 outputs/<profile>.report.md
+outputs/<profile>.findings.json
 ```
 
 ## Agent Workflow
 
 The intended product direction is agent-first.
 
-In this repository, the main path is:
+At the moment, the agent workflow is split into two paths:
+
+1. `profile-only`: the user provides a `.sqlite` / `.sqlite3` / `.nsys-rep` path, and Sysight runs analysis directly
+2. `workspace-aware`: the user also provides a `workspace/` plus a `program.md` contract so the agent can interpret findings with project entrypoints, performance goals, important paths, and constraints
+
+The normal main path in this repository is therefore:
 
 1. The user provides a profile path in natural language
-2. The agent invokes the analysis backend automatically
-3. The agent returns `结论 / 问题 / 下一步行动建议`
-4. Sysight writes a complete `report.md` report for deeper follow-up
+2. The agent optionally resolves the workflow mode from `profile + workspace + program.md`
+3. The agent invokes the analysis backend automatically
+4. The agent returns `结论 / 问题 / 下一步行动建议`
+5. Sysight writes a complete `report.md` report for deeper follow-up
 
 The CLI is therefore an internal execution surface, not the primary user interface.
+
+### Recommended Path
+
+- Start with `profile-only` when the user only has a profile artifact and wants a fast analysis report.
+- Upgrade to `workspace-aware` when the user can also provide `workspace/program.md` and wants stronger project-aware attribution.
+- Keep the current priority simple: `analyze`/`report` first, deeper profiling and optimization loops later.
+
+### Workspace Contract
+
+If the user wants workspace-aware analysis, place a `program.md` file under `workspace/`. A starter template now lives at `workspace/program.md`.
+
+The current template asks the user to fill in:
+
+- task and project background
+- framework / stack
+- entry command
+- performance goal
+- important paths
+- constraints
+- success criteria
+- output contract
 
 ## Backend Commands
 
@@ -71,7 +124,11 @@ When debugging the backend itself, run commands directly from the repository roo
 ```bash
 PYTHONPATH=src python3 -m sysight --help
 PYTHONPATH=src python3 -m sysight analyze path/to/profile.sqlite
+PYTHONPATH=src python3 -m sysight analyze path/to/profile.sqlite --workspace workspace --program program.md
+PYTHONPATH=src python3 -m sysight route --profile path/to/profile.sqlite --workspace workspace --program program.md
 PYTHONPATH=src python3 -m sysight skill list
+PYTHONPATH=src python3 -m sysight skill run workflow_router path/to/profile.sqlite --workspace workspace --program program.md
+scripts/export-nsys-sqlite.sh path/to/profile.nsys-rep
 ```
 
 ## Repository Layout
@@ -87,13 +144,13 @@ sysight/
 ├── skills/                      # Internal skill notes and workflow docs
 ├── test/                        # Local-only test inputs
 ├── outputs/                     # Generated analysis artifacts
-└── workspace/                   # User project workspace
+└── workspace/                   # User workspace, including program.md contract template
 ```
 
 ## Roadmap
 
 - [ ] Add a profiling stage that can wrap real Torch entrypoints and produce standard Nsight Systems captures
-- [ ] Improve project understanding for user codebases, including entrypoints, modules, and data paths
+- [ ] Strengthen workspace-aware analysis around `program.md`, project entrypoints, modules, and data paths
 - [ ] Strengthen NVTX conventions and attribution quality
 - [ ] Add investigation workflows built around `ncu`, targeted benchmarks, and controlled reproductions
 - [ ] Support before/after profile comparison for optimization validation

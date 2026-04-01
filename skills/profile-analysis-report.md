@@ -39,13 +39,21 @@ scripts/run-profile-analysis.sh <profile-path> [gpu_id]
 这个脚本会：
 
 - 调用 `PYTHONPATH=src python3 -m sysight analyze`
+- 若输入是 `.nsys-rep`，会先触发底层自动导出同名 `.sqlite`
 - 在 `outputs/` 下生成 Markdown 报告
+- 可选生成 findings JSON
 - 在终端打印最终文件地址
 
 如果必须手动执行，则使用：
 
 ```bash
 PYTHONPATH=src python3 -m sysight analyze <profile-path> --markdown <markdown-path> --findings <findings-path>
+```
+
+如果只想先把 `.nsys-rep` 显式导出成 `.sqlite`，使用：
+
+```bash
+scripts/export-nsys-sqlite.sh <profile.nsys-rep> [output.sqlite]
 ```
 
 ### 3. 读取结果
@@ -55,6 +63,8 @@ PYTHONPATH=src python3 -m sysight analyze <profile-path> --markdown <markdown-pa
 - 终端分析输出中的核心结论
 - Markdown 报告中的“存在问题 / 下一步行动指南”
 - 生成的 `report.md` 绝对路径
+
+如果输入是 `.nsys-rep` 且发生了自动转换，还应留意对应的 `.sqlite` 路径，便于后续复用。
 
 ### 4. 回复用户
 
@@ -105,6 +115,8 @@ PYTHONPATH=src python3 -m sysight analyze <profile-path> --markdown <markdown-pa
 ```bash
 scripts/run-profile-analysis.sh test/basemodel_8gpu.sqlite
 scripts/run-profile-analysis.sh test/basemodel_8gpu.sqlite 0
+scripts/run-profile-analysis.sh test/basemodel_8gpu.nsys-rep
+scripts/export-nsys-sqlite.sh test/basemodel_8gpu.nsys-rep
 ```
 
 ## 示例回复骨架

@@ -9,8 +9,9 @@ test/
 # Generated analysis outputs.
 outputs/
 
-# Local user workspaces.
-workspace/
+# Local user workspaces. Keep the contract template, ignore everything else.
+workspace/*
+!workspace/program.md
 
 # Local scratch notes.
 tmp_memory.md

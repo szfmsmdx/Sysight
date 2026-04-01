@@ -8,6 +8,7 @@ from .report import (
     format_summary,
     run_analysis,
 )
+from sysight.workflow import format_workflow_route, resolve_workflow_route
 
 __all__ = [
     "build_evidence_report",
@@ -16,4 +17,6 @@ __all__ = [
     "format_info",
     "format_summary",
     "run_analysis",
+    "format_workflow_route",
+    "resolve_workflow_route",
 ]

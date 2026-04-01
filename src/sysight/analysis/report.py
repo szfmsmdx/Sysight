@@ -156,6 +156,9 @@ def _fleet_imbalance_summary(data: dict) -> str | None:
 
 def _conclusion_items(data: dict, findings: list[dict]) -> list[str]:
     items = [auto_commentary(data["target_summary"])]
+    workflow = data.get("workflow_route") or {}
+    if workflow.get("mode"):
+        items.append(f"当前 agent 工作流模式为 `{workflow['mode']}`：{workflow.get('summary', '')}")
     if findings:
         top = findings[0]
         items.append(f"首要问题模式是“{top['pattern']}”，当前证据为：{top['evidence']}")
@@ -173,9 +176,15 @@ def _conclusion_items(data: dict, findings: list[dict]) -> list[str]:
 def format_analysis_report(data: dict) -> str:
     """Format the analysis as a conversation-style terminal summary."""
     findings = _sorted_findings(data.get("root_causes", []))
+    workflow = data.get("workflow_route") or {}
     lines = ["结论"]
     for item in _conclusion_items(data, findings):
         lines.append(f"- {item}")
+
+    if workflow:
+        lines.extend(["", "工作流上下文"])
+        for item in _workflow_context_items(workflow):
+            lines.append(f"- {item}")
 
     lines.extend(["", "问题"])
     if findings:
@@ -226,6 +235,8 @@ def format_analysis_markdown(data: dict, profile_path: str | None = None) -> str
         else f"{data['target_range'][0] / 1e9:.3f}s - {data['target_range'][1] / 1e9:.3f}s"
     )
 
+    workflow = data.get("workflow_route") or {}
+
     lines = [
         "# Sysight 分析报告",
         "",
@@ -243,10 +254,15 @@ def format_analysis_markdown(data: dict, profile_path: str | None = None) -> str
     for item in _conclusion_items(data, findings):
         lines.append(f"- {item}")
 
+    if workflow:
+        lines.extend(["", "### 1.2 工作流上下文", ""])
+        for item in _workflow_context_items(workflow):
+            lines.append(f"- {item}")
+
     lines.extend(
         [
             "",
-            "### 1.2 全局概览",
+            "### 1.3 全局概览",
             "",
         ]
     )
@@ -273,13 +289,13 @@ def format_analysis_markdown(data: dict, profile_path: str | None = None) -> str
     lines.extend(
         [
             "",
-            "### 1.3 目标 GPU 摘要",
+            "### 1.4 目标 GPU 摘要",
             "",
             f"- 设备: `{target_summary['hardware']['name']}` / PCI `{target_summary['hardware']['pci_bus']}`",
             f"- 时间跨度: `{timing.get('span_ms', 0):.1f}ms`，Kernel 时间 `{timing.get('compute_ms', 0):.1f}ms`，Idle `{timing.get('idle_ms', 0):.1f}ms`",
             f"- 汇总判断: {auto_commentary(target_summary)}",
             "",
-            "### 1.4 Kernel 热点",
+            "### 1.5 Kernel 热点",
             "",
         ]
     )
@@ -303,7 +319,7 @@ def format_analysis_markdown(data: dict, profile_path: str | None = None) -> str
     else:
         lines.append("未发现可汇总的 kernel。")
 
-    lines.extend(["", "### 1.5 NVTX / 代码区域热点", ""])
+    lines.extend(["", "### 1.6 NVTX / 代码区域热点", ""])
     nvtx_rows = [
         [
             row.get("nvtx_path") or row.get("nvtx_region") or "(unnamed)",
@@ -325,7 +341,7 @@ def format_analysis_markdown(data: dict, profile_path: str | None = None) -> str
     else:
         lines.append("未检测到可归因的 NVTX 区域，当前代码定位将主要依赖 runtime + sampled stack。")
 
-    lines.extend(["", "### 1.6 通信、传输与同步", ""])
+    lines.extend(["", "### 1.7 通信、传输与同步", ""])
     if data["memory_transfers"]:
         transfer_rows = [
             [
@@ -363,7 +379,7 @@ def format_analysis_markdown(data: dict, profile_path: str | None = None) -> str
             f"({sync['pct_of_gpu_time']:.1f}% of GPU kernel time)，API = {', '.join(sync['api_names'])}"
         )
 
-    lines.extend(["", "### 1.7 Iteration 节奏", ""])
+    lines.extend(["", "### 1.8 Iteration 节奏", ""])
     if data["iterations_summary"]:
         summary = data["iterations_summary"]
         lines.append(
@@ -696,6 +712,40 @@ def _format_python_location(row: dict) -> str:
     return label
 
 
+def _workflow_context_items(workflow: dict) -> list[str]:
+    items: list[str] = []
+    mode = workflow.get("mode")
+    if mode:
+        items.append(f"模式: `{mode}`")
+    if workflow.get("workspace_root"):
+        items.append(f"Workspace: `{workflow['workspace_root']}`")
+    if workflow.get("program_path"):
+        items.append(f"Program 合同: `{workflow['program_path']}`")
+
+    contract = workflow.get("program_contract") or {}
+    if contract.get("task"):
+        items.append(f"任务: {contract['task']}")
+    if contract.get("framework"):
+        items.append(f"框架/技术栈: {contract['framework']}")
+    if contract.get("entry"):
+        items.append(f"启动方式: {contract['entry']}")
+    if contract.get("performance_goal"):
+        items.append(f"性能目标: {contract['performance_goal']}")
+    if contract.get("success_criteria"):
+        items.append(f"成功标准: {contract['success_criteria']}")
+    if contract.get("important_paths"):
+        items.append(
+            "关键路径: " + ", ".join(f"`{path}`" for path in contract["important_paths"][:4])
+        )
+    if contract.get("missing_sections"):
+        items.append(
+            "program.md 待补字段: " + ", ".join(f"`{field}`" for field in contract["missing_sections"])
+        )
+    for warning in workflow.get("warnings", [])[:2]:
+        items.append(f"提示: {warning}")
+    return items[:8]
+
+
 def _action_items(data: dict, findings: list[dict]) -> list[str]:
     actions = []
     for finding in findings:
@@ -709,6 +759,16 @@ def _action_items(data: dict, findings: list[dict]) -> list[str]:
         actions.append(
             "给训练/推理主循环补充稳定的 NVTX iteration marker，这样 iteration timing、layer breakdown 和问题定位会明显更稳定。"
         )
+
+    workflow = data.get("workflow_route") or {}
+    if workflow.get("mode") == "profile-only":
+        actions.append("如果后续需要把问题更稳定地映射到项目入口、模块和优化目标，补充 workspace/program.md 后再重跑一次分析。")
+    elif workflow.get("mode") == "workspace-aware":
+        contract = workflow.get("program_contract") or {}
+        if contract.get("entry"):
+            actions.append(f"结合 program.md 中的启动方式 `{contract['entry']}`，优先核对热点是否落在同一条主执行路径上。")
+        if contract.get("performance_goal"):
+            actions.append(f"后续优化阶段建议围绕 program.md 中的目标“{contract['performance_goal']}”来定义 before/after 对比口径。")
 
     deduped = []
     seen = set()

@@ -25,6 +25,7 @@ from .stream_concurrency import SKILL as STREAM_CONCURRENCY
 from .theoretical_flops import SKILL as THEORETICAL_FLOPS
 from .thread_utilization import SKILL as THREAD_UTILIZATION
 from .top_kernels import SKILL as TOP_KERNELS
+from .workflow_router import SKILL as WORKFLOW_ROUTER
 
 _SKILLS = {
     skill.name: skill
@@ -52,6 +53,7 @@ _SKILLS = {
         THEORETICAL_FLOPS,
         THREAD_UTILIZATION,
         TOP_KERNELS,
+        WORKFLOW_ROUTER,
     )
 }
 

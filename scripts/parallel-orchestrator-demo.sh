@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "Usage: $0 <profile.sqlite|profile.nsys-rep> [gpu_id]" >&2
+  echo "Usage: $0 <profile.sqlite|profile.sqlite3|profile.nsys-rep> [gpu_id]" >&2
   exit 1
 fi
 

@@ -12,6 +12,8 @@ from sysight.analysis import (
     format_analysis_report,
     format_info,
     format_summary,
+    format_workflow_route,
+    resolve_workflow_route,
     run_analysis,
 )
 from sysight.analysis.mfu import compute_theoretical_flops, format_region_mfu, format_theoretical_flops
@@ -87,15 +89,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     info = sub.add_parser("info", help="Show profile metadata")
-    info.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    info.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
 
     summary = sub.add_parser("summary", help="Show per-GPU summary")
-    summary.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    summary.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
     summary.add_argument("--gpu", type=int, default=None, help="Optional GPU device ID")
     _add_trim(summary)
 
     report = sub.add_parser("report", help="Generate markdown-oriented performance report")
-    report.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    report.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
     report.add_argument("--gpu", type=int, default=None, help="Target GPU device ID")
     report.add_argument(
         "--findings",
@@ -107,10 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to markdown report output. Defaults to outputs/<profile>.report.md",
     )
+    report.add_argument("--workspace", default=None, help="Optional workspace root")
+    report.add_argument(
+        "--program",
+        default="program.md",
+        help="Workspace contract file name or path. Defaults to program.md",
+    )
     _add_trim(report)
 
     analyze = sub.add_parser("analyze", help="Run lightweight analysis")
-    analyze.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    analyze.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
     analyze.add_argument("--gpu", type=int, default=None, help="Target GPU device ID")
     analyze.add_argument(
         "--findings",
@@ -122,6 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to markdown report output. Defaults to outputs/<profile>.report.md",
     )
+    analyze.add_argument("--workspace", default=None, help="Optional workspace root")
+    analyze.add_argument(
+        "--program",
+        default="program.md",
+        help="Workspace contract file name or path. Defaults to program.md",
+    )
     _add_trim(analyze)
 
     skill = sub.add_parser("skill", help="Run adapted built-in analysis skills")
@@ -132,8 +146,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     skill_run = skill_sub.add_parser("run", help="Run one built-in skill")
     skill_run.add_argument("skill_name", help="Skill name")
-    skill_run.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    skill_run.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
     skill_run.add_argument("--gpu", type=int, default=None, help="Target GPU device ID")
+    skill_run.add_argument(
+        "--workspace",
+        default=None,
+        help="Optional workspace root used by agent workflow-aware skills",
+    )
+    skill_run.add_argument(
+        "--program",
+        default="program.md",
+        help="Workspace contract file name or path. Defaults to program.md",
+    )
     skill_run.add_argument(
         "--arg",
         action="append",
@@ -145,22 +169,22 @@ def build_parser() -> argparse.ArgumentParser:
     skill_run.set_defaults(skill_action="run")
 
     overlap = sub.add_parser("overlap", help="Show compute/NCCL overlap breakdown")
-    overlap.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    overlap.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
     overlap.add_argument("--gpu", type=int, default=None, help="Target GPU device ID")
     _add_trim(overlap)
 
     nccl = sub.add_parser("nccl", help="Show NCCL collective breakdown")
-    nccl.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    nccl.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
     nccl.add_argument("--gpu", type=int, default=None, help="Target GPU device ID")
     _add_trim(nccl)
 
     iters = sub.add_parser("iters", help="Show per-iteration timing")
-    iters.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    iters.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
     iters.add_argument("--gpu", type=int, default=None, help="Target GPU device ID")
     _add_trim(iters)
 
     schema = sub.add_parser("schema", help="Inspect SQLite schema")
-    schema.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    schema.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
 
     theoretical_flops = sub.add_parser(
         "theoretical-flops", help="Compute theoretical FLOPs for transformer operations"
@@ -181,8 +205,17 @@ def build_parser() -> argparse.ArgumentParser:
     theoretical_flops.add_argument("--N", dest="n_dim", type=int, default=0, help="Linear N dim")
     theoretical_flops.add_argument("--K", dest="k_dim", type=int, default=0, help="Linear K dim")
 
+    route = sub.add_parser("route", help="Resolve the agent workflow mode from profile/workspace inputs")
+    route.add_argument("--profile", default=None, help="Optional path to .sqlite, .sqlite3, or .nsys-rep")
+    route.add_argument("--workspace", default=None, help="Optional workspace root")
+    route.add_argument(
+        "--program",
+        default="program.md",
+        help="Workspace contract file name or path. Defaults to program.md",
+    )
+
     region_mfu = sub.add_parser("region-mfu", help="Compute MFU for a named NVTX region or kernel")
-    region_mfu.add_argument("profile", help="Path to .sqlite or .nsys-rep")
+    region_mfu.add_argument("profile", help="Path to .sqlite, .sqlite3, or .nsys-rep")
     region_mfu.add_argument("--name", required=True, help="NVTX region text or kernel name")
     region_mfu.add_argument(
         "--theoretical-flops",
@@ -229,6 +262,12 @@ def _run_named_skill(args, skill_name: str) -> None:
 def _run_report_like(args, prof) -> None:
     trim = _parse_trim(args)
     data = run_analysis(prof, args.gpu, trim)
+    route = resolve_workflow_route(
+        profile_path=args.profile,
+        workspace_root=getattr(args, "workspace", None),
+        program_path=getattr(args, "program", None),
+    )
+    data["workflow_route"] = route.to_dict()
 
     markdown_path = _resolve_markdown_output(args.profile, args.gpu, args.markdown).resolve()
     requested_resolved = Path(args.profile).resolve()
@@ -271,10 +310,27 @@ def main() -> None:
                 skill = get_skill(args.skill_name)
                 if not skill:
                     raise SystemExit(f"Unknown skill: {args.skill_name}")
-                result = skill.run(prof, args.gpu, trim, **_parse_key_value_args(args.arg))
+                result = skill.run(
+                    prof,
+                    args.gpu,
+                    trim,
+                    profile_path=args.profile,
+                    workspace=args.workspace,
+                    program=args.program,
+                    **_parse_key_value_args(args.arg),
+                )
                 print(skill.format(result))
             return
         raise SystemExit("Usage: sysight skill {list,run} ...")
+
+    if args.command == "route":
+        route = resolve_workflow_route(
+            profile_path=args.profile,
+            workspace_root=args.workspace,
+            program_path=args.program,
+        )
+        print(format_workflow_route(route))
+        return
 
     if args.command == "theoretical-flops":
         result = compute_theoretical_flops(
