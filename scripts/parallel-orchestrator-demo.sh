@@ -62,7 +62,7 @@ echo
 
 build_prompt() {
   local skill_name="$1"
-  local cmd="PYTHONPATH=src python3 -m nsys_agent skill run ${skill_name} '${profile_path}'"
+  local cmd="PYTHONPATH=src python3 -m sysight skill run ${skill_name} '${profile_path}'"
   if [[ -n "$gpu_id" ]]; then
     cmd+=" --gpu ${gpu_id}"
   fi

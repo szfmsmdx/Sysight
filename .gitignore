@@ -3,26 +3,24 @@
 # Local reference project; do not publish as part of this repo.
 nsys-ai/
 
+# Local profile fixtures and sample captures.
+test/
+
 # Generated analysis outputs.
 outputs/
 
 # Local user workspaces.
 workspace/
 
-# Local profile artifacts.
-test/*.sqlite
-test/*.sqlite3
-test/*.nsys-rep
+# Local scratch notes.
+tmp_memory.md
 
-# Python cache and build artifacts.
+# Python cache artifacts.
 __pycache__/
 *.py[cod]
-*.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-build/
-dist/
 
 # Virtual environments and editor state.
 .venv/

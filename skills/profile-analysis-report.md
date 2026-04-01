@@ -1,15 +1,15 @@
 ---
 name: profile-analysis-report
-description: 当用户直接提供 Nsight Systems 的 `.sqlite`、`.sqlite3` 或 `.nsys-rep` 路径，并希望立刻得到分析结论、问题定位和完整 Markdown 报告地址时使用。运行仓库脚本生成终端摘要、Markdown 报告和 findings JSON，并在回复里明确给出关键结论与报告路径。
+description: 当用户直接提供 Nsight Systems 的 `.sqlite`、`.sqlite3` 或 `.nsys-rep` 路径，并希望 agent 直接给出“结论 / 问题 / 下一步行动建议”以及完整 `report.md` 路径时使用。运行仓库脚本生成终端摘要和 Markdown 报告，并在回复里按三段式格式输出关键结论与报告路径。
 ---
 
 # Profile Analysis Report
 
-这个 skill 负责把“用户丢一个 profile 文件路径进来”这件事变成一个标准化流程：
+这个 skill 负责把“用户丢一个 profile 文件路径进来，然后说帮我分析一下”这件事变成一个标准化流程：
 
 1. 运行分析
-2. 在终端里快速给出高价值结论
-3. 告知完整 Markdown 报告和 findings JSON 的地址
+2. 在终端里输出 `结论 / 问题 / 下一步行动建议`
+3. 告知完整 Markdown 报告地址
 
 不要把结果只停留在“我已经分析了”，必须给出结论和文件路径。
 
@@ -19,7 +19,7 @@ description: 当用户直接提供 Nsight Systems 的 `.sqlite`、`.sqlite3` 或
 
 - 直接给出一个 `.sqlite` / `.sqlite3` / `.nsys-rep` 路径
 - 说“帮我分析这个 profile”
-- 希望“给我一个结论 + 完整报告地址”
+- 希望“给我一个终端简要结论 + 完整报告地址”
 
 ## 标准执行步骤
 
@@ -38,15 +38,14 @@ scripts/run-profile-analysis.sh <profile-path> [gpu_id]
 
 这个脚本会：
 
-- 调用 `PYTHONPATH=src python3 -m nsys_agent analyze`
+- 调用 `PYTHONPATH=src python3 -m sysight analyze`
 - 在 `outputs/` 下生成 Markdown 报告
-- 在 `outputs/` 下生成 findings JSON
 - 在终端打印最终文件地址
 
 如果必须手动执行，则使用：
 
 ```bash
-PYTHONPATH=src python3 -m nsys_agent analyze <profile-path> --markdown <markdown-path> --findings <findings-path>
+PYTHONPATH=src python3 -m sysight analyze <profile-path> --markdown <markdown-path> --findings <findings-path>
 ```
 
 ### 3. 读取结果
@@ -55,16 +54,16 @@ PYTHONPATH=src python3 -m nsys_agent analyze <profile-path> --markdown <markdown
 
 - 终端分析输出中的核心结论
 - Markdown 报告中的“存在问题 / 下一步行动指南”
-- 生成文件的绝对路径
+- 生成的 `report.md` 绝对路径
 
 ### 4. 回复用户
 
 回复里必须同时包含：
 
-- 简短结论：2～5 条最重要的发现
-- 问题定位：至少给出 1～2 个具体的代码 / NVTX / frame 位置
+- `结论`：2～5 条最重要的发现
+- `问题`：列出最值得优先处理的问题，尽量附数值证据
+- `下一步行动建议`：给出 2～4 条可执行建议
 - 报告地址：Markdown 报告绝对路径
-- 如有 findings JSON，也给出它的路径
 
 不要只复述“报告已生成”，必须先给结论，再给地址。
 
@@ -72,22 +71,27 @@ PYTHONPATH=src python3 -m nsys_agent analyze <profile-path> --markdown <markdown
 
 默认按下面的顺序组织回复：
 
-### 终端结论
+### 结论
 
 - 概括 profile 的整体状态
 - 点出最严重的 3～5 个问题
 - 对每个问题尽量附带数值证据
 
-### 定位信息
+### 问题
 
 - 若有 NVTX region，优先给 NVTX region
 - 若有 sampled stack / runtime 线程，补充 frame 名称
 - 若两者都有，优先写成“问题 -> NVTX -> frame”
 
+### 下一步行动建议
+
+- 优先告诉用户最值得先处理的 2～4 个动作
+- 建议要能直接执行，不要只写泛泛方向
+- 如果 iteration 检测是 heuristic fallback，要明确说明
+
 ### 报告地址
 
 - Markdown 报告绝对路径
-- findings JSON 绝对路径
 
 ## 偏好规则
 
@@ -106,18 +110,24 @@ scripts/run-profile-analysis.sh test/basemodel_8gpu.sqlite 0
 ## 示例回复骨架
 
 ```markdown
-分析已经完成。这个 profile 的主要问题集中在同步开销、持续 H2D 传输和 NCCL 热点。
+结论
 
-- GPU 0 的主要热点是 `...`，占 `...%`
-- 发现 `...` 个 idle gap，总计 `...ms`
-- H2D 传输 `...MB / ...ms`
-- 同步 API `...` 次，总计 `...ms`
+- GPU 0 当前最主要的时间消耗集中在 `...`
+- profile 中发现 `...` 个明显 idle gap，总计 `...ms`
+- 同步开销达到 `...ms`，已经影响主执行节奏
 
-问题定位上，优先看：
-- NVTX `...`
-- frame `...`
+问题
 
-完整报告：
+- `Excessive Synchronization`：主要集中在 `NVTX ...`，相关 frame 为 `...`
+- `Continuous H2D Transfers`：在 `...` 时间窗内持续出现，累计 `...MB`
+
+下一步行动建议
+
+- 先检查 `...` 附近是否存在不必要的同步点
+- 评估 `...` 路径上的 H2D 是否可以提前或合并
+- 给训练主循环补稳定的 NVTX iteration marker，方便后续精确定位
+
+完整报告
+
 - Markdown: `/abs/path/to/report.md`
-- Findings: `/abs/path/to/findings.json`
 ```

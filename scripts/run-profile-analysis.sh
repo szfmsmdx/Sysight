@@ -42,10 +42,10 @@ if [[ -n "$gpu_id" ]]; then
 fi
 
 mkdir -p "$repo_root/outputs"
-markdown_path="$repo_root/outputs/${stem}${gpu_suffix}.analysis.md"
+markdown_path="$repo_root/outputs/${stem}${gpu_suffix}.report.md"
 findings_path="$repo_root/outputs/${stem}${gpu_suffix}.findings.json"
 
-cmd=(python3 -m nsys_agent analyze "$profile_path" --markdown "$markdown_path" --findings "$findings_path")
+cmd=(python3 -m sysight analyze "$profile_path" --markdown "$markdown_path" --findings "$findings_path")
 if [[ -n "$gpu_id" ]]; then
   cmd+=(--gpu "$gpu_id")
 fi

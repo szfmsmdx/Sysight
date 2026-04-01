@@ -5,13 +5,17 @@ description: 当主进程需要先理解仓库上下文，再把若干独立 ana
 
 # Skill: parallel-orchestrator
 
-这个 skill 的目标不是直接替代主 agent，而是给主 agent 一个最小可运行的主从 workflow：
+这个 skill 的目标不是直接替代主 agent，而是给主 agent 一个最小可运行的主从 workflow。
+
+用户侧的主交互仍然应该是自然语言，例如“帮我分析一下某个 sqlite 文件”；这个 skill 只负责在主 agent 已经接到任务之后，如何把底层只读 analysis 子任务拆开并行执行。
+
+主从 workflow 如下：
 
 1. 主进程先读项目和任务背景
 2. 主进程把独立子任务拆出来
 3. 主进程启动多个 `codex exec` 子进程
 4. 子进程各自执行一个明确的只读分析任务
-5. 主进程收集输出并做后续聚合
+5. 主进程收集输出并做后续聚合，最后仍然面向用户输出 `结论 / 问题 / 下一步行动建议`
 
 当前版本先保证“跑起来”，不追求复杂调度、长会话交互或自动合并 patch。
 
@@ -59,6 +63,7 @@ scripts/parallel-orchestrator-demo.sh <profile.sqlite|profile.nsys-rep> [gpu_id]
 - 每个子进程只负责一个边界明确的任务
 - 子任务之间尽量无共享写入
 - 主进程负责最终取舍和结论整合
+- 最终对用户的回答格式仍然应收敛成 `结论 / 问题 / 下一步行动建议`
 
 ## 子进程约束
 
@@ -66,7 +71,7 @@ scripts/parallel-orchestrator-demo.sh <profile.sqlite|profile.nsys-rep> [gpu_id]
 
 - 不修改文件
 - 不生成 Markdown 报告
-- 只运行一个指定的 `nsys_agent skill run ...` 命令
+- 只运行一个指定的 `sysight skill run ...` 命令
 - 最后返回简短文本总结
 
 这保证了主从模式的第一版足够稳定，不会因为子进程自由度太大而失控。

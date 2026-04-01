@@ -4,7 +4,7 @@
 
 ### 工作内容
 - 阅读了 `nsys-ai` 的 CLI、profile、analysis、web、agent 与 skill 相关模块，梳理出上游项目的核心工作流、可复用能力和当前仓库的拆分边界。
-- 基于调研结果，起草了 `nsys-agent` 的项目定位，明确三阶段主线：profile 采集、轻量 analysis、定向 investigation。
+- 基于调研结果，起草了 `Sysight` 的项目定位，明确三阶段主线：profile 采集、轻量 analysis、定向 investigation。
 - 初始化工作日志机制，把 `worklog.md` 作为后续持续记录入口，避免后面的设计、实现和验证过程散落在对话里。
 
 ### 修改文件
@@ -14,33 +14,33 @@
 | `worklog.md` | 初始化工作日志文件，并写入首轮上游调研与项目规划记录 |
 
 ### 成果结论
-- 明确了 `nsys-agent` 不做上游的重型 web/TUI/chat 复刻，而是优先保留高价值 analysis 能力。
+- 明确了 `Sysight` 不做上游的重型 web/TUI/chat 复刻，而是优先保留高价值 analysis 能力。
 - 项目已经有了清晰的三阶段拆分边界，后续工作可以围绕 `profiling / analysis / investigation` 逐段推进。
 
 ## 2026-03-30 Analysis MVP
 
 ### 工作内容
 - 创建了 `test/` 目录，并将 `basemodel_8gpu.sqlite` 接入当前仓库，作为 analysis 阶段的本地验证输入。
-- 新建 `nsys-agent` 的最小 Python 包和 CLI，先落地 `info`、`summary`、`analyze` 三个面向 sqlite 的分析入口。
+- 新建 `Sysight` 的最小 Python 包和 CLI，先落地 `info`、`summary`、`analyze` 三个面向 sqlite 的分析入口。
 - 从 `nsys-ai` 中抽取并重写了 analysis 所需的最小核心，包括 profile 读取、GPU 摘要、idle gap、NCCL、H2D、同步、launch overhead、root cause 和 findings 导出。
 
 ### 修改文件
 | 文件名 | 修改内容 |
 |--------|----------|
-| `README.md` | 增加用户项目放置规则，并补充 `workspace/`、`test/`、`src/nsys_agent/` 等结构说明 |
-| `pyproject.toml` | 新增最小 Python 包配置，注册 `nsys-agent` CLI |
-| `src/nsys_agent/__init__.py` | 新增包版本信息 |
-| `src/nsys_agent/__main__.py` | 新增模块入口，支持 `python -m nsys_agent` |
-| `src/nsys_agent/cli.py` | 新增最小 CLI，提供 `info`、`summary`、`analyze` 三个命令 |
-| `src/nsys_agent/profile.py` | 新增轻量 profile 打开与 schema 发现逻辑 |
-| `src/nsys_agent/annotation.py` | 新增 findings/evidence 数据结构与 JSON 导出 |
-| `src/nsys_agent/analysis/summary.py` | 新增 per-GPU 摘要和自动 commentary 逻辑 |
-| `src/nsys_agent/analysis/queries.py` | 新增核心 SQL 分析查询与 root cause / evidence 构建逻辑 |
-| `src/nsys_agent/analysis/report.py` | 新增 analysis 编排和终端报告格式化逻辑 |
+| `README.md` | 增加用户项目放置规则，并补充 `workspace/`、`test/`、`src/sysight/` 等结构说明 |
+| 本地 CLI 配置 | 初期曾加过最小打包配置，后续已移除，当前仅保留本地运行方式 |
+| `src/sysight/__init__.py` | 新增包版本信息 |
+| `src/sysight/__main__.py` | 新增模块入口，支持 `python -m sysight` |
+| `src/sysight/cli.py` | 新增最小 CLI，提供 `info`、`summary`、`analyze` 三个命令 |
+| `src/sysight/profile.py` | 新增轻量 profile 打开与 schema 发现逻辑 |
+| `src/sysight/annotation.py` | 新增 findings/evidence 数据结构与 JSON 导出 |
+| `src/sysight/analysis/summary.py` | 新增 per-GPU 摘要和自动 commentary 逻辑 |
+| `src/sysight/analysis/queries.py` | 新增核心 SQL 分析查询与 root cause / evidence 构建逻辑 |
+| `src/sysight/analysis/report.py` | 新增 analysis 编排和终端报告格式化逻辑 |
 | `test/basemodel_8gpu.sqlite` | 接入测试 sqlite，供本地直接验证 |
 
 ### 成果结论
-- `nsys-agent` 已具备最小 analysis 主链路：输入 1 个 sqlite，可输出 profile 信息、per-GPU 摘要、根因推断与 findings。
+- `Sysight` 已具备最小 analysis 主链路：输入 1 个 sqlite，可输出 profile 信息、per-GPU 摘要、根因推断与 findings。
 - 新项目已经从运行时层面摆脱了上游的 web、TUI、chat 依赖，先把 analysis 收敛为本地 CLI。
 
 ## 2026-03-30 代码定位能力建设
@@ -53,14 +53,14 @@
 ### 修改文件
 | 文件名 | 修改内容 |
 |--------|----------|
-| `src/nsys_agent/analysis/code_location.py` | 新增线程筛选、sample 栈聚合、候选帧过滤和结果格式化逻辑 |
-| `src/nsys_agent/analysis/report.py` | 在默认 analysis 输出中加入 `Code Location Candidates` 段落 |
-| `src/nsys_agent/analysis/skills/code_location.py` | 新增 `code_location` skill 入口 |
-| `src/nsys_agent/analysis/skills/registry.py` | 注册 `code_location` skill |
+| `src/sysight/analysis/code_location.py` | 新增线程筛选、sample 栈聚合、候选帧过滤和结果格式化逻辑 |
+| `src/sysight/analysis/report.py` | 在默认 analysis 输出中加入 `Code Location Candidates` 段落 |
+| `src/sysight/analysis/skills/code_location.py` | 新增 `code_location` skill 入口 |
+| `src/sysight/analysis/skills/registry.py` | 注册 `code_location` skill |
 | `README.md` | 将 `code_location` 纳入已提炼 skill 列表 |
 
 ### 成果结论
-- `nsys-agent` 已经能从“发现问题”进一步推进到“给出问题对应的线程 / frame 候选”，不再停留在纯现象级诊断。
+- `Sysight` 已经能从“发现问题”进一步推进到“给出问题对应的线程 / frame 候选”，不再停留在纯现象级诊断。
 - 代码定位链路已被封装为独立 skill，后续可以持续优化筛选规则而不需要每次回头重新拼 SQL。
 
 ## 2026-03-30 Analysis 对齐与 Markdown 报告
@@ -76,18 +76,18 @@
 ### 修改文件
 | 文件名 | 修改内容 |
 |--------|----------|
-| `src/nsys_agent/profile.py` | 新增 kernel/runtime/NVTX 相关 helper，用于更丰富的 analysis 归因 |
-| `src/nsys_agent/analysis/nvtx.py` | 新增轻量 NVTX 归因、layer breakdown、kernel map 逻辑 |
-| `src/nsys_agent/analysis/iterations.py` | 新增 iteration 检测和 iteration 汇总逻辑 |
-| `src/nsys_agent/analysis/queries.py` | 新增 `top_kernel_summary` 与更接近上游的 root cause 匹配逻辑 |
-| `src/nsys_agent/analysis/report.py` | 接入 NVTX / iteration / top kernel 数据，并新增 Markdown 报告输出 |
-| `src/nsys_agent/analysis/__init__.py` | 导出 Markdown formatter |
-| `src/nsys_agent/cli.py` | `analyze` 命令支持写 Markdown 报告，默认落到 `outputs/` |
-| `src/nsys_agent/analysis/skills/registry.py` | 注册 `iteration_timing`、`nvtx_kernel_map`、`nvtx_layer_breakdown`、`top_kernels` |
-| `src/nsys_agent/analysis/skills/iteration_timing.py` | 新增 iteration timing skill |
-| `src/nsys_agent/analysis/skills/nvtx_kernel_map.py` | 新增 NVTX -> kernel 映射 skill |
-| `src/nsys_agent/analysis/skills/nvtx_layer_breakdown.py` | 新增 NVTX region GPU time breakdown skill |
-| `src/nsys_agent/analysis/skills/top_kernels.py` | 新增 top kernels skill |
+| `src/sysight/profile.py` | 新增 kernel/runtime/NVTX 相关 helper，用于更丰富的 analysis 归因 |
+| `src/sysight/analysis/nvtx.py` | 新增轻量 NVTX 归因、layer breakdown、kernel map 逻辑 |
+| `src/sysight/analysis/iterations.py` | 新增 iteration 检测和 iteration 汇总逻辑 |
+| `src/sysight/analysis/queries.py` | 新增 `top_kernel_summary` 与更接近上游的 root cause 匹配逻辑 |
+| `src/sysight/analysis/report.py` | 接入 NVTX / iteration / top kernel 数据，并新增 Markdown 报告输出 |
+| `src/sysight/analysis/__init__.py` | 导出 Markdown formatter |
+| `src/sysight/cli.py` | `analyze` 命令支持写 Markdown 报告，默认落到 `outputs/` |
+| `src/sysight/analysis/skills/registry.py` | 注册 `iteration_timing`、`nvtx_kernel_map`、`nvtx_layer_breakdown`、`top_kernels` |
+| `src/sysight/analysis/skills/iteration_timing.py` | 新增 iteration timing skill |
+| `src/sysight/analysis/skills/nvtx_kernel_map.py` | 新增 NVTX -> kernel 映射 skill |
+| `src/sysight/analysis/skills/nvtx_layer_breakdown.py` | 新增 NVTX region GPU time breakdown skill |
+| `src/sysight/analysis/skills/top_kernels.py` | 新增 top kernels skill |
 | `scripts/run-profile-analysis.sh` | 新增统一分析脚本，生成 Markdown 报告与 findings JSON |
 | `skills/profile-analysis-report/SKILL.md` | 新增“路径输入 -> 分析 -> 结论 -> 报告地址” workflow skill |
 | `README.md` | 更新当前 analysis 输出形态和已支持 skill 清单 |
@@ -135,3 +135,39 @@
 ### 成果结论
 - 当前仓库已经具备一份更清晰的对外说明，能够直接回答“这个项目要解决什么问题、现在做到哪里、下一步做什么”。
 - 后续上传或初始化 Git 仓库时，不会再把本地参考副本 `nsys-ai/` 误传进去。
+
+## 2026-03-30 Analysis Backend 对齐补齐
+
+### 工作内容
+- 继续对照本地 `nsys-ai` 上游仓库，按“不要重型 web/TUI/chat，只补 analysis backend”这个边界梳理剩余缺口。
+- 新增并接入 `schema_inspect`、`nccl_breakdown`、`overlap_breakdown`、`speedup_estimator`、`stream_concurrency`、`kernel_launch_pattern`、`cpu_gpu_pipeline`、`thread_utilization` 等缺失 analysis skills。
+- 新增 `theoretical_flops` 和 `region_mfu` 两个上游关键分析能力，并在当前仓库里补了一套轻量版 FLOPs / MFU 计算逻辑，包括 GPU peak TFLOPS 查表、NVTX region 匹配、kernel 归因和 MFU 计算。
+- 为 `gpu_idle_gaps` 增加兼容 alias，避免因为 skill 命名差异导致 agent 无法命中已存在的 idle gap 分析能力。
+- 扩展 `skill run`，支持通过 `--arg key=value` 传递额外参数，使参数化 skill 不需要额外 agent patch 就能直接调用。
+- 在 CLI 中补充 `report`、`overlap`、`nccl`、`iters`、`schema`、`theoretical-flops`、`region-mfu` 等分析入口，并在 sample sqlite 上逐项验证。
+- 更新 `README.md`，明确当前项目的定位是“尽量对齐上游分析功能，但不默认继承重型 web UI”。
+
+### 修改文件
+| 文件名 | 修改内容 |
+|--------|----------|
+| `src/sysight/analysis/mfu.py` | 新增轻量 FLOPs / region MFU 计算逻辑和格式化输出 |
+| `src/sysight/analysis/skills/base.py` | `Skill.run` 支持额外参数透传 |
+| `src/sysight/analysis/skills/registry.py` | 注册新增的 analysis skills，包括 `region_mfu` 和 `theoretical_flops` |
+| `src/sysight/analysis/skills/schema_inspect.py` | 新增 schema inspection skill |
+| `src/sysight/analysis/skills/nccl_breakdown.py` | 新增 NCCL collective breakdown skill |
+| `src/sysight/analysis/skills/overlap_breakdown.py` | 新增 compute / communication overlap skill |
+| `src/sysight/analysis/skills/speedup_estimator.py` | 新增 speedup estimate skill |
+| `src/sysight/analysis/skills/stream_concurrency.py` | 新增 stream concurrency skill |
+| `src/sysight/analysis/skills/kernel_launch_pattern.py` | 新增 kernel launch pattern skill |
+| `src/sysight/analysis/skills/cpu_gpu_pipeline.py` | 新增 CPU-GPU pipeline skill |
+| `src/sysight/analysis/skills/thread_utilization.py` | 新增 CPU thread utilization skill |
+| `src/sysight/analysis/skills/theoretical_flops.py` | 新增 theoretical FLOPs skill |
+| `src/sysight/analysis/skills/region_mfu.py` | 新增 region MFU skill |
+| `src/sysight/analysis/skills/gpu_idle_gaps.py` | 新增上游 `gpu_idle_gaps` 的兼容 alias |
+| `src/sysight/cli.py` | 新增 `--arg` 支持和多个 analysis CLI 子命令 |
+| `README.md` | 更新功能、状态、Quick Start 和 roadmap 描述 |
+| `worklog.md` | 追加本轮 analysis backend 对齐记录 |
+
+### 成果结论
+- 当前仓库在“单 profile analysis backend”这一层已经覆盖本地 `nsys-ai` 上游的内置 analysis skills，剩余显著差异主要收敛到尚未实现的 diff，以及明确未纳入当前目标范围的 web / TUI / chat 表层。
+- `theoretical_flops` 和 `region_mfu` 已经不再是口头规划，而是当前仓库中可直接运行的分析能力。
