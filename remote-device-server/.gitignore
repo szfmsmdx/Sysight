@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+
+# Secrets & local config
+.env
+*.db
+
+# Offline packages (for air-gapped installs)
+offline_packages/
+
+# Uploaded tarballs
+*.tar.gz
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+.claude/
+
+# Logs & runtime data (server generates these)
+/logs/
+/workspace/

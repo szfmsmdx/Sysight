@@ -124,26 +124,31 @@ def format_summary(summary: dict) -> str:
 
 
 def auto_commentary(summary: dict) -> str:
-    """Produce a short narrative for one GPU."""
+    """Produce a short narrative for one GPU (Chinese)."""
     if "error" in summary:
         return f"GPU {summary['device']}: {summary['error']}"
 
     timing = summary["timing"]
     top = summary["top_kernels"]
     parts = [
-        f"GPU {summary['device']} ran {summary['kernel_count']} kernels over {timing['span_ms']:.0f}ms with {timing['utilization_pct']}% active timeline coverage."
+        f"GPU {summary['device']} 共执行 {summary['kernel_count']} 个 kernel，"
+        f"跨度 {timing['span_ms']:.0f}ms，GPU 利用率 {timing['utilization_pct']}%。"
     ]
     if top:
+        top_name = top[0]["name"]
+        # Truncate very long C++ mangled names for readability
+        if len(top_name) > 60:
+            top_name = top_name[:57] + "..."
         parts.append(
-            f"Top bottleneck: {top[0]['name']} at {top[0]['pct']}% of compute time ({top[0]['total_ms']:.0f}ms across {top[0]['count']} calls)."
+            f"最耗时 kernel 为 `{top_name}`，占 compute 时间 {top[0]['pct']}%（{top[0]['total_ms']:.0f}ms，共 {top[0]['count']} 次调用）。"
         )
     total_ms = summary["nccl_ms"] + summary["compute_only_ms"]
     if total_ms > 0 and summary["nccl_ms"] > 0:
         nccl_pct = 100 * summary["nccl_ms"] / total_ms
         parts.append(
-            f"NCCL accounts for {nccl_pct:.0f}% of kernel time ({summary['nccl_ms']:.0f}ms), compute kernels account for {summary['compute_only_ms']:.0f}ms."
+            f"NCCL 占 kernel 时间 {nccl_pct:.0f}%（{summary['nccl_ms']:.0f}ms），compute kernel 共 {summary['compute_only_ms']:.0f}ms。"
         )
     if timing["idle_ms"] > 10:
         idle_pct = 100 * timing["idle_ms"] / timing["span_ms"] if timing["span_ms"] else 0
-        parts.append(f"There are {timing['idle_ms']:.0f}ms of idle gaps ({idle_pct:.0f}% of span).")
-    return " ".join(parts)
+        parts.append(f"存在 {timing['idle_ms']:.0f}ms 的 GPU idle（占总跨度 {idle_pct:.0f}%）。")
+    return "".join(parts)

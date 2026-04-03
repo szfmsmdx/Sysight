@@ -846,13 +846,12 @@ def match_root_causes(data: dict) -> list[dict]:
                 "pattern": "GPU Bubbles (Pipeline Stalls)",
                 "severity": "warning",
                 "evidence": (
-                    f"{gap_summary['gap_count']} gaps > 1.0ms detected, totaling "
-                    f"{gap_summary['total_idle_ms']:.1f}ms of idle time "
-                    f"({gap_summary['pct_of_profile']}% of profile)"
+                    f"检测到 {gap_summary['gap_count']} 个超过 1ms 的 GPU idle gap，"
+                    f"总计闲置 {gap_summary['total_idle_ms']:.1f}ms（占 profile 时间跨度 {gap_summary['pct_of_profile']}%）"
                 ),
                 "recommendation": (
-                    "Remove explicit cudaDeviceSynchronize / cudaStreamSynchronize. "
-                    "Use event-based dependencies or CUDA graphs."
+                    "删除代码中显式的 cudaDeviceSynchronize / cudaStreamSynchronize 调用，"
+                    "改用 CUDA event 做依赖同步，或引入 CUDA Graphs 消除启动开销。"
                 ),
                 "score": round(float(gap_summary["total_idle_ms"]), 2),
                 "windows": _idle_gap_windows(data, limit=2),
@@ -868,11 +867,12 @@ def match_root_causes(data: dict) -> list[dict]:
                     "pattern": "Low Compute/NCCL Overlap",
                     "severity": "critical",
                     "evidence": (
-                        f"NCCL overlap only {overlap['overlap_pct']}%, "
-                        f"NCCL-only time {overlap['nccl_only_ms']:.1f}ms over {overlap['total_ms']:.1f}ms span."
+                        f"NCCL 与计算重叠仅 {overlap['overlap_pct']}%，"
+                        f"纯通信时间 {overlap['nccl_only_ms']:.1f}ms（占总跨度 {overlap['total_ms']:.1f}ms）。"
                     ),
                     "recommendation": (
-                        "Ensure communication runs on a dedicated stream and avoid host synchronization immediately after NCCL."
+                        "确保 NCCL 通信运行在独立的 stream 上，避免在 AllReduce 后立即调用 host 同步；"
+                        "可在 backward 后手动重叠下一层的 forward 与当前层的 AllReduce。"
                     ),
                     "score": round(float(nccl_total) + max(0.0, 30.0 - float(overlap["overlap_pct"])), 2),
                     "windows": _nccl_windows(data, limit=2),
@@ -887,11 +887,12 @@ def match_root_causes(data: dict) -> list[dict]:
                 "pattern": "Excessive H2D Transfers",
                 "severity": "warning",
                 "evidence": (
-                    f"H2D transfers: {h2d_row['total_dur_ms']:.1f}ms total, {h2d_row['total_mb']:.1f}MB, "
-                    f"{h2d_row['op_count']} ops, avg bandwidth {h2d_row['avg_bandwidth_gbps']:.1f} GB/s"
+                    f"H2D 传输总耗时 {h2d_row['total_dur_ms']:.1f}ms，{h2d_row['total_mb']:.1f}MB，"
+                    f"{h2d_row['op_count']} 次操作，平均带宽 {h2d_row['avg_bandwidth_gbps']:.1f} GB/s"
                 ),
                 "recommendation": (
-                    "Use pin_memory=True in DataLoader, non_blocking=True in .to(device), and prefetch batches earlier."
+                    "DataLoader 开启 pin_memory=True，tensor 转设备改用 .to(device, non_blocking=True)，"
+                    "并提前预取 batch 以隐藏 H2D 延迟。"
                 ),
                 "score": round(float(h2d_row["total_dur_ms"]), 2),
                 "windows": _h2d_windows(data, limit=2),
@@ -904,9 +905,11 @@ def match_root_causes(data: dict) -> list[dict]:
             {
                 "pattern": "Continuous H2D Transfers",
                 "severity": "warning",
-                "evidence": h2d_pattern["detail"],
+                "evidence": (
+                    f"H2D 常驻热路径：{h2d_pattern['detail']}"
+                ),
                 "recommendation": (
-                    "Check if every step is pulling data from host or calling .cpu() / .item() in the hot path."
+                    "排查热路径上是否每个 step 都在从 host 拉取数据，或在训练循环内频繁调用 .cpu() / .item()。"
                 ),
                 "score": round(float(h2d_row["total_dur_ms"]) * 0.9, 2) if h2d_row else 0.0,
                 "windows": _h2d_windows(data, limit=2),
@@ -922,9 +925,10 @@ def match_root_causes(data: dict) -> list[dict]:
             {
                 "pattern": "Small Kernel Overhead",
                 "severity": "warning",
-                "evidence": f"{len(high_overhead)} kernels with launch overhead greater than kernel duration.",
+                "evidence": f"检测到 {len(high_overhead)} 个 kernel 的启动开销远超过 kernel 执行时间（小 kernel 问题）。",
                 "recommendation": (
-                    "Use torch.compile(), CUDA Graphs, or operator fusion to reduce kernel launch pressure."
+                    "使用 torch.compile() 或 CUDA Graphs 融合小 kernel，减少启动开销；"
+                    "也可考虑算子融合降低 dispatch 压力。"
                 ),
                 "score": round(float(len(high_overhead) * 10), 2),
                 "windows": _launch_windows(data, limit=2),
@@ -938,11 +942,12 @@ def match_root_causes(data: dict) -> list[dict]:
                 "pattern": "Excessive Synchronization",
                 "severity": "warning",
                 "evidence": (
-                    f"{sync_summary['call_count']} sync calls totalling {sync_summary['total_ms']:.1f}ms "
-                    f"({sync_summary['pct_of_gpu_time']:.1f}% of GPU time). APIs: {', '.join(sync_summary['api_names'])}"
+                    f"{sync_summary['call_count']} 次同步 API 调用，总耗时 {sync_summary['total_ms']:.1f}ms（占 GPU kernel 时间 {sync_summary['pct_of_gpu_time']:.1f}%），"
+                    f"涉及接口：{', '.join(sync_summary['api_names'])}"
                 ),
                 "recommendation": (
-                    "Remove .item() / .cpu() from the training loop and replace device-wide syncs with event-based dependencies."
+                    "从训练循环中删除 .item() / .cpu() 调用，用 CUDA event 替代全局 device sync；"
+                    "重点排查 backward 阶段是否有隐式同步点。"
                 ),
                 "score": round(float(sync_summary["total_ms"]), 2),
                 "windows": _idle_gap_windows(data, limit=2, category="synchronization"),
@@ -956,11 +961,10 @@ def match_root_causes(data: dict) -> list[dict]:
                 "pattern": "Pageable Memory in Memcpy",
                 "severity": "warning",
                 "evidence": (
-                    f"{pageable['count']} memcpy ops using pageable memory: {pageable['total_mb']:.1f}MB "
-                    f"in {pageable['total_ms']:.1f}ms."
+                    f"{pageable['count']} 次内存拷贝使用了可分页内存：{pageable['total_mb']:.1f}MB，耗时 {pageable['total_ms']:.1f}ms。"
                 ),
                 "recommendation": (
-                    "Switch host buffers to pinned memory so async H2D copies can overlap with compute."
+                    "将 host 侧 buffer 改为 pinned memory，使异步 H2D 拷贝能与计算并行进行。"
                 ),
                 "score": round(float(pageable["total_ms"]), 2),
                 "windows": _h2d_windows(data, limit=2),
@@ -974,11 +978,11 @@ def match_root_causes(data: dict) -> list[dict]:
                 "pattern": "NCCL Hotspot",
                 "severity": "warning",
                 "evidence": (
-                    f"{top_kernel['name']} accounts for {top_kernel['pct']}% of target GPU compute time "
-                    f"({top_kernel['total_ms']:.1f}ms)."
+                    f"NCCL 热点 kernel `{top_kernel['name']}` 占目标 GPU 计算时间 {top_kernel['pct']}%（{top_kernel['total_ms']:.1f}ms）。"
                 ),
                 "recommendation": (
-                    "Check bucket sizing, communication scheduling, and whether the model parallel degree is too high for this workload."
+                    "检查 DDP gradient bucket 大小（bucket_cap_mb）、通信调度顺序，"
+                    "以及当前模型并行度对该任务是否过高。"
                 ),
                 "score": round(float(top_kernel["total_ms"]), 2),
                 "windows": _nccl_windows(data, limit=2),
@@ -995,13 +999,14 @@ def match_root_causes(data: dict) -> list[dict]:
                     {
                         "pattern": "Compute-Communication Imbalance",
                         "severity": "critical",
-                        "evidence": (
-                            f"Compute/NCCL ratio = {ratio:.2f}. "
-                            f"Compute: {compute_ms:.1f}ms, NCCL: {nccl_total:.1f}ms"
-                        ),
-                        "recommendation": (
-                            "Revisit tensor parallel degree, gradient bucket sizing, and whether this workload is communication-bound."
-                        ),
+                    "evidence": (
+                        f"计算/通信时间比 = {ratio:.2f}；"
+                        f"纯计算 {compute_ms:.1f}ms，纯 NCCL {nccl_total:.1f}ms。"
+                    ),
+                    "recommendation": (
+                        "重新评估张量并行度和 gradient bucket 大小，判断该任务是否处于通信瓶颈；"
+                        "可尝试减小并行度或引入计算/通信流水线。"
+                    ),
                         "score": round(float(nccl_total) * 1.5, 2),
                         "windows": _nccl_windows(data, limit=2),
                     }
@@ -1022,12 +1027,12 @@ def match_root_causes(data: dict) -> list[dict]:
                     "pattern": "Layer NCCL Hotspot",
                     "severity": "warning",
                     "evidence": (
-                        f"NVTX region '{heaviest_nccl.get('nvtx_path') or heaviest_nccl.get('nvtx_region', '?')}' "
-                        f"accounts for {heaviest_pct:.0f}% of NCCL time "
-                        f"({heaviest_nccl_ms:.1f}ms / {total_nccl_ms:.1f}ms)."
+                        f"NVTX 区域 '{heaviest_nccl.get('nvtx_path') or heaviest_nccl.get('nvtx_region', '?')}' "
+                        f"占总 NCCL 时间 {heaviest_pct:.0f}%（{heaviest_nccl_ms:.1f}ms / {total_nccl_ms:.1f}ms）。"
                     ),
                     "recommendation": (
-                        "Inspect this layer or stage first. Rebalance gradient buckets or overlap this region's communication with compute."
+                        "优先排查该层/阶段的 AllReduce 时序；调整 gradient bucket 分组，"
+                        "或将该区域的通信与下一层计算重叠。"
                     ),
                     "score": round(float(heaviest_nccl_ms), 2),
                     "windows": _nccl_windows(data, limit=2),
@@ -1045,16 +1050,15 @@ def match_root_causes(data: dict) -> list[dict]:
                     {
                         "pattern": "Pipeline Imbalance",
                         "severity": "warning",
-                        "evidence": (
-                            f"Compute time varies {ratio:.1f}x across NVTX regions. "
-                            f"Heaviest: '{heaviest.get('nvtx_path') or heaviest.get('nvtx_region', '?')}' "
-                            f"({heaviest['compute_ms']:.1f}ms), "
-                            f"lightest: '{lightest.get('nvtx_path') or lightest.get('nvtx_region', '?')}' "
-                            f"({lightest['compute_ms']:.1f}ms)."
-                        ),
-                        "recommendation": (
-                            "Inspect the heavy region for poor kernel mix or stage imbalance before moving to micro-optimizations."
-                        ),
+                    "evidence": (
+                        f"NVTX 区域间计算时间相差 {ratio:.1f}倍；"
+                        f"最重：'{heaviest.get('nvtx_path') or heaviest.get('nvtx_region', '?')}'（{heaviest['compute_ms']:.1f}ms），"
+                        f"最轻：'{lightest.get('nvtx_path') or lightest.get('nvtx_region', '?')}'（{lightest['compute_ms']:.1f}ms）。"
+                    ),
+                "recommendation": (
+                    "优先排查最重的 NVTX 区域是否存在 kernel 组合不合理或 stage 负载不均，"
+                    "再考虑细粒度的 kernel 级优化。"
+                ),
                         "score": round(float(heaviest["compute_ms"]), 2),
                         "windows": [],
                     }
@@ -1068,11 +1072,11 @@ def match_root_causes(data: dict) -> list[dict]:
                 "pattern": "Iteration Variance",
                 "severity": "warning",
                 "evidence": (
-                    f"Iteration {slow['iteration']} took {slow['duration_ms']:.1f}ms, "
-                    f"above median {iteration_meta['median_ms']:.1f}ms."
+                    f"Iteration {slow['iteration']} 耗时 {slow['duration_ms']:.1f}ms，"
+                    f"远超中位数 {iteration_meta['median_ms']:.1f}ms。"
                 ),
                 "recommendation": (
-                    "Compare slow iterations against the median. Check host-side input timing, synchronization, and per-layer NVTX breakdown."
+                    "将慢 iteration 与中位数对比，排查 host 侧输入时序、同步点和各层 NVTX 时间分解。"
                 ),
                 "score": round(float(slow["duration_ms"] - iteration_meta["median_ms"]), 2),
                 "windows": _slow_iteration_windows(data, limit=1),
@@ -1082,10 +1086,10 @@ def match_root_causes(data: dict) -> list[dict]:
     if not findings:
         findings.append(
             {
-                "pattern": "No Major Anti-Pattern Detected",
+                "pattern": "未检测到明显反模式",
                 "severity": "info",
-                "evidence": "The lightweight checks did not detect a strong anti-pattern.",
-                "recommendation": "Next step: inspect targeted kernels with NCU or add deeper code-location signals.",
+                "evidence": "轻量检查未发现显著的反模式信号。",
+                "recommendation": "下一步：使用 Nsight Compute（ncu）对热点 kernel 做更深的分析，或补充 NVTX marker 提升归因精度。",
                 "score": 0.0,
                 "windows": [],
             }
@@ -1211,3 +1215,179 @@ def _intersection_ns(
                 break
             k += 1
     return total
+
+
+# ---------------------------------------------------------------------------
+# Tensor Core utilisation
+# ---------------------------------------------------------------------------
+
+# Kernel name patterns that strongly indicate Tensor Core usage.
+# Sources: cuBLAS HGEMM/WMMA kernels, FlashAttention, cuDNN conv, Triton matmul.
+_TENSOR_CORE_PATTERNS = (
+    # cuBLAS HMMA / IMMA
+    "h100_xmma_", "s16816", "s884", "hgemm", "sgemm_128x128",
+    "volta_h884", "turing_h1688", "ampere_s16816",
+    # FlashAttention (Triton / CUDA)
+    "_attn_fwd", "_attn_bwd", "flash_fwd", "flash_bwd",
+    # cuDNN convolution NHWC Tensor Core
+    "nhwc_", "cudnn::detail::implicit",
+    # Generic WMMA / mma patterns
+    "wmma", "mma_", "_mma",
+    # Triton matmul (heuristic: _kernel + matmul-like block sizes)
+    "matmul_kernel",
+    # cutlass
+    "cutlass::gemm", "cutlass::conv",
+)
+
+
+def tensor_core_summary(
+    prof: "Profile",
+    device: int,
+    trim: tuple[int, int] | None = None,
+) -> dict:
+    """Estimate Tensor Core kernel share by name-pattern matching.
+
+    Returns a dict with:
+    - tc_kernel_count  : number of TC-matching kernel invocations
+    - total_count      : total kernel invocations on this device/trim
+    - tc_ms            : total duration of TC kernels (ms)
+    - total_ms         : total duration of all kernels (ms)
+    - tc_time_pct      : tc_ms / total_ms * 100
+    - tc_count_pct     : tc_kernel_count / total_count * 100
+    - top_tc_kernels   : top-5 TC kernels by total_ms [{name, count, total_ms, pct}]
+    - non_tc_ms        : total_ms - tc_ms
+    """
+    trim_clause = ""
+    params: list[object] = [device]
+    if trim:
+        trim_clause = " AND k.start >= ? AND k.[end] <= ?"
+        params.extend(trim)
+
+    sql = f"""
+        SELECT
+            COALESCE(d.value, s.value) AS kernel_name,
+            COUNT(*) AS invocations,
+            ROUND(SUM(k.[end] - k.start) / 1e6, 3) AS total_ms
+        FROM {prof.schema.kernel_table} k
+        JOIN StringIds s ON k.shortName = s.id
+        LEFT JOIN StringIds d ON k.demangledName = d.id
+        WHERE k.deviceId = ?{trim_clause}
+        GROUP BY COALESCE(d.value, s.value)
+        ORDER BY total_ms DESC
+    """
+    with prof._lock:
+        rows = [dict(row) for row in prof.conn.execute(sql, params).fetchall()]
+
+    if not rows:
+        return {
+            "tc_kernel_count": 0, "total_count": 0,
+            "tc_ms": 0.0, "total_ms": 0.0,
+            "tc_time_pct": 0.0, "tc_count_pct": 0.0,
+            "top_tc_kernels": [], "non_tc_ms": 0.0,
+        }
+
+    total_ms = sum(r["total_ms"] for r in rows)
+    total_count = sum(r["invocations"] for r in rows)
+
+    def _is_tc(name: str) -> bool:
+        lower = (name or "").lower()
+        return any(pat in lower for pat in _TENSOR_CORE_PATTERNS)
+
+    tc_rows = [r for r in rows if _is_tc(r["kernel_name"])]
+    tc_ms = sum(r["total_ms"] for r in tc_rows)
+    tc_count = sum(r["invocations"] for r in tc_rows)
+
+    top_tc = sorted(tc_rows, key=lambda r: -r["total_ms"])[:5]
+    top_tc_out = [
+        {
+            "name": r["kernel_name"],
+            "count": r["invocations"],
+            "total_ms": r["total_ms"],
+            "pct": round(100 * r["total_ms"] / total_ms, 1) if total_ms else 0.0,
+        }
+        for r in top_tc
+    ]
+
+    return {
+        "tc_kernel_count": tc_count,
+        "total_count": total_count,
+        "tc_ms": round(tc_ms, 2),
+        "total_ms": round(total_ms, 2),
+        "tc_time_pct": round(100 * tc_ms / total_ms, 1) if total_ms else 0.0,
+        "tc_count_pct": round(100 * tc_count / total_count, 1) if total_count else 0.0,
+        "top_tc_kernels": top_tc_out,
+        "non_tc_ms": round(total_ms - tc_ms, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Kernel Grid / Block dimension summary
+# ---------------------------------------------------------------------------
+
+def kernel_grid_block_summary(
+    prof: "Profile",
+    device: int,
+    trim: tuple[int, int] | None = None,
+    *,
+    limit: int = 15,
+) -> list[dict]:
+    """Return per-kernel aggregated Grid/Block dimensions and resource usage.
+
+    Each row contains:
+    - kernel_name
+    - invocations
+    - total_ms
+    - avg_grid_x/y/z, avg_block_x/y/z
+    - threads_per_block  (blockX * blockY * blockZ)
+    - total_threads      (gridX * gridY * gridZ * threads_per_block, per-call avg)
+    - registers_per_thread
+    - static_smem_bytes  (staticSharedMemory)
+    - dynamic_smem_bytes (dynamicSharedMemory, averaged)
+    - local_mem_per_thread
+    """
+    trim_clause = ""
+    params: list[object] = [device]
+    if trim:
+        trim_clause = " AND k.start >= ? AND k.[end] <= ?"
+        params.extend(trim)
+
+    sql = f"""
+        SELECT
+            COALESCE(d.value, s.value) AS kernel_name,
+            COUNT(*) AS invocations,
+            ROUND(SUM(k.[end] - k.start) / 1e6, 3) AS total_ms,
+            ROUND(AVG(k.[end] - k.start) / 1e6, 4) AS avg_ms,
+            ROUND(AVG(k.gridX), 1)  AS avg_grid_x,
+            ROUND(AVG(k.gridY), 1)  AS avg_grid_y,
+            ROUND(AVG(k.gridZ), 1)  AS avg_grid_z,
+            ROUND(AVG(k.blockX), 1) AS avg_block_x,
+            ROUND(AVG(k.blockY), 1) AS avg_block_y,
+            ROUND(AVG(k.blockZ), 1) AS avg_block_z,
+            ROUND(AVG(k.blockX * k.blockY * k.blockZ), 0) AS threads_per_block,
+            ROUND(AVG(k.gridX * k.gridY * k.gridZ * k.blockX * k.blockY * k.blockZ), 0) AS total_threads,
+            ROUND(AVG(k.registersPerThread), 1) AS registers_per_thread,
+            ROUND(AVG(k.staticSharedMemory), 0) AS static_smem_bytes,
+            ROUND(AVG(k.dynamicSharedMemory), 0) AS dynamic_smem_bytes,
+            ROUND(AVG(k.localMemoryPerThread), 0) AS local_mem_per_thread
+        FROM {prof.schema.kernel_table} k
+        JOIN StringIds s ON k.shortName = s.id
+        LEFT JOIN StringIds d ON k.demangledName = d.id
+        WHERE k.deviceId = ?{trim_clause}
+          AND k.blockX IS NOT NULL
+          AND k.gridX IS NOT NULL
+        GROUP BY COALESCE(d.value, s.value)
+        ORDER BY total_ms DESC
+        LIMIT ?
+    """
+    with prof._lock:
+        rows = [dict(row) for row in prof.conn.execute(sql, params + [limit]).fetchall()]
+
+    # Add a convenience field: block occupancy hint
+    # A100 has 1024 max threads/block and 2048 resident threads/SM
+    # We flag kernels with very small blocks (<= 64 threads) as potentially low-occupancy
+    for row in rows:
+        tpb = int(row.get("threads_per_block") or 0)
+        row["threads_per_block"] = tpb
+        row["low_occupancy_hint"] = tpb > 0 and tpb <= 64
+
+    return rows

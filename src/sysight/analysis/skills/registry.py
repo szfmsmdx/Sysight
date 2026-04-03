@@ -8,6 +8,7 @@ from .cpu_gpu_pipeline import SKILL as CPU_GPU_PIPELINE
 from .gpu_idle_gaps import SKILL as GPU_IDLE_GAPS
 from .idle_gaps import SKILL as IDLE_GAPS
 from .iteration_timing import SKILL as ITERATION_TIMING
+from .kernel_grid_block import SKILL as KERNEL_GRID_BLOCK
 from .kernel_launch_pattern import SKILL as KERNEL_LAUNCH_PATTERN
 from .kernel_launch_overhead import SKILL as KERNEL_LAUNCH_OVERHEAD
 from .memory_bandwidth import SKILL as MEMORY_BANDWIDTH
@@ -22,6 +23,7 @@ from .root_cause_matcher import SKILL as ROOT_CAUSE_MATCHER
 from .schema_inspect import SKILL as SCHEMA_INSPECT
 from .speedup_estimator import SKILL as SPEEDUP_ESTIMATOR
 from .stream_concurrency import SKILL as STREAM_CONCURRENCY
+from .tensor_core_util import SKILL as TENSOR_CORE_UTIL
 from .theoretical_flops import SKILL as THEORETICAL_FLOPS
 from .thread_utilization import SKILL as THREAD_UTILIZATION
 from .top_kernels import SKILL as TOP_KERNELS
@@ -36,6 +38,7 @@ _SKILLS = {
         GPU_IDLE_GAPS,
         IDLE_GAPS,
         ITERATION_TIMING,
+        KERNEL_GRID_BLOCK,
         KERNEL_LAUNCH_PATTERN,
         MEMORY_TRANSFERS,
         MEMORY_BANDWIDTH,
@@ -50,6 +53,7 @@ _SKILLS = {
         SCHEMA_INSPECT,
         SPEEDUP_ESTIMATOR,
         STREAM_CONCURRENCY,
+        TENSOR_CORE_UTIL,
         THEORETICAL_FLOPS,
         THREAD_UTILIZATION,
         TOP_KERNELS,

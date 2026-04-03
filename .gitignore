@@ -1,10 +1,7 @@
 .DS_Store
 
-# Local reference project; do not publish as part of this repo.
-nsys-ai/
-
 # Local profile fixtures and sample captures.
-test/
+profiles/
 
 # Generated analysis outputs.
 outputs/

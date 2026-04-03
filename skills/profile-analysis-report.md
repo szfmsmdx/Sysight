@@ -74,7 +74,8 @@ scripts/export-nsys-sqlite.sh <profile.nsys-rep> [output.sqlite]
 - `问题`：列出最值得优先处理的问题，尽量附数值证据
 - `下一步行动建议`：给出 2～4 条可执行建议
 - 报告地址：Markdown 报告绝对路径
-
+- 尽可能附上 `.py` 或者函数、代码段行数以增强可信度
+ 
 不要只复述“报告已生成”，必须先给结论，再给地址。
 
 ## 输出约束
@@ -113,10 +114,10 @@ scripts/export-nsys-sqlite.sh <profile.nsys-rep> [output.sqlite]
 ## 示例命令
 
 ```bash
-scripts/run-profile-analysis.sh test/basemodel_8gpu.sqlite
-scripts/run-profile-analysis.sh test/basemodel_8gpu.sqlite 0
-scripts/run-profile-analysis.sh test/basemodel_8gpu.nsys-rep
-scripts/export-nsys-sqlite.sh test/basemodel_8gpu.nsys-rep
+scripts/run-profile-analysis.sh profiles/my_profile.sqlite
+scripts/run-profile-analysis.sh profiles/my_profile.sqlite 0
+scripts/run-profile-analysis.sh profiles/my_profile.nsys-rep
+scripts/export-nsys-sqlite.sh profiles/my_profile.nsys-rep
 ```
 
 ## 示例回复骨架
@@ -135,7 +136,7 @@ scripts/export-nsys-sqlite.sh test/basemodel_8gpu.nsys-rep
 
 下一步行动建议
 
-- 先检查 `...` 附近是否存在不必要的同步点
+- 先检查 `...`(xxx文件 : xx 行/xx函数) 附近是否存在不必要的同步点
 - 评估 `...` 路径上的 H2D 是否可以提前或合并
 - 给训练主循环补稳定的 NVTX iteration marker，方便后续精确定位
 

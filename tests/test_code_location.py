@@ -12,7 +12,7 @@ from sysight.profile import Profile
 
 
 _PROFILE_PATH = (
-    Path(__file__).resolve().parents[1] / "test" / "pnc_prof_0330_lane_selection_fakedata.sqlite"
+    Path(__file__).resolve().parents[1] / "profiles" / "pnc_prof_0330_lane_selection_fakedata.sqlite"
 )
 
 
