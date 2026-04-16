@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sysight"
+version = "0.1.0"
+description = "Static repository analyzer: entry-point detection, call-chain tracing, multi-language"
+requires-python = ">=3.10"
+license = "MIT"
+
+[project.scripts]
+sysight = "sysight.analyzer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sysight"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]

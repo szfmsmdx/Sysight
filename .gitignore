@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+.venv/
+venv/
+env/
+
+# 测试 & 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 子项目（独立 git 仓库，用 submodule 管理）
+code-review-graph/
+nsys-ai/
+workspace/
+
+# nsys profile 原始文件（体积大）
+*.nsys-rep
+*.sqlite
+*.qdrep
+
+# 日志 & 临时
+*.log
+*.tmp
+tmp/
