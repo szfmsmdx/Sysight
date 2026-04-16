@@ -33,6 +33,7 @@ htmlcov/
 code-review-graph/
 nsys-ai/
 workspace/
+profile/
 
 # nsys profile 原始文件（体积大）
 *.nsys-rep
