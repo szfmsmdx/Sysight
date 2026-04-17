@@ -19,99 +19,7 @@ from .analyzer import (
 )
 from .nsys import analyze_nsys
 from .nsys.models import NsysAnalysisRequest, NsysDiag
-
-
-# ── Nsys render helpers ───────────────────────────────────────────────────────
-
-def _render_nsys_diag(diag: NsysDiag) -> str:
-    """Human-readable text output for NsysDiag."""
-
-    lines: list[str] = []
-    lines.append(f"文件：{diag.profile_path}")
-    if diag.sqlite_path:
-        lines.append(f"SQLite：{diag.sqlite_path}")
-    _STATUS_ZH = {"ok": "分析完成", "error": "分析失败", "action_required": "需要手动操作"}
-    lines.append(f"状态：{_STATUS_ZH.get(diag.status, diag.status)}")
-    lines.append("")
-
-    if diag.status == "action_required":
-        lines.append(f"请执行：{diag.required_action}")
-        return "\n".join(lines)
-
-    if diag.status == "error":
-        for w in diag.repo_warnings:
-            lines.append(f"错误：{w}")
-        return "\n".join(lines)
-
-    # Bottleneck summary
-    if diag.bottlenecks:
-        b = diag.bottlenecks
-        total_ms = b.total_ns / 1e6
-        active_ms = b.gpu_active_ns / 1e6
-        idle_ms = b.gpu_idle_ns / 1e6
-        lines.append(
-            f"Trace 时长：{total_ms:.1f}ms  |  "
-            f"GPU 活跃：{active_ms:.1f}ms ({active_ms / total_ms * 100:.1f}%)  |  "
-            f"GPU 空闲：{idle_ms:.1f}ms ({idle_ms / total_ms * 100:.1f}%)"
-        )
-        lines.append("")
-        lines.append("瓶颈分布：")
-        for lb in b.labels:
-            pct_gpu = (
-                f"  (GPU 活跃时间的 {lb.pct_of_gpu_active * 100:.1f}%)"
-                if lb.pct_of_gpu_active is not None else ""
-            )
-            lines.append(
-                f"  {lb.category:<22}  {lb.pct_of_trace * 100:5.1f}% of trace"
-                f"  {lb.active_ns / 1e6:8.1f}ms{pct_gpu}"
-            )
-        lines.append("")
-        if b.top_events:
-            lines.append(f"Top {len(b.top_events)} 热点事件：")
-            for ev in b.top_events[:10]:
-                lines.append(
-                    f"  [{ev.category}] {ev.name[:60]:<60}  "
-                    f"{ev.total_ns / 1e6:8.1f}ms  ×{ev.count}"
-                )
-            lines.append("")
-
-    # Findings
-    if diag.findings:
-        sev_icon = {"critical": "✖", "warning": "⚠", "info": "ℹ"}
-        sev_zh = {"critical": "严重", "warning": "警告", "info": "提示"}
-        lines.append(f"分析结果（{len(diag.findings)} 条）：")
-        for f in diag.findings:
-            icon = sev_icon.get(f.severity, "·")
-            label = sev_zh.get(f.severity, f.severity.upper())
-            lines.append(f"  {icon} [{label}] {f.title}")
-            if f.evidence:
-                for ev in f.evidence[:3]:
-                    lines.append(f"      {ev}")
-            if f.next_step:
-                lines.append(f"    → {f.next_step[:120]}")
-        lines.append("")
-
-    # Hotspots
-    if diag.hotspots:
-        lines.append(f"代码热点（已映射到仓库，共 {len(diag.hotspots)} 个）：")
-        for h in diag.hotspots[:10]:
-            mapped = h.repo_file or "(未在仓库中找到)"
-            fn = f"  [{h.function}]" if h.function else ""
-            lines.append(
-                f"  {h.sample.pct * 100:5.1f}%  {h.sample.frame.symbol or '?':<40}"
-                f"  → {mapped}{fn}  置信度={h.match_confidence:.2f}"
-            )
-        lines.append("")
-
-    # Warnings
-    for w in diag.repo_warnings:
-        lines.append(f"注意：{w}")
-
-    if diag.summary:
-        lines.append("")
-        lines.append(f"摘要：{diag.summary}")
-
-    return "\n".join(lines)
+from .nsys.render import render_nsys_terminal
 
 
 def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
@@ -207,6 +115,21 @@ def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
         for el in diag.evidence_links
     ]
 
+    d["task_drafts"] = [
+        {
+            "id": td.id,
+            "finding_id": td.finding_id,
+            "hypothesis": td.hypothesis,
+            "verification_metric": td.verification_metric,
+            "candidate_callsites": td.candidate_callsites,
+            "target_locations": td.target_locations,
+            "inferred_by": td.inferred_by,
+            "evidence_windows": td.evidence_windows,
+            "search_specs": td.search_specs,
+        }
+        for td in diag.task_drafts
+    ]
+
     return d
 
 
@@ -267,6 +190,10 @@ def main() -> None:
     sc.add_argument(
         "--top-hotspots", type=int, default=20,
         help="映射到源码的 Top N 热点（默认 20）",
+    )
+    sc.add_argument(
+        "--report", choices=("compact", "full"), default="compact",
+        help="报告详细度：compact（默认）或 full",
     )
 
     args = p.parse_args()
@@ -337,7 +264,8 @@ def main() -> None:
         if args.json:
             print(json.dumps(_nsys_diag_to_dict(diag), indent=2))
         else:
-            print(_render_nsys_diag(diag))
+            verbose = args.verbose or getattr(args, "report", "compact") == "full"
+            print(render_nsys_terminal(diag, verbose=verbose))
 
     else:
         result = analyze_repo(args.repo_path, top_n=args.top, max_chain_depth=args.depth)

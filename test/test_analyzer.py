@@ -2,7 +2,7 @@
 
 Coverage:
   - Entry point detection (Python training / inference / generic)
-  - Cross-file call-chain tracing (Python & Rust)
+  - Cross-file call-chain tracing (Python)
   - Ignore rules (vendor / runfiles)
   - DAG structure (nodes, edges, in-degrees, reachability)
   - Python class method parsing
@@ -11,8 +11,6 @@ Coverage:
   - trace_from      (file-level & symbol-level targeting)
   - find_hubs       (degree computation)
   - C++ scanner     (include resolution, function extraction)
-  - Java scanner    (import resolution, method extraction)
-  - Go scanner      (package main, func main detection)
   - render_summary / render_trace output format
   - AnalysisResult.to_dict  (JSON-serialisable output)
 """
@@ -122,40 +120,6 @@ class TestEntryPointDetection(unittest.TestCase):
             self.assertGreaterEqual(len(result.entry_points), 1)
             self.assertEqual(result.entry_points[0].path, "inference.py")
             self.assertEqual(result.entry_points[0].mode, "inference")
-
-    def test_detects_rust_main_and_traces_module_calls(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "src/main.rs", """
-                mod core;
-
-                fn main() {
-                    run_cli();
-                }
-
-                fn run_cli() {
-                    core::telemetry::maybe_ping();
-                }
-            """)
-            _write(root, "src/core/mod.rs", """
-                pub mod telemetry;
-            """)
-            _write(root, "src/core/telemetry.rs", """
-                pub fn maybe_ping() {}
-            """)
-
-            result = analyze_repo(root)
-
-            self.assertGreaterEqual(len(result.entry_points), 1)
-            self.assertEqual(result.entry_points[0].path, "src/main.rs")
-            self.assertEqual(result.entry_points[0].mode, "generic")
-
-            chain = result.call_chains[0]
-            self.assertIn("src/main.rs", chain.visited_files)
-            self.assertIn("src/core/telemetry.rs", chain.visited_files)
-            targets = {step.to_symbol for step in chain.steps}
-            self.assertIn("src/main.rs::run_cli", targets)
-            self.assertIn("src/core/telemetry.rs::maybe_ping", targets)
 
     def test_ignores_vendor_trees_and_keeps_project_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -753,215 +717,7 @@ class TestCppScanner(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 9.  Java scanner
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestJavaScanner(unittest.TestCase):
-    """JavaScanner: method extraction, import binding, main detection."""
-
-    def _scan(self, root: Path):
-        files, _ = scan_repo(root)
-        return files
-
-    def test_java_methods_extracted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "com/example/App.java", """
-                package com.example;
-
-                public class App {
-                    public static void main(String[] args) {
-                        run();
-                    }
-
-                    private static void run() {
-                        System.out.println("hello");
-                    }
-                }
-            """)
-
-            files = self._scan(root)
-
-            self.assertIn("com/example/App.java", files)
-            facts = files["com/example/App.java"]
-            self.assertIn("main", facts.functions)
-            self.assertIn("run", facts.functions)
-            self.assertEqual(facts.language, "java")
-
-    def test_java_main_has_high_generic_score(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "Main.java", """
-                public class Main {
-                    public static void main(String[] args) {
-                        System.out.println("start");
-                    }
-                }
-            """)
-
-            files = self._scan(root)
-            facts = files["Main.java"]
-
-            self.assertTrue(facts.has_main_guard)
-            self.assertGreater(facts.generic_score, 0)
-
-    def test_java_import_binding(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "com/example/Service.java", """
-                import com.example.Repo;
-
-                public class Service {
-                    public void handle() {
-                        Repo r = new Repo();
-                        r.save();
-                    }
-                }
-            """)
-            _write(root, "com/example/Repo.java", """
-                public class Repo {
-                    public void save() {}
-                }
-            """)
-
-            files = self._scan(root)
-            facts = files["com/example/Service.java"]
-
-            self.assertIn("Repo", facts.imports)
-            imp = facts.imports["Repo"]
-            self.assertEqual(imp.binding_type, "import")
-
-    def test_java_method_calls_recorded(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "Processor.java", """
-                public class Processor {
-                    public void process() {
-                        validate();
-                        transform();
-                        store();
-                    }
-
-                    private void validate() {}
-                    private void transform() {}
-                    private void store() {}
-                }
-            """)
-
-            files = self._scan(root)
-            calls = files["Processor.java"].functions["process"].calls
-
-            self.assertIn("validate", calls)
-            self.assertIn("transform", calls)
-            self.assertIn("store", calls)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 10.  Go scanner
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestGoScanner(unittest.TestCase):
-    """GoScanner: func extraction, package main detection, import handling."""
-
-    def _scan(self, root: Path):
-        files, _ = scan_repo(root)
-        return files
-
-    def test_go_main_func_detected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "main.go", """
-                package main
-
-                import "fmt"
-
-                func main() {
-                    greet()
-                }
-
-                func greet() {
-                    fmt.Println("hello")
-                }
-            """)
-
-            files = self._scan(root)
-
-            self.assertIn("main.go", files)
-            facts = files["main.go"]
-            self.assertIn("main", facts.functions)
-            self.assertIn("greet", facts.functions)
-            self.assertTrue(facts.has_main_guard)
-            self.assertGreater(facts.generic_score, 0)
-            self.assertEqual(facts.language, "go")
-
-    def test_go_non_main_package_lower_score(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "lib/helper.go", """
-                package helper
-
-                func Compute() int {
-                    return 42
-                }
-            """)
-
-            files = self._scan(root)
-            facts = files["lib/helper.go"]
-
-            self.assertFalse(facts.has_main_guard)
-
-    def test_go_func_calls_extracted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "server.go", """
-                package main
-
-                func main() {
-                    serve()
-                }
-
-                func serve() {
-                    listen()
-                    accept()
-                }
-
-                func listen() {}
-                func accept() {}
-            """)
-
-            files = self._scan(root)
-            calls = files["server.go"].functions["serve"].calls
-
-            self.assertIn("listen", calls)
-            self.assertIn("accept", calls)
-
-    def test_go_import_group_parsed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "app.go", """
-                package main
-
-                import (
-                    "fmt"
-                    "os"
-                    log "log/slog"
-                )
-
-                func main() {
-                    fmt.Println("ok")
-                }
-            """)
-
-            files = self._scan(root)
-            facts = files["app.go"]
-
-            self.assertIn("fmt", facts.imports)
-            self.assertIn("os", facts.imports)
-            self.assertIn("log", facts.imports)   # alias
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 11.  Render helpers + JSON output
+# 9.  Render helpers + JSON output
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestRenderAndJSON(unittest.TestCase):
@@ -1049,27 +805,11 @@ class TestRenderAndJSON(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 12.  Language distribution & multi-language repo
+# 10.  Source file count
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestMultiLanguage(unittest.TestCase):
-    """analyze_repo correctly counts files per language in a mixed repo."""
-
-    def test_language_distribution_mixed_repo(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "main.py", "def run(): pass\nif __name__=='__main__': run()")
-            _write(root, "lib.go", "package lib\nfunc Helper() {}")
-            _write(root, "core.cpp", "void compute() {}")
-
-            result = analyze_repo(root)
-
-            self.assertIn("python", result.languages)
-            self.assertIn("go", result.languages)
-            self.assertIn("cpp", result.languages)
-            self.assertEqual(result.languages["python"], 1)
-            self.assertEqual(result.languages["go"], 1)
-            self.assertEqual(result.languages["cpp"], 1)
+class TestSourceFileCount(unittest.TestCase):
+    """analyze_repo counts Python source files correctly."""
 
     def test_source_files_count_matches_actual(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

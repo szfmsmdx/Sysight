@@ -43,13 +43,15 @@ INFERENCE_KW = (
 CLI_HINTS = ("argparse", "click", "typer", "fire", "hydra")
 
 
-def should_ignore(repo_root: Path, path: Path) -> bool:
+def should_ignore(repo_root: Path, path: Path, include_runfiles: bool = False) -> bool:
     if path.suffix.lower() in _IGNORE_EXTS:
         return True
     for part in path.relative_to(repo_root).parts:
         low = part.lower()
         if low in _IGNORE_DIRS:
             return True
+        if include_runfiles and low.endswith(".runfiles"):
+            continue
         if any(low.endswith(s) for s in _IGNORE_SUFFIXES):
             return True
     return False
@@ -120,6 +122,31 @@ class FunctionFacts:
 
 
 @dataclass
+class CallSiteFacts:
+    """A single Python call site captured at AST parse time.
+
+    Syntax-level only — no type inference.  Receiver and keywords are
+    string reprs of the AST nodes, not resolved values.
+
+    id format: "<path>:<line>:<col>:<call_name>"
+    """
+    id: str                         # stable reference for LLM / optimizer
+    path: str
+    line: int
+    col: int | None
+    end_line: int | None
+    end_col: int | None
+    call_name: str                  # "to", "cuda", "copy_", "pin_memory"
+    full_call_name: str | None      # "batch.to", "torch.cuda.synchronize"
+    receiver: str | None            # "batch", "x", "self.data"
+    args_repr: list[str]            # positional args as source strings
+    keywords: dict[str, str]        # keyword args: {"device": "cuda", "non_blocking": "False"}
+    enclosing_function: str | None  # qualified name of the containing function
+    loop_depth: int                 # 0 = not inside any loop
+    source_line: str                # raw source line for LLM reading
+
+
+@dataclass
 class FileFacts:
     path: str
     module_name: str
@@ -134,6 +161,7 @@ class FileFacts:
     inference_score: int
     generic_score: int
     notes: list[str]
+    callsites: list[CallSiteFacts] = field(default_factory=list)
     extra: dict[str, str | int | float | list[str]] = field(default_factory=dict)
     # e.g. {"gpu_tags": ["triton_jit", "nccl_comm"], "cuda_kernel_count": 3}
 
@@ -151,8 +179,9 @@ class BaseScanner(ABC):
     #: Set of lowercase file extensions this scanner handles, e.g. {".py"}
     EXTENSIONS: frozenset[str] = frozenset()
 
-    def __init__(self, repo_root: Path) -> None:
+    def __init__(self, repo_root: Path, include_runfiles: bool = False) -> None:
         self.root = repo_root
+        self.include_runfiles = include_runfiles
         self.warnings: list[str] = []
 
     @abstractmethod
@@ -172,7 +201,7 @@ class BaseScanner(ABC):
         for p in paths:
             if p.suffix.lower() not in self.EXTENSIONS:
                 continue
-            if should_ignore(self.root, p):
+            if should_ignore(self.root, p, include_runfiles=self.include_runfiles):
                 continue
             rel = str(p.relative_to(self.root))
             try:

@@ -1,3 +1,24 @@
+## v0.2 — 2026-04-17
+
+- Summary: 诊断协议强化，建立 TaskDraft → OptimizeTask 的 LLM 调查层分层边界。
+- 架构澄清：
+  - analyzer core 输出 `TaskDraft`（deterministic）；LLM investigator 将其升级为 `OptimizeTask`；optimizer 消费 `OptimizeTask`
+  - core 不直接输出 `OptimizeTask`
+- `nsys/models.py`：
+  - 新增 `stable_finding_id()`：基于 category + severity + time_range + device_id 的 SHA1 content hash，不依赖排序 index
+  - 新增 `TargetLocation`、`RejectedCandidate`、`ConfidenceBreakdown` dataclass，替代 `OptimizeTask` 中的 loose dict
+  - `ConfidenceBreakdown.composite()`：deterministic_finding 为 ceiling anchor，LLM 代码语义最多加 +0.15
+  - `NsysFinding` 新增 `stable_id` 字段
+- `nsys/classify.py`：`classify_bottlenecks()` 返回前批量赋值 `finding.stable_id`
+- `nsys/__init__.py`：
+  - `TaskDraft.finding_id` 改用 `finding.stable_id`
+  - `EvidenceLink` 创建时补全稳定 `id`（格式 `{category}:{event}:{link_type}:{idx}`）
+  - evidence_windows 扩充 `event_category`、`correlation_id`；memcpy 事件额外加 `copy_kind`、`size_bytes`
+  - gpu_idle gap 计算改为 `gpu_compute + gpu_comm + gpu_memcpy`，修正 memcpy 活跃时间被误算为 idle
+- render.py（上轮）：
+  - Bottleneck 表新增 Union % / Inclusive % 双列；Overview、Capture Quality、Investigation Queue 重构；Code Localization 改进；SQL 证据归并进各自 domain
+- 测试：88 → 96 tests，全部通过
+
 ## v0.1 — 2026-04-16
 
 - Summary: `sysight analyzer` 首个可用版本，包含仓库三阶段分析和 nsys T1-T5 诊断流水线。

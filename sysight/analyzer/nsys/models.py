@@ -19,6 +19,7 @@ Key design decisions:
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 
 # ── T1: Input ─────────────────────────────────────────────────────────────────
@@ -76,9 +77,11 @@ class NsysTrace:
     profile_path: str
     sqlite_path: str
     duration_ns: int
-    events: list[TimelineEvent]
-    schema_version: str
-    warnings: list[str]
+    trace_start_ns: int = 0     # absolute start of the profiled window (ns)
+    trace_end_ns: int = 0       # absolute end of the profiled window (ns)
+    events: list[TimelineEvent] = field(default_factory=list)
+    schema_version: str = "unknown"
+    warnings: list[str] = field(default_factory=list)
 
 
 # ── T4: Bottleneck classification ─────────────────────────────────────────────
@@ -124,12 +127,28 @@ class EventStat:
 
 
 @dataclass
+class DeviceBreakdown:
+    """Per-device GPU activity breakdown.
+
+    Used when a profile covers multiple GPUs.
+    active_ns is the interval-union GPU time for this device only.
+    """
+    device_id: int
+    active_ns: int
+    idle_ns: int
+    pct_active: float           # active_ns / total_trace_ns
+    top_event_names: list[str]  # top kernels for this device
+
+
+@dataclass
 class BottleneckSummary:
     total_ns: int           # trace.duration_ns  (wall clock)
-    gpu_active_ns: int      # interval-union of all GPU events
+    gpu_active_ns: int      # interval-union of all GPU events (all devices)
     gpu_idle_ns: int        # total_ns - gpu_active_ns
     labels: list[BottleneckLabel]   # sorted by pct_of_trace descending
     top_events: list[EventStat]     # top 10 most time-consuming events (cross-category)
+    per_device: list[DeviceBreakdown] = field(default_factory=list)
+    # non-empty only when profile has events from multiple device_ids
 
 
 # ── NsysFinding: diagnostic problem descriptions ──────────────────────────────
@@ -166,6 +185,10 @@ class NsysFinding:
     related_events: list[str] = field(default_factory=list) # event names involved
     related_hotspots: list[str] = field(default_factory=list)  # kernel/func names
     next_step: str = ""                     # recommended action for optimizer
+    # Stable ID: survives re-ordering of findings list.
+    # Generated from category + severity + time_range_ns by stable_finding_id().
+    # Empty string until explicitly assigned (e.g. in classify_bottlenecks).
+    stable_id: str = ""
 
 
 # ── T5: Sample & event aggregation ───────────────────────────────────────────
@@ -201,6 +224,144 @@ class MappedHotspot:
     alternatives: list[str]     # candidate files/functions when confidence is low
 
 
+# ── T8: Task drafts & optimize tasks ─────────────────────────────────────────
+
+
+def stable_finding_id(category: str, severity: str, time_range_ns: tuple[int, int] | None, device_id: int | None = None) -> str:
+    """Generate a stable finding ID from content fields (not sort order).
+
+    Based on: category + severity + time_range_ns + device_id.
+    Returns an 8-char hex prefix, e.g. "gpu_idle:a3f2c1b0".
+    Safe to use as a long-term reference in TaskDraft / OptimizeTask.
+    """
+    raw = f"{category}|{severity}|{time_range_ns}|{device_id}"
+    h = hashlib.sha1(raw.encode(), usedforsecurity=False).hexdigest()[:8]
+    return f"{category}:{h}"
+
+
+@dataclass
+class TargetLocation:
+    """A confirmed code location that an OptimizeTask targets.
+
+    Every target_location must be traceable to a deterministic source:
+    callsite_id, file + line, NVTX region name, CPU sample, or correlation_id.
+    LLM must NOT create a TargetLocation without at least one anchor.
+    """
+    file: str
+    line: int
+    call: str                           # source expression, e.g. "batch.to(device)"
+    # At least one anchor must be non-None:
+    callsite_id: str | None = None      # "<path>:<line>:<col>:<call_name>" from callsite index
+    nvtx_region: str | None = None      # NVTX range label that led here
+    correlation_id: int | None = None   # nsys correlation_id linking CPU API to GPU kernel
+    cpu_sample_pct: float | None = None # CPU sample percentage if from cpu_sample hotspot
+    anchor_type: str = "unknown"        # "callsite" | "nvtx" | "correlation_id" | "cpu_sample" | "file_line"
+    note: str = ""                      # LLM's brief justification
+
+
+@dataclass
+class RejectedCandidate:
+    """A callsite the LLM investigated but ruled out.
+
+    Required field: LLM must not silently drop candidates.
+    reason must explain *why* this callsite is not the bottleneck.
+    """
+    callsite_id: str                    # same id format as TargetLocation.callsite_id
+    file: str
+    line: int
+    call: str
+    reason: str                         # e.g. "only runs at init, not in training loop"
+
+
+@dataclass
+class ConfidenceBreakdown:
+    """Per-source confidence components for an OptimizeTask.
+
+    Scores are 0.0–1.0.  The final composite confidence is computed by the
+    LLM investigator; it must not exceed the deterministic_finding score by
+    more than 0.15 (LLM adds code-semantic confidence, not bottleneck math).
+    """
+    deterministic_finding: float        # from NsysFinding.confidence (immutable)
+    callsite_score: float = 0.0         # evidence from static callsite index
+    llm_verify: float = 0.0            # LLM code-semantic verification
+    nvtx_match: float = 0.0            # NVTX region → source mapping match
+    cpu_sample_match: float = 0.0      # CPU backtrace → source file match
+
+    def composite(self) -> float:
+        """Compute final confidence; deterministic_finding is the ceiling anchor."""
+        sources = [self.callsite_score, self.llm_verify,
+                   self.nvtx_match, self.cpu_sample_match]
+        code_confidence = max((s for s in sources if s > 0), default=0.0)
+        # code semantics can raise confidence, but not by more than +0.15
+        return min(1.0, self.deterministic_finding + min(0.15, code_confidence * 0.15))
+
+
+@dataclass
+class TaskDraft:
+    """Core-generated task skeleton for one finding.
+
+    Produced deterministically by the analyzer core (no LLM).
+    Contains the finding, verification metric, search seeds, and evidence
+    windows.  target_locations is empty — the LLM investigator fills that in.
+
+    evidence_windows: top time windows from the profile that caused this
+      finding (device/stream/event/neighboring kernels/overlapping NVTX).
+      Most useful when no repo is available — these windows ARE the
+      closest-to-code information we have without source mapping.
+
+    search_specs: rg-pattern seeds derived from the finding category.
+      These are SEARCH ENTRY POINTS, not conclusions.  The LLM investigator
+      must run them and validate matches against profile evidence before
+      writing target_locations.
+    """
+    id: str                             # e.g. "gpu_memcpy_h2d_001_draft"
+    finding_id: str                     # corresponds to NsysFinding
+    hypothesis: str                     # "H2D memcpy 量异常，待确认代码位置"
+    verification_metric: str            # "H2D memcpy total_ms 下降"
+    candidate_callsites: list[str]      # callsite ids from search_calls (scored)
+    target_locations: list[dict]        # empty until LLM investigator fills it
+    inferred_by: str = "deterministic"
+    # ── Profile-derived evidence (no LLM, no repo needed) ────────────────────
+    evidence_windows: list[dict] = field(default_factory=list)
+    # Each dict: {"start_ms": float, "end_ms": float, "device": int|None,
+    #             "stream": int|None, "event": str,
+    #             "before_kernel": str|None, "after_kernel": str|None,
+    #             "overlap_nvtx": list[str]}
+    search_specs: list[dict] = field(default_factory=list)
+    # Each dict: {"pattern": str, "kind": "rg", "rationale": str}
+    # kind="rg" means: rg -n "<pattern>" <repo_root>
+
+
+@dataclass
+class OptimizeTask:
+    """LLM-confirmed task with target code locations.
+
+    Upgraded from a TaskDraft after LLM investigator validates callsites.
+    confidence may be > 0.5 because it combines deterministic finding
+    confidence with callsite facts and LLM verification.
+
+    rejected_candidates: callsites the LLM investigated but ruled out,
+      with reasons.  Required — LLM must not silently ignore candidates.
+
+    confidence_breakdown: per-source confidence scores that compose the
+      final confidence value, for auditability.
+    """
+    id: str
+    finding_id: str                     # must be NsysFinding.stable_id, not sort-index
+    hypothesis: str
+    evidence_links: list[str]           # EvidenceLink ids (audit trail)
+    target_files: list[str]
+    target_locations: list[TargetLocation]   # non-empty before optimizer may run
+    proposed_change_kind: str
+    verification_metric: str
+    confidence: float                   # ConfidenceBreakdown.composite()
+    risk: str                           # "low" | "medium" | "high"
+    inferred_by: str = "llm_investigated"
+    rejected_candidates: list[RejectedCandidate] = field(default_factory=list)
+    # LLM must populate this; empty rejected_candidates is a validator error
+    confidence_breakdown: ConfidenceBreakdown | None = None
+
+
 # ── T8: Evidence links ────────────────────────────────────────────────────────
 
 @dataclass
@@ -212,6 +373,9 @@ class EvidenceLink:
       2. time_overlap:   NVTX range / cpu_sample overlaps kernel window
       3. file_line:      SourceFrame.source_file + source_line → repo function
       4. symbol:         SourceFrame.symbol → repo function name match
+
+    LLM-inferred links must set inferred_by="llm_investigated" and have
+    confidence <= 0.50 unless backed by deterministic evidence.
     """
     bottleneck_category: str        # e.g. "gpu_comm"
     event_name: str                 # e.g. "ncclAllReduceKernel"
@@ -221,6 +385,11 @@ class EvidenceLink:
     link_type: str                  # "correlation_id" | "time_overlap" | "file_line" | "symbol"
     reason: str                     # human-readable explanation
     confidence: float
+    # Audit / extended fields
+    id: str | None = None           # stable reference: "{category}:{event}:{link_type}:{idx}"
+    correlation_id: int | None = None   # nsys CPU↔GPU correlation key (most reliable)
+    device_id: int | None = None    # which GPU device this link was found on
+    inferred_by: str = "deterministic"  # "deterministic" | "llm_investigated"
 
 
 # ── T8: Final diagnosis ───────────────────────────────────────────────────────
@@ -235,6 +404,7 @@ class NsysDiag:
     findings: list[NsysFinding]     # diagnostic problems (LLM reads this first)
     hotspots: list[MappedHotspot]
     evidence_links: list[EvidenceLink]
+    task_drafts: list[TaskDraft]    # Core-generated task skeletons; LLM upgrades to OptimizeTask
     repo_warnings: list[str]
     summary: str                    # brief text for LLM quick-read; not primary data
 

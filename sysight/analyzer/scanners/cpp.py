@@ -38,14 +38,15 @@ _KW = {
 class CppScanner(BaseScanner):
     EXTENSIONS = frozenset({".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cuh"})
 
-    def __init__(self, repo_root: Path) -> None:
-        super().__init__(repo_root)
+    def __init__(self, repo_root: Path, include_runfiles: bool = False) -> None:
+        super().__init__(repo_root, include_runfiles=include_runfiles)
         self._rel2path: dict[str, str] = {}
 
     def scan(self) -> dict[str, FileFacts]:
         paths = sorted(
             p for p in self.root.rglob("*")
-            if p.suffix.lower() in self.EXTENSIONS and not should_ignore(self.root, p)
+            if p.suffix.lower() in self.EXTENSIONS
+            and not should_ignore(self.root, p, include_runfiles=self.include_runfiles)
         )
         basename_map: dict[str, list[str]] = defaultdict(list)
         for p in paths:
@@ -70,7 +71,8 @@ class CppScanner(BaseScanner):
         """
         cpp_paths = sorted(
             p for p in paths
-            if p.suffix.lower() in self.EXTENSIONS and not should_ignore(self.root, p)
+            if p.suffix.lower() in self.EXTENSIONS
+            and not should_ignore(self.root, p, include_runfiles=self.include_runfiles)
         )
         basename_map: dict[str, list[str]] = defaultdict(list)
         for p in cpp_paths:

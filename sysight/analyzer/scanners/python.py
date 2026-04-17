@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .base import (
-    BaseScanner, CLI_HINTS, FileFacts, FunctionFacts, ImportBinding,
+    BaseScanner, CallSiteFacts, CLI_HINTS, FileFacts, FunctionFacts, ImportBinding,
     INFERENCE_KW, TRAINING_KW, ENTRY_FILE_HINTS, norm, should_ignore,
 )
 
@@ -78,15 +78,137 @@ def _fn_gpu_tags(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
     return tags
 
 
+def _node_repr(node: ast.expr) -> str:
+    """Best-effort single-line repr of an AST expression node."""
+    try:
+        if hasattr(ast, "unparse"):
+            return ast.unparse(node)
+    except Exception:
+        pass
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Constant):
+        return repr(node.value)
+    return "<expr>"
+
+
+def _collect_callsites(
+    body: list[ast.stmt],
+    rel_path: str,
+    src_lines: list[str],
+    enclosing_fn: str | None,
+) -> list[CallSiteFacts]:
+    """Walk *body* and emit a CallSiteFacts for every Call node found.
+
+    loop_depth counts nested for/while loops around each call.
+    We do a manual DFS instead of ast.walk so we can track loop nesting.
+    """
+    results: list[CallSiteFacts] = []
+
+    def _visit(stmts: list[ast.stmt], depth: int) -> None:
+        for stmt in stmts:
+            _visit_stmt(stmt, depth)
+
+    def _visit_stmt(node: ast.stmt, depth: int) -> None:
+        # Recurse into loop bodies with depth+1
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            _visit(node.body, depth + 1)
+            _visit(node.orelse, depth)
+            return
+        # Recurse into conditionals / try / with without increasing depth
+        if isinstance(node, ast.If):
+            _visit(node.body, depth)
+            _visit(node.orelse, depth)
+            return
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            _visit(node.body, depth)
+            return
+        if isinstance(node, ast.Try):
+            _visit(node.body, depth)
+            _visit(node.orelse, depth)
+            _visit(node.finalbody if hasattr(node, "finalbody") else [], depth)
+            for handler in node.handlers:
+                _visit(handler.body, depth)
+            return
+        if hasattr(ast, "TryStar") and isinstance(node, ast.TryStar):  # Python 3.11+
+            _visit(node.body, depth)
+            for handler in node.handlers:
+                _visit(handler.body, depth)
+            _visit(node.orelse, depth)
+            _visit(node.finalbody, depth)
+            return
+        # Collect calls from expression statements and assignments
+        _collect_from_stmt(node, depth)
+
+    def _collect_from_stmt(stmt: ast.stmt, depth: int) -> None:
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # Determine call_name and receiver
+            if isinstance(func, ast.Attribute):
+                call_name = func.attr
+                receiver = _node_repr(func.value)
+                full_call_name = f"{receiver}.{call_name}"
+            elif isinstance(func, ast.Name):
+                call_name = func.id
+                receiver = None
+                full_call_name = call_name
+            else:
+                continue  # complex expression, skip
+
+            line = node.lineno
+            col = node.col_offset
+            end_line = getattr(node, "end_lineno", None)
+            end_col = getattr(node, "end_col_offset", None)
+            source_line = src_lines[line - 1].rstrip() if 0 < line <= len(src_lines) else ""
+
+            args_repr = [_node_repr(a) for a in node.args]
+            keywords = {
+                kw.arg: _node_repr(kw.value)
+                for kw in node.keywords
+                if kw.arg is not None
+            }
+
+            cs_id = f"{rel_path}:{line}:{col}:{call_name}"
+            results.append(CallSiteFacts(
+                id=cs_id,
+                path=rel_path,
+                line=line,
+                col=col,
+                end_line=end_line,
+                end_col=end_col,
+                call_name=call_name,
+                full_call_name=full_call_name,
+                receiver=receiver,
+                args_repr=args_repr,
+                keywords=keywords,
+                enclosing_function=enclosing_fn,
+                loop_depth=depth,
+                source_line=source_line,
+            ))
+
+    try:
+        _visit(body, 0)
+    except RecursionError:
+        pass
+    return results
+
+
 class PythonScanner(BaseScanner):
     EXTENSIONS = frozenset({".py"})
 
-    def __init__(self, repo_root: Path) -> None:
-        super().__init__(repo_root)
+    def __init__(self, repo_root: Path, include_runfiles: bool = False) -> None:
+        super().__init__(repo_root, include_runfiles=include_runfiles)
         self._mod2file: dict[str, str] = {}
 
     def scan(self) -> dict[str, FileFacts]:
-        paths = sorted(p for p in self.root.rglob("*.py") if not should_ignore(self.root, p))
+        paths = sorted(
+            p for p in self.root.rglob("*.py")
+            if not should_ignore(self.root, p, include_runfiles=self.include_runfiles)
+        )
         self._mod2file = {self._modname(p): str(p.relative_to(self.root)) for p in paths}
         out: dict[str, FileFacts] = {}
         for p in paths:
@@ -105,7 +227,8 @@ class PythonScanner(BaseScanner):
         """
         py_paths = sorted(
             p for p in paths
-            if p.suffix.lower() == ".py" and not should_ignore(self.root, p)
+            if p.suffix.lower() == ".py"
+            and not should_ignore(self.root, p, include_runfiles=self.include_runfiles)
         )
         # Build mod2file only from selected paths
         self._mod2file = {self._modname(p): str(p.relative_to(self.root)) for p in py_paths}
@@ -154,6 +277,7 @@ class PythonScanner(BaseScanner):
         rel = str(path.relative_to(self.root))
         mod = self._modname(path)
         src = path.read_text(encoding="utf-8")
+        src_lines = src.splitlines()
         tree = ast.parse(src, filename=rel)
 
         fns: dict[str, FunctionFacts] = {}
@@ -162,33 +286,42 @@ class PythonScanner(BaseScanner):
         top: list[ast.stmt] = []
         guard: list[ast.stmt] = []
         has_guard = False
+        all_callsites: list[CallSiteFacts] = []
 
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 gpu_tags = _fn_gpu_tags(node)
+                qname = f"{rel}::{node.name}"
                 fns[node.name] = FunctionFacts(
                     name=node.name,
-                    qualified_name=f"{rel}::{node.name}",
+                    qualified_name=qname,
                     line=node.lineno,
                     end_line=getattr(node, 'end_lineno', None),
                     calls=_collect_calls(node.body),
                     is_gpu_kernel=bool(gpu_tags),
                     extra={'gpu_tags': gpu_tags} if gpu_tags else {},
                 )
+                all_callsites.extend(
+                    _collect_callsites(node.body, rel, src_lines, qname)
+                )
                 continue
             if isinstance(node, ast.ClassDef):
                 for item in node.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         key = f"{node.name}.{item.name}"
+                        qname = f"{rel}::{key}"
                         gpu_tags = _fn_gpu_tags(item)
                         fns[key] = FunctionFacts(
                             name=item.name,
-                            qualified_name=f"{rel}::{key}",
+                            qualified_name=qname,
                             line=item.lineno,
                             end_line=getattr(item, 'end_lineno', None),
                             calls=_collect_calls(item.body),
                             is_gpu_kernel=bool(gpu_tags),
                             extra={'gpu_tags': gpu_tags} if gpu_tags else {},
+                        )
+                        all_callsites.extend(
+                            _collect_callsites(item.body, rel, src_lines, qname)
                         )
                 top.append(node)
                 continue
@@ -245,6 +378,7 @@ class PythonScanner(BaseScanner):
             main_guard_calls=_collect_calls(guard),
             functions=fns, imports=imps,
             training_score=tr, inference_score=inf, generic_score=gen, notes=notes,
+            callsites=all_callsites,
             extra=file_extra,
         )
 

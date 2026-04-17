@@ -39,7 +39,7 @@ def resolve_profile_input(
         if sq.is_file() and sq.stat().st_size > 0:
             return ProfileInput(original_path=original, sqlite_path=str(sq), action_required=False)
         return ProfileInput(original_path=original, sqlite_path=str(sq), action_required=True,
-                            reason=f"Explicit sqlite_path not found or empty: {sq}")
+                            reason=f"指定的 sqlite_path 不存在或为空：{sq}")
 
     if p.suffix.lower() == ".nsys-rep":
         sibling = p.with_suffix(".sqlite")
@@ -47,14 +47,14 @@ def resolve_profile_input(
             return ProfileInput(original_path=original, sqlite_path=str(sibling), action_required=False)
         return ProfileInput(
             original_path=original, sqlite_path=None, action_required=True,
-            reason=f"SQLite export required. Run: nsys export -t sqlite {p} -o {sibling} --force-overwrite=true",
+            reason=f"需要导出 SQLite，请运行： nsys export -t sqlite {p} -o {sibling} --force-overwrite=true",
         )
 
     if p.is_file() and p.stat().st_size > 0:
         return ProfileInput(original_path=original, sqlite_path=str(p), action_required=False)
 
     return ProfileInput(original_path=original, sqlite_path=None, action_required=True,
-                        reason=f"Profile file not found or empty: {p}")
+                        reason=f"Profile 文件不存在或为空：{p}")
 
 
 # ── T2: Schema inspection ─────────────────────────────────────────────────────
@@ -67,17 +67,21 @@ _CAPABILITY_TABLES: dict[str, list[str]] = {
     "cuda_sync":    ["CUPTI_ACTIVITY_KIND_SYNCHRONIZATION"],
     "nvtx":         ["NVTX_EVENTS"],
     "cpu_sample":   ["COMPOSITE_EVENTS"],
+    "cudnn":        ["CUDNN_EVENTS"],
     "osrt":         ["OSRT_API"],
     "mpi":          ["MPI_", "MPIP_"],
     "gpu_metrics":  ["GPU_METRICS", "TARGET_INFO_GPU_METRICS"],
     "file_access":  ["FILE_ACCESS"],
     "string_ids":   ["StringIds"],
 }
-_REQUIRES_STRING_IDS = {"cuda_kernel", "nvtx", "cpu_sample"}
-_SKIP_COLUMN_READ = {"COMPOSITE_EVENTS", "OSRT_CALLCHAINS", "SAMPLING_CALLCHAINS", "NVTX_PAYLOAD_SCHEMAS"}
+_REQUIRES_STRING_IDS = {"cuda_kernel", "nvtx", "cpu_sample", "cudnn"}
+_SKIP_COLUMN_READ = {"OSRT_CALLCHAINS", "SAMPLING_CALLCHAINS", "NVTX_PAYLOAD_SCHEMAS"}
 _KNOWN_PREFIXES = {"CUPTI_", "NVTX_", "OSRT_", "MPI", "StringIds",
                    "META_DATA", "TARGET_INFO", "GPU_METRICS", "FILE_ACCESS",
-                   "COMPOSITE_EVENTS", "SAMPLING_CALLCHAINS", "ENUM_"}
+                   "COMPOSITE_EVENTS", "SAMPLING_CALLCHAINS", "ENUM_",
+                   "ANALYSIS_", "CUDA_GPU_", "CUDNN_", "DIAGNOSTIC_",
+                   "PROCESSES", "ProcessStreams", "SCHED_", "ThreadNames",
+                   "PROFILER_OVERHEAD"}
 
 
 def inspect_schema(sqlite_path: str) -> SchemaInfo:
@@ -249,14 +253,16 @@ def extract_trace(
     sqlite_path: str,
     schema: SchemaInfo,
     *,
-    max_events: int = 500_000,
+    max_events: int = 0,
 ) -> NsysTrace:
     """T3: Extract timeline events from a Nsight Systems SQLite file.
 
     Args:
         sqlite_path:  Path to .sqlite export.
         schema:       Output of inspect_schema() for this file.
-        max_events:   Hard cap on events loaded (safety valve for huge profiles).
+        max_events:   已弃用参数，保留以兼容旧调用，设置为 0 表示不限制。
+                      详细分析由 classify.py 直接查询 SQLite 完成，无需在内存中
+                      加载全量事件。
 
     Returns NsysTrace with all events and trace-level metadata.
     """
@@ -272,6 +278,7 @@ def extract_trace(
         duration_ns = 0
         trace_start = 0
 
+        trace_end = 0
         if kernel_tbl:
             row = conn.execute(
                 f"SELECT MIN(start), MAX([end]) FROM {kernel_tbl}"
@@ -286,57 +293,52 @@ def extract_trace(
             ).fetchone()
             if row and row[0] is not None:
                 trace_start = int(row[0])
-                duration_ns = int(row[1]) - trace_start
+                trace_end = int(row[0]) + (int(row[1]) - int(row[0]))
+                duration_ns = trace_end - trace_start
 
         if duration_ns == 0:
             warnings.append("无法确定 trace 时长（未找到 kernel/runtime 数据）")
 
-        # Extract each category
-        remaining = max_events
+        # 提取各类别事件——不设上限。
+        # 注意：对于超大 profile，内核数量可能达到数十万乃至数百万。
+        # classify.py 会直接查询 SQLite 做统计分析，这里只需加载
+        # 足够的区间信息用于瓶颈分类即可。
+        # 为了节省内存，对于纯统计目的我们做聚合查询。
 
-        if "cuda_kernel" in schema.capabilities and remaining > 0:
-            n = _extract_kernels(conn, schema, events, remaining, warnings)
-            remaining -= n
+        if "cuda_kernel" in schema.capabilities:
+            n = _extract_kernels(conn, schema, events, 0, warnings)
 
-        if "cuda_memcpy" in schema.capabilities and remaining > 0:
-            n = _extract_memcpy(conn, schema, events, remaining, warnings)
-            remaining -= n
+        if "cuda_memcpy" in schema.capabilities:
+            n = _extract_memcpy(conn, schema, events, 0, warnings)
 
-        if "cuda_memset" in schema.capabilities and remaining > 0:
-            n = _extract_memset(conn, schema, events, remaining, warnings)
-            remaining -= n
+        if "cuda_memset" in schema.capabilities:
+            n = _extract_memset(conn, schema, events, 0, warnings)
 
-        if "cuda_runtime" in schema.capabilities and remaining > 0:
-            n = _extract_runtime(conn, schema, events, remaining, warnings)
-            remaining -= n
+        if "cuda_runtime" in schema.capabilities:
+            n = _extract_runtime(conn, schema, events, 0, warnings)
 
-        if "cuda_sync" in schema.capabilities and remaining > 0:
-            n = _extract_sync(conn, schema, events, remaining, warnings)
-            remaining -= n
+        if "cuda_sync" in schema.capabilities:
+            n = _extract_sync(conn, schema, events, 0, warnings)
 
-        if "nvtx" in schema.capabilities and remaining > 0:
-            n = _extract_nvtx(conn, schema, events, remaining, warnings)
-            remaining -= n
+        if "nvtx" in schema.capabilities:
+            n = _extract_nvtx(conn, schema, events, 0, warnings)
 
-        if "cpu_sample" in schema.capabilities and remaining > 0:
-            n = _extract_cpu_samples(conn, schema, events, remaining, warnings)
-            remaining -= n
+        if "cpu_sample" in schema.capabilities:
+            n = _extract_cpu_samples(conn, schema, events, 0, warnings)
 
-        if "osrt" in schema.capabilities and remaining > 0:
-            n = _extract_osrt(conn, schema, events, remaining, warnings)
-            remaining -= n
+        if "cudnn" in schema.capabilities:
+            n = _extract_cudnn(conn, schema, events, 0, warnings)
 
-    if remaining <= 0:
-        warnings.append(
-            f"事件数量超过上限 {max_events}，部分事件已截断。"
-            "可使用更短的时间窗口或调大 max_events 参数。"
-        )
+        if "osrt" in schema.capabilities:
+            n = _extract_osrt(conn, schema, events, 0, warnings)
 
     return NsysTrace(
         tool="nsys",
         profile_path=sqlite_path,
         sqlite_path=sqlite_path,
         duration_ns=duration_ns,
+        trace_start_ns=trace_start,
+        trace_end_ns=trace_end,
         events=events,
         schema_version=schema.version_hint,
         warnings=warnings,
@@ -372,6 +374,7 @@ def _extract_kernels(
     has_strings = "string_ids" in schema.capabilities
     name_expr = "s.value AS name" if has_strings else "CAST(k.shortName AS TEXT) AS name"
     join = "JOIN StringIds s ON k.shortName = s.id" if has_strings else ""
+    limit_clause = f"LIMIT {limit}" if limit and limit > 0 else ""
     sql = f"""
         SELECT k.start, k.[end],
                {_sel_col(schema, tbl, 'deviceId', prefix='k.')},
@@ -380,11 +383,11 @@ def _extract_kernels(
                {_sel_col(schema, tbl, 'globalTid', prefix='k.')},
                {name_expr}
         FROM {tbl} k {join}
-        ORDER BY k.start LIMIT ?
+        ORDER BY k.start {limit_clause}
     """
     count = 0
     try:
-        rows = conn.execute(sql, (limit,)).fetchall()
+        rows = conn.execute(sql).fetchall()
         for row in rows:
             name = row["name"] or "unknown_kernel"
             cat = "gpu_comm" if _is_comm_kernel(name) else "gpu_compute"
@@ -420,11 +423,11 @@ def _extract_memcpy(
                {_sel_col(schema, tbl, 'globalTid')},
                {_sel_col(schema, tbl, 'copyKind')},
                {_sel_col(schema, tbl, 'bytes')}
-        FROM {tbl} ORDER BY start LIMIT ?
+        FROM {tbl} ORDER BY start
     """
     count = 0
     try:
-        rows = conn.execute(sql, (limit,)).fetchall()
+        rows = conn.execute(sql).fetchall()
         for row in rows:
             kind = int(row["copyKind"]) if row["copyKind"] is not None else 0
             dur = int(row["end"]) - int(row["start"])
@@ -460,11 +463,11 @@ def _extract_memset(
                {_sel_col(schema, tbl, 'correlationId')},
                {_sel_col(schema, tbl, 'globalTid')},
                {_sel_col(schema, tbl, 'bytes')}
-        FROM {tbl} ORDER BY start LIMIT ?
+        FROM {tbl} ORDER BY start
     """
     count = 0
     try:
-        rows = conn.execute(sql, (limit,)).fetchall()
+        rows = conn.execute(sql).fetchall()
         for row in rows:
             dur = int(row["end"]) - int(row["start"])
             size = int(row["bytes"]) if row["bytes"] is not None else 0
@@ -500,11 +503,11 @@ def _extract_runtime(
                {_sel_col(schema, tbl, 'correlationId', prefix='r.')},
                {name_expr}
         FROM {tbl} r {join}
-        ORDER BY r.start LIMIT ?
+        ORDER BY r.start
     """
     count = 0
     try:
-        rows = conn.execute(sql, (limit,)).fetchall()
+        rows = conn.execute(sql).fetchall()
         for row in rows:
             dur = int(row["end"]) - int(row["start"])
             events.append(TimelineEvent(
@@ -535,11 +538,11 @@ def _extract_sync(
                {_sel_col(schema, tbl, 'globalTid')},
                {_sel_col(schema, tbl, 'correlationId')},
                {sync_expr}
-        FROM {tbl} ORDER BY start LIMIT ?
+        FROM {tbl} ORDER BY start
     """
     count = 0
     try:
-        rows = conn.execute(sql, (limit,)).fetchall()
+        rows = conn.execute(sql).fetchall()
         for row in rows:
             dur = int(row["end"]) - int(row["start"])
             events.append(TimelineEvent(
@@ -576,18 +579,18 @@ def _extract_nvtx(
             FROM {tbl} n
             LEFT JOIN StringIds s ON n.textId = s.id
             WHERE (n.text IS NOT NULL OR s.value IS NOT NULL) AND n.[end] > n.start
-            ORDER BY n.start LIMIT ?
+            ORDER BY n.start
         """
     else:
         sql = f"""
             SELECT start, [end], {gtid}, text
             FROM {tbl}
             WHERE text IS NOT NULL AND [end] > start
-            ORDER BY start LIMIT ?
+            ORDER BY start
         """
     count = 0
     try:
-        rows = conn.execute(sql, (limit,)).fetchall()
+        rows = conn.execute(sql).fetchall()
         for row in rows:
             dur = int(row["end"]) - int(row["start"])
             events.append(TimelineEvent(
@@ -633,32 +636,94 @@ def _extract_cpu_samples(
     sampling_tbl = "SAMPLING_CALLCHAINS"
     tables_present = set(schema.tables.keys())
     if has_strings and sampling_tbl in tables_present:
+        # Fetch all stack frames per sample, ordered by stackDepth ascending.
+        # stackDepth=0 is the leaf (innermost) frame; higher depths are callers.
+        # We group frames per sample using the COMPOSITE_EVENTS timestamp as key.
+        #
+        # Strategy: fetch all (ts, globalTid, stackDepth, symbol) rows at once,
+        # then group by ts in Python.  This avoids N+1 queries.
         sql = f"""
             SELECT ce.{time_expr} AS ts, {gtid},
+                   sc.stackDepth AS depth,
                    s.value AS symbol
             FROM {tbl} ce
-            LEFT JOIN {sampling_tbl} sc ON ce.id = sc.eventId
-            LEFT JOIN StringIds s ON sc.symbolId = s.id
-            WHERE sc.stackDepth = 0 OR sc.stackDepth IS NULL
-            ORDER BY ce.{time_expr} LIMIT ?
+            JOIN {sampling_tbl} sc ON ce.id = sc.id
+            LEFT JOIN StringIds s ON sc.symbol = s.id
+            ORDER BY ce.{time_expr}, sc.stackDepth
         """
     else:
         sql = f"""
-            SELECT {time_expr} AS ts, {gtid}, NULL AS symbol
-            FROM {tbl} ORDER BY {time_expr} LIMIT ?
+            SELECT {time_expr} AS ts, {gtid}, NULL AS depth, NULL AS symbol
+            FROM {tbl} ORDER BY {time_expr}
         """
     count = 0
     try:
-        rows = conn.execute(sql, (limit,)).fetchall()
-        for row in rows:
+        rows = conn.execute(sql).fetchall()
+        # Group consecutive rows by (ts, globalTid) to build per-sample callstacks.
+        # A sample event is emitted once per unique (ts, globalTid) pair.
+        from itertools import groupby
+        def _key(r: Any) -> tuple:
+            return (int(r["ts"]), r["globalTid"])
+
+        for (ts_val, gtid_val), group_rows in groupby(rows, key=_key):
+            frames = []
+            leaf_symbol: str | None = None
+            for r in group_rows:
+                sym = r["symbol"]
+                if sym:
+                    frames.append(sym)
+                    if leaf_symbol is None:
+                        leaf_symbol = sym  # depth=0 comes first (ORDER BY depth)
+            # Use leaf frame as the event name (matches existing behaviour).
+            # Full callstack stored in extra["callstack"] for downstream use.
+            name = leaf_symbol or "cpu_sample"
+            extra: dict = {}
+            if frames:
+                extra["callstack"] = frames
             events.append(TimelineEvent(
-                category="cpu_sample", name=row["symbol"] or "cpu_sample",
-                start_ns=int(row["ts"]), dur_ns=0, is_sample=True,
-                global_tid=_int_or_none(row, "globalTid"),
+                category="cpu_sample", name=name,
+                start_ns=ts_val, dur_ns=0, is_sample=True,
+                global_tid=gtid_val,
+                extra=extra,
             ))
             count += 1
     except sqlite3.Error as e:
         warnings.append(f"提取 CPU 采样事件失败（{tbl}）：{e}")
+    return count
+
+
+def _extract_cudnn(
+    conn: sqlite3.Connection,
+    schema: SchemaInfo,
+    events: list[TimelineEvent],
+    limit: int,
+    warnings: list[str],
+) -> int:
+    """Extract CUDNN_EVENTS as cuda_api point events."""
+    tbl = schema.table_roles.get("cudnn", "CUDNN_EVENTS")
+    has_strings = "string_ids" in schema.capabilities
+    name_expr = "s.value AS name" if has_strings else "CAST(c.nameId AS TEXT) AS name"
+    join = "LEFT JOIN StringIds s ON c.nameId = s.id" if has_strings else ""
+    gtid = _sel_col(schema, tbl, "globalTid", prefix="c.")
+    sql = f"""
+        SELECT c.start, c.[end], {gtid}, {name_expr}
+        FROM {tbl} c {join}
+        ORDER BY c.start
+    """
+    count = 0
+    try:
+        rows = conn.execute(sql).fetchall()
+        for row in rows:
+            # CUDNN_EVENTS often has start==end (point events); use dur=0 in that case
+            dur = max(0, int(row["end"]) - int(row["start"]))
+            events.append(TimelineEvent(
+                category="cuda_api", name=row["name"] or "cudnn",
+                start_ns=int(row["start"]), dur_ns=dur,
+                global_tid=_int_or_none(row, "globalTid"),
+            ))
+            count += 1
+    except sqlite3.Error as e:
+        warnings.append(f"提取 CUDNN 事件失败（{tbl}）：{e}")
     return count
 
 
@@ -681,16 +746,16 @@ def _extract_osrt(
         sql = f"""
             SELECT o.start, o.[end], {gtid}, s.value AS name
             FROM {tbl} o JOIN StringIds s ON o.nameId = s.id
-            ORDER BY o.start LIMIT ?
+            ORDER BY o.start
         """
     else:
         sql = f"""
             SELECT start, [end], {gtid}, CAST(nameId AS TEXT) AS name
-            FROM {tbl} ORDER BY start LIMIT ?
+            FROM {tbl} ORDER BY start
         """
     count = 0
     try:
-        rows = conn.execute(sql, (limit,)).fetchall()
+        rows = conn.execute(sql).fetchall()
         for row in rows:
             dur = int(row["end"]) - int(row["start"])
             events.append(TimelineEvent(
