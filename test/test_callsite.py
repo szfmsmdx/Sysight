@@ -9,13 +9,15 @@ import unittest
 from pathlib import Path
 
 from sysight.analyzer.scanners import PythonScanner
-from sysight.analyzer.analyzer import (
+from sysight.analyzer.analyzer import RepoScope, scan_repo
+from sysight.analyzer.callsite import (
+    AnalysisScope,
+    CallSiteCandidate,
+    CallsiteContext,
     build_callsite_index,
     search_calls,
     derive_analysis_scope,
     get_callsite_context,
-    RepoScope,
-    scan_repo,
 )
 
 
@@ -31,11 +33,43 @@ def _scan_py(root: Path, rel: str) -> object:
     return scanner._parse(root / rel)
 
 
+class TestCallsiteModuleSurface(unittest.TestCase):
+
+    def test_exports_callsite_api_from_dedicated_module(self):
+        self.assertTrue(callable(build_callsite_index))
+        self.assertTrue(callable(search_calls))
+        self.assertTrue(callable(derive_analysis_scope))
+        self.assertTrue(callable(get_callsite_context))
+        self.assertTrue(hasattr(AnalysisScope, "__dataclass_fields__"))
+        self.assertTrue(hasattr(CallSiteCandidate, "__dataclass_fields__"))
+        self.assertTrue(hasattr(CallsiteContext, "__dataclass_fields__"))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. CallSiteFacts collection
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestCallSiteFacts(unittest.TestCase):
+
+    def test_for_iter_calls_are_indexed(self):
+        """range/enumerate/zip in for-iter must be indexed at the for-statement line."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, "ops.py", """
+                def process(tokens):
+                    for i in range(tokens.shape[1]):
+                        tokens[i] = tokens[i] * 2
+                    for idx, item in enumerate(tokens):
+                        pass
+            """)
+            facts = _scan_py(root, "ops.py")
+            range_sites = [cs for cs in facts.callsites if cs.call_name == "range"]
+            enum_sites  = [cs for cs in facts.callsites if cs.call_name == "enumerate"]
+            self.assertEqual(len(range_sites), 1, "range() in for-iter should be indexed")
+            self.assertEqual(len(enum_sites), 1, "enumerate() in for-iter should be indexed")
+            # loop_depth at the for statement line itself is 0 (the iter is not inside the body)
+            self.assertEqual(range_sites[0].loop_depth, 0)
+            self.assertEqual(enum_sites[0].loop_depth, 0)
 
     def test_loop_depth_inside_for(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -308,102 +342,6 @@ class TestGetCallsiteContext(unittest.TestCase):
             files, _ = scan_repo(root)
             ctx = get_callsite_context("nonexistent:999:0:to", files, repo_root=root)
             self.assertIsNone(ctx)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5. NVTX region → repo callsite mapping
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestNvtxRegionMapping(unittest.TestCase):
-    """_map_nvtx_regions_to_repo finds user-defined nvtx.range_push callsites."""
-
-    def _make_trace_with_nvtx(self, region_names: list[str]):
-        """Build a minimal NsysTrace with NVTX events."""
-        from sysight.analyzer.nsys.models import NsysTrace, TimelineEvent
-        events = [
-            TimelineEvent(
-                category="nvtx", name=name,
-                start_ns=i * 1_000_000, dur_ns=500_000,
-                is_sample=False,
-            )
-            for i, name in enumerate(region_names)
-        ]
-        return NsysTrace(
-            tool="nsys",
-            profile_path="test.sqlite",
-            sqlite_path="test.sqlite",
-            events=events,
-            duration_ns=max(len(region_names) * 1_000_000, 1),
-        )
-
-    def test_finds_range_push_callsite_by_string_arg(self):
-        """range_push('forward') callsite is found when 'forward' NVTX region exists."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "trainer.py", """
-                import torch
-                def train_step(model, batch):
-                    torch.cuda.nvtx.range_push('forward')
-                    out = model(batch)
-                    torch.cuda.nvtx.range_pop()
-                    return out
-            """)
-            files, _ = scan_repo(root, scope=RepoScope(
-                mode="full", max_files=100, max_file_bytes=1_000_000,
-                include_runfiles=False,
-            ))
-            trace = self._make_trace_with_nvtx(["forward", "forward", "backward"])
-
-            from sysight.analyzer.nsys import _map_nvtx_regions_to_repo
-            hotspots = _map_nvtx_regions_to_repo(trace, files)
-
-            self.assertTrue(len(hotspots) > 0, "Should find at least one NVTX hotspot")
-            found = [h for h in hotspots if h.sample.frame.symbol == "forward"]
-            self.assertEqual(len(found), 1)
-            self.assertEqual(found[0].match_reason, "nvtx_region")
-            self.assertIsNotNone(found[0].repo_file)
-            self.assertGreater(found[0].match_confidence, 0)
-
-    def test_noise_regions_filtered_out(self):
-        """Holding GIL, iter_NNN regions are not emitted as hotspots."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "trainer.py", """
-                def f(): pass
-            """)
-            files, _ = scan_repo(root, scope=RepoScope(
-                mode="full", max_files=100, max_file_bytes=1_000_000,
-                include_runfiles=False,
-            ))
-            noisy = ["Holding GIL", "Waiting for GIL", "iter_100", "iter_101",
-                     "0xffffffffb03f9078"]
-            trace = self._make_trace_with_nvtx(noisy)
-
-            from sysight.analyzer.nsys import _map_nvtx_regions_to_repo
-            hotspots = _map_nvtx_regions_to_repo(trace, files)
-
-            self.assertEqual(hotspots, [], "All noisy regions should be filtered")
-
-    def test_empty_files_returns_empty(self):
-        """Empty file dict yields no hotspots."""
-        trace = self._make_trace_with_nvtx(["forward"])
-        from sysight.analyzer.nsys import _map_nvtx_regions_to_repo
-        hotspots = _map_nvtx_regions_to_repo(trace, {})
-        self.assertEqual(hotspots, [])
-
-    def test_no_nvtx_events_returns_empty(self):
-        """Trace with no NVTX events yields no hotspots."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _write(root, "trainer.py", "def f(): pass")
-            files, _ = scan_repo(root, scope=RepoScope(
-                mode="full", max_files=100, max_file_bytes=1_000_000,
-                include_runfiles=False,
-            ))
-            trace = self._make_trace_with_nvtx([])  # no NVTX events
-            from sysight.analyzer.nsys import _map_nvtx_regions_to_repo
-            hotspots = _map_nvtx_regions_to_repo(trace, files)
-            self.assertEqual(hotspots, [])
 
 
 if __name__ == "__main__":

@@ -18,6 +18,11 @@
   - sql_nccl_breakdown    NCCL 集合通信按流分解
   - sql_sync_cost         CUPTI 同步表的同步代价
   - sql_nvtx_hotspots     NVTX 注释段热点分布
+  - sql_nvtx_layer_breakdown  NVTX region 级 GPU 时间分解
+  - sql_root_cause_analysis   已知反模式程序化检测
+  - sql_profile_health        Profile 全局健康摘要
+
+对齐 nsys-ai 设计：使用 severity (critical/warning/info) 而非数值 confidence。
 """
 
 from __future__ import annotations
@@ -71,7 +76,11 @@ _SYNC_API_NAMES = frozenset({
 # 主入口
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def classify_bottlenecks(trace: NsysTrace) -> tuple[BottleneckSummary, list[NsysFinding]]:
+def classify_bottlenecks(
+    trace: NsysTrace,
+    *,
+    include_deep_sql: bool = True,
+) -> tuple[BottleneckSummary, list[NsysFinding]]:
     """T4: 瓶颈分类，生成 Findings。返回 (BottleneckSummary, list[NsysFinding])。"""
     findings: list[NsysFinding] = []
 
@@ -127,7 +136,6 @@ def classify_bottlenecks(trace: NsysTrace) -> tuple[BottleneckSummary, list[Nsys
             inclusive_ns=compute_inclusive,
             pct_of_trace=compute_active_ns / total_ns,
             pct_of_gpu_active=_pct_active(compute_active_ns),
-            confidence=0.9,
             evidence=[f"{len(gpu_compute)} 个计算内核，{compute_active_ns / 1e6:.1f}ms 活跃"],
         ))
 
@@ -138,7 +146,6 @@ def classify_bottlenecks(trace: NsysTrace) -> tuple[BottleneckSummary, list[Nsys
             inclusive_ns=comm_inclusive,
             pct_of_trace=comm_active_ns / total_ns,
             pct_of_gpu_active=_pct_active(comm_active_ns),
-            confidence=0.9,
             evidence=[f"{len(gpu_comm)} 个 NCCL/通信内核，{comm_active_ns / 1e6:.1f}ms 活跃"],
         ))
 
@@ -149,7 +156,6 @@ def classify_bottlenecks(trace: NsysTrace) -> tuple[BottleneckSummary, list[Nsys
             inclusive_ns=memcpy_inclusive,
             pct_of_trace=memcpy_active_ns / total_ns,
             pct_of_gpu_active=_pct_active(memcpy_active_ns),
-            confidence=0.85,
             evidence=[f"{len(gpu_memcpy)} 次 memcpy/memset，{memcpy_active_ns / 1e6:.1f}ms 活跃"],
         ))
 
@@ -160,7 +166,6 @@ def classify_bottlenecks(trace: NsysTrace) -> tuple[BottleneckSummary, list[Nsys
             inclusive_ns=gpu_idle_ns,
             pct_of_trace=gpu_idle_ns / total_ns,
             pct_of_gpu_active=None,
-            confidence=0.95,
             evidence=[f"GPU 空闲 {gpu_idle_ns / 1e6:.1f}ms / 总计 {total_ns / 1e6:.1f}ms"],
         ))
 
@@ -171,7 +176,6 @@ def classify_bottlenecks(trace: NsysTrace) -> tuple[BottleneckSummary, list[Nsys
             inclusive_ns=sync_inclusive,
             pct_of_trace=sync_active_ns / total_ns,
             pct_of_gpu_active=None,
-            confidence=0.85,
             evidence=[f"{len(sync_evs)} 个同步事件，{sync_active_ns / 1e6:.1f}ms"],
         ))
 
@@ -226,7 +230,7 @@ def classify_bottlenecks(trace: NsysTrace) -> tuple[BottleneckSummary, list[Nsys
         _finding_tiny_kernels(findings, gpu_compute)
 
     # 深度 SQL 分析（移植自 nsys-ai skills，委托给 classify_sql.py）
-    if trace.sqlite_path:
+    if include_deep_sql and trace.sqlite_path:
         try:
             from .classify_sql import run_deep_sql_analysis
             run_deep_sql_analysis(findings, trace)
@@ -235,7 +239,6 @@ def classify_bottlenecks(trace: NsysTrace) -> tuple[BottleneckSummary, list[Nsys
 
     findings.sort(key=lambda f: (
         {"critical": 0, "warning": 1, "info": 2}.get(f.severity, 3),
-        -f.confidence,
     ))
 
     # Assign stable IDs after sorting (content-based, not sort-order-based)
@@ -270,7 +273,6 @@ def _finding_gpu_idle(
     findings.append(NsysFinding(
         category="gpu_idle",
         severity=severity,
-        confidence=0.95,
         title=f"GPU 空闲占 trace {idle_pct*100:.1f}%（{gpu_idle_ns/1e6:.1f}ms）",
         description=(
             f"GPU 在总时长 {total_ns/1e6:.1f}ms 中空闲了 {gpu_idle_ns/1e6:.1f}ms"
@@ -297,7 +299,6 @@ def _finding_gpu_compute(
     findings.append(NsysFinding(
         category="gpu_compute_hotspot",
         severity=severity,
-        confidence=0.85,
         title=f"GPU 计算占 GPU 时间 {pct*100:.1f}%",
         description=(
             f"非 NCCL 的 GPU 计算内核占 GPU 活跃时间的 {pct*100:.1f}%"
@@ -328,7 +329,6 @@ def _finding_gpu_comm(
     findings.append(NsysFinding(
         category="gpu_comm_hotspot",
         severity=severity,
-        confidence=0.85,
         title=f"GPU 通信占 GPU 时间 {pct_of_active*100:.1f}%",
         description=(
             f"NCCL/MPI 通信内核占 GPU 活跃时间的 {pct_of_active*100:.1f}%"
@@ -359,7 +359,6 @@ def _finding_comm_overlap(
         findings.append(NsysFinding(
             category="comm_not_overlapped",
             severity="info",
-            confidence=0.8,
             title=f"通信重叠良好（{overlap_pct*100:.1f}% NCCL 时间已隐藏）",
             description=(
                 f"计算与 NCCL 通信重叠了 {overlap_pct*100:.1f}% 的 NCCL 时间。"
@@ -373,7 +372,6 @@ def _finding_comm_overlap(
     findings.append(NsysFinding(
         category="comm_not_overlapped",
         severity=severity,
-        confidence=0.85,
         title=f"通信重叠差：仅 {overlap_pct*100:.1f}% 被隐藏",
         description=(
             f"只有 {overlap_pct*100:.1f}% 的 NCCL 通信时间与计算重叠。"
@@ -416,7 +414,6 @@ def _finding_gpu_memcpy(
     findings.append(NsysFinding(
         category="gpu_memcpy_hotspot",
         severity=severity,
-        confidence=0.85,
         title=f"内存拷贝消耗 trace 的 {pct_of_trace*100:.1f}%",
         description=(
             f"GPU 内存拷贝/memset 占 {memcpy_active_ns/1e6:.1f}ms"
@@ -462,7 +459,6 @@ def _finding_sync_wait(
     findings.append(NsysFinding(
         category="sync_wait",
         severity=severity,
-        confidence=0.85,
         title=f"同步开销 {total_sync_ns/1e6:.1f}ms（trace 的 {pct*100:.1f}%）",
         description=(
             f"CPU 在 CUDA 同步调用中阻塞了 {total_sync_ns/1e6:.1f}ms。"
@@ -499,7 +495,6 @@ def _finding_host_launch(
     findings.append(NsysFinding(
         category="host_launch_overhead",
         severity=severity,
-        confidence=0.75,
         title=(
             f"Host 内核启动开销 {overhead_pct*100:.1f}%"
             f"（{kernel_count} 个内核，均 {avg_kernel_ns/1e3:.1f}µs）"
@@ -541,7 +536,6 @@ def _finding_cpu_hotspot(
     findings.append(NsysFinding(
         category="cpu_hotspot",
         severity=severity,
-        confidence=0.70,
         title=f"CPU 热点：{top_name!r}（{top_pct*100:.1f}% 采样）",
         description=(
             f"CPU 采样显示 {top_name!r} 占 {top_pct*100:.1f}% 的 CPU 采样。"
@@ -575,7 +569,6 @@ def _finding_tiny_kernels(
     findings.append(NsysFinding(
         category="many_tiny_kernels",
         severity="warning",
-        confidence=0.80,
         title=(
             f"{len(gpu_compute)} 个内核，{tiny_pct*100:.0f}% 短于 {_TINY_KERNEL_THRESHOLD_US}µs"
             f"（均 {avg_ns/1e3:.1f}µs）"

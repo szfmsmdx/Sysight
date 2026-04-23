@@ -19,15 +19,37 @@ from .analyzer import (  # noqa: F401
     AnalysisResult, EntryPoint, CallChain, CallStep,
     FileDAG, HubNode, SearchResult, ImpactResult, SCANNERS,
 )
+from .callsite import (  # noqa: F401
+    AnalysisScope,
+    CallSiteCandidate,
+    CallsiteContext,
+    build_callsite_index,
+    derive_analysis_scope,
+    get_callsite_context,
+    search_calls,
+)
 
-from .nsys import analyze_nsys, derive_repo_scope  # noqa: F401
+from .nsys import (  # noqa: F401
+    analyze_nsys,
+    extract_evidence_windows,
+    prepare_analysis_request,
+    register_cli_investigator,
+)
 from .nsys.models import (  # noqa: F401
+    EvidenceWindow,
+    InvestigationResult,
     NsysAnalysisRequest, NsysDiag,
     ProfileInput, SchemaInfo,
     NsysTrace, TimelineEvent,
     BottleneckSummary, BottleneckLabel, EventStat,
     SampleHotspot, SourceFrame,
-    MappedHotspot, EvidenceLink,
+    NsysFinding, stable_finding_id,
 )
 
-from .cli import main  # noqa: F401
+
+
+def __getattr__(name: str):
+    if name == "main":
+        from .cli import main
+        return main
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

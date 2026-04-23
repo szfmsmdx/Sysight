@@ -112,8 +112,15 @@ def _collect_callsites(
             _visit_stmt(stmt, depth)
 
     def _visit_stmt(node: ast.stmt, depth: int) -> None:
-        # Recurse into loop bodies with depth+1
-        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+        # Recurse into loop bodies with depth+1.
+        # Also collect calls in the iter/test expression (e.g. range(), enumerate()).
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            _collect_from_stmt(node.iter, depth)  # range(), enumerate(), zip(), etc.
+            _visit(node.body, depth + 1)
+            _visit(node.orelse, depth)
+            return
+        if isinstance(node, ast.While):
+            _collect_from_stmt(node.test, depth)  # calls in while condition
             _visit(node.body, depth + 1)
             _visit(node.orelse, depth)
             return

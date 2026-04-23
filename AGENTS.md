@@ -5,15 +5,16 @@ Sysight is a repo-loop optimization pipeline with three peer modules:
 - `optimizer`
 - `executor`
 
-Current scope is `analyzer v0.1`.
+Current scope is `analyzer v0.3`.
 
 ## Analyzer Goals
 
 The analyzer must quickly:
-- understand repo structure
-- find likely training / inference entry scripts
-- trace the main intra-repo file / function call chain
-- return structured output for downstream modules
+- Quickly locate issues in analysis files
+- Understand the codebase structure
+- Quickly pinpoint code files and functions based on the issue area
+- Trace the main file/function call chain within the codebase
+- Return structured output to downstream modules
 
 ## Common Commands
 
@@ -61,6 +62,10 @@ PYTHONPATH=src python3 -m sysight.analyzer.core /path/to/repo
 - Do not depend on external repos for unit tests.
 - Keep tests deterministic and fast.
 - Document important static-analysis limitations in tests when relevant.
+- Callstack readability is a release criterion for `nsys` work.
+- If a change touches Stage 4 / Stage 6 / Stage 7, CPU hotspots, or callstack cleanup/rendering, you must run at least one real or focused rendered report check and verify the output is readable.
+- Bad cases such as `PyEval_RestoreThread <- PyGILState_Ensure`, `launch <- cfunction_call <- _PyEval_EvalFrameDefault`, or `pthread_cond_timedwait <- ...` must not be shipped as the final coarse location by themselves.
+- If the rendered output still only shows runtime wrappers / syscall leafs and no readable coarse location, the task is not done; continue improving or explicitly surface that Stage 6 / better trace signals are required.
 - Before declaring an analyzer change done, run:
 
 ```bash

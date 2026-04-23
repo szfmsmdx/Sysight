@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from .models import NsysTrace, SchemaInfo, TimelineEvent, ProfileInput
+from .models import GpuDeviceInfo, NsysTrace, SchemaInfo, TimelineEvent, ProfileInput
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ def inspect_schema(sqlite_path: str) -> SchemaInfo:
     table_roles: dict[str, str] = {}
     capabilities: list[str] = []
 
-    with sqlite3.connect(sqlite_path) as conn:
+    with closing(sqlite3.connect(sqlite_path)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         all_tables = {row[0] for row in cur.execute(
@@ -127,13 +128,20 @@ def inspect_schema(sqlite_path: str) -> SchemaInfo:
                 table_roles[cap] = found
 
         version_hint = _detect_nsys_version(conn, all_tables)
+        gpu_devices = _extract_gpu_devices(conn, tables)
 
         unknown = [t for t in sorted(all_tables) if not any(t.startswith(p) for p in _KNOWN_PREFIXES)]
         if unknown:
             warnings.append(f"发现未知表（可能是更新版本的 nsys schema）：{unknown}")
 
-    return SchemaInfo(tables=tables, capabilities=capabilities,
-                      table_roles=table_roles, version_hint=version_hint, warnings=warnings)
+    return SchemaInfo(
+        tables=tables,
+        capabilities=capabilities,
+        table_roles=table_roles,
+        version_hint=version_hint,
+        warnings=warnings,
+        gpu_devices=gpu_devices,
+    )
 
 
 def _detect_nsys_version(conn: sqlite3.Connection, all_tables: set[str]) -> str:
@@ -151,9 +159,63 @@ def _detect_nsys_version(conn: sqlite3.Connection, all_tables: set[str]) -> str:
     return "unknown"
 
 
+def _extract_gpu_devices(conn: sqlite3.Connection, tables: dict[str, list[str]]) -> list[GpuDeviceInfo]:
+    table_name = "TARGET_INFO_GPU"
+    if table_name not in tables:
+        return []
+
+    cols = set(tables.get(table_name, []))
+    select_cols = [
+        col for col in (
+            "id", "name", "totalMemory", "memoryBandwidth", "smCount",
+            "computeMajor", "computeMinor", "busLocation", "chipName",
+        )
+        if col in cols
+    ]
+    if not select_cols:
+        return []
+
+    try:
+        rows = conn.execute(
+            f"SELECT {', '.join(select_cols)} FROM {table_name} ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+
+    devices: list[GpuDeviceInfo] = []
+    for row in rows:
+        data = dict(row)
+        major = data.get("computeMajor")
+        minor = data.get("computeMinor")
+        compute = None
+        if major is not None and minor is not None:
+            compute = f"{int(major)}.{int(minor)}"
+        devices.append(GpuDeviceInfo(
+            device_id=int(data.get("id", len(devices))),
+            name=str(data.get("name") or "unknown GPU"),
+            total_memory_bytes=_int_or_none_dict(data, "totalMemory"),
+            memory_bandwidth_bytes_per_s=_int_or_none_dict(data, "memoryBandwidth"),
+            sm_count=_int_or_none_dict(data, "smCount"),
+            compute_capability=compute,
+            bus_location=str(data.get("busLocation") or "") or None,
+            chip_name=str(data.get("chipName") or "") or None,
+        ))
+    return devices
+
+
 # ── Interval math ─────────────────────────────────────────────────────────────
 
 Interval = tuple[int, int]   # (start_ns, end_ns)
+
+
+def _int_or_none_dict(data: dict[str, Any], key: str) -> int | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def union_intervals(intervals: list[Interval]) -> list[Interval]:
@@ -269,7 +331,7 @@ def extract_trace(
     warnings: list[str] = list(schema.warnings)  # carry forward schema warnings
     events: list[TimelineEvent] = []
 
-    with sqlite3.connect(sqlite_path) as conn:
+    with closing(sqlite3.connect(sqlite_path)) as conn:
         conn.row_factory = sqlite3.Row
 
         # Determine trace time range from kernel table
@@ -642,13 +704,18 @@ def _extract_cpu_samples(
         #
         # Strategy: fetch all (ts, globalTid, stackDepth, symbol) rows at once,
         # then group by ts in Python.  This avoids N+1 queries.
+        sampling_cols = set(schema.tables.get(sampling_tbl, []))
+        module_select = "m.value AS module" if "module" in sampling_cols else "NULL AS module"
+        module_join = "LEFT JOIN StringIds m ON sc.module = m.id" if "module" in sampling_cols else ""
         sql = f"""
             SELECT ce.{time_expr} AS ts, {gtid},
                    sc.stackDepth AS depth,
-                   s.value AS symbol
+                   s.value AS symbol,
+                   {module_select}
             FROM {tbl} ce
             JOIN {sampling_tbl} sc ON ce.id = sc.id
             LEFT JOIN StringIds s ON sc.symbol = s.id
+            {module_join}
             ORDER BY ce.{time_expr}, sc.stackDepth
         """
     else:
@@ -667,11 +734,14 @@ def _extract_cpu_samples(
 
         for (ts_val, gtid_val), group_rows in groupby(rows, key=_key):
             frames = []
+            structured_frames = []
             leaf_symbol: str | None = None
             for r in group_rows:
                 sym = r["symbol"]
+                module = r["module"]
                 if sym:
                     frames.append(sym)
+                    structured_frames.append({"symbol": sym, "module": module})
                     if leaf_symbol is None:
                         leaf_symbol = sym  # depth=0 comes first (ORDER BY depth)
             # Use leaf frame as the event name (matches existing behaviour).
@@ -680,6 +750,7 @@ def _extract_cpu_samples(
             extra: dict = {}
             if frames:
                 extra["callstack"] = frames
+                extra["callstack_frames"] = structured_frames
             events.append(TimelineEvent(
                 category="cpu_sample", name=name,
                 start_ns=ts_val, dur_ns=0, is_sample=True,

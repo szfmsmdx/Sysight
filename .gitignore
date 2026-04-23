@@ -35,6 +35,11 @@ code-review-graph/
 nsys-ai/
 workspace/
 profile/
+.sysight/
+
+# 本地工具 & 草稿
+benchmark.py
+plan.md
 
 # nsys profile 原始文件（体积大）
 *.nsys-rep

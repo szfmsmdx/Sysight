@@ -1,0 +1,3 @@
+[submodule "nsys-bench"]
+	path = nsys-bench
+	url = https://github.com/szfmsmdx/nsys-bench.git
