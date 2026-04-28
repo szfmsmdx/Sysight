@@ -1,4 +1,4 @@
-"""Stage 6 investigation helpers for nsys analysis.
+"""Agent-driven localization helpers for nsys analysis.
 
 This module isolates prompt building, backend registration, Codex CLI
 execution, and result parsing from the main nsys orchestration entrypoint.
@@ -18,9 +18,9 @@ from .sql_cli import run_sql_nvtx, run_sql_sync, run_sql_memcpy, run_sql_kernels
 
 from .models import (
     EvidenceWindow,
-    InvestigationAnchor,
-    InvestigationQuestion,
-    InvestigationResult,
+    LocalizationAnchor,
+    LocalizationQuestion,
+    LocalizationResult,
     NsysAnalysisRequest,
     NsysFinding,
 )
@@ -29,7 +29,7 @@ _CLI_INVESTIGATORS: dict[str, callable] = {}
 
 
 def register_cli_investigator(name: str, runner) -> None:
-    """Register a thin CLI backend runner for Stage 6 investigation."""
+    """Register a thin CLI backend runner for Code localization."""
     _CLI_INVESTIGATORS[name] = runner
 
 
@@ -37,7 +37,7 @@ def has_cli_investigator(name: str) -> bool:
     return name in _CLI_INVESTIGATORS
 
 
-def run_stage6_investigation(
+def run_code_localization(
     request: NsysAnalysisRequest,
     *,
     summary: str,
@@ -47,18 +47,18 @@ def run_stage6_investigation(
     bottleneck_summary=None,
     hotspots=None,
     profile_report_text: str = "",
-) -> InvestigationResult:
-    backend = request.investigation_backend or "codex"
+) -> LocalizationResult:
+    backend = request.localization_backend or "codex"
     runner = _CLI_INVESTIGATORS.get(backend)
     if runner is None:
-        return InvestigationResult(
+        return LocalizationResult(
             backend=backend,
             status="error",
             prompt="",
-            error=f"未注册的 investigation backend：{backend}",
+            error=f"未注册的 localization backend：{backend}",
         )
 
-    prompt = _build_investigation_prompt(
+    prompt = _build_localization_prompt(
         request,
         summary=summary,
         findings=findings,
@@ -72,7 +72,7 @@ def run_stage6_investigation(
 
 
 # Backward-compatible alias for tests and existing imports.
-_run_stage6_investigation = run_stage6_investigation
+_run_code_localization = run_code_localization
 
 
 def _analyzer_dir() -> Path:
@@ -95,7 +95,7 @@ def _read_harness_file(path: Path) -> str:
         return ""
 
 
-def _build_investigation_prompt(
+def _build_localization_prompt(
     request: NsysAnalysisRequest,
     *,
     summary: str,
@@ -106,7 +106,7 @@ def _build_investigation_prompt(
     hotspots=None,
     profile_report_text: str = "",
 ) -> str:
-    """Build the investigation prompt from TASK.txt template + profile report.
+    """Build the localization prompt from TASK.txt template + profile report.
 
     The prompt is intentionally minimal:
       - Profile report (raw numbers, no heuristic findings)
@@ -247,9 +247,9 @@ def _estimate_prompt_tokens(prompt: str) -> int:
     return max(1, round(len(prompt) / 4))
 
 
-def _run_codex_cli(prompt: str, request: NsysAnalysisRequest) -> InvestigationResult:
+def _run_codex_cli(prompt: str, request: NsysAnalysisRequest) -> LocalizationResult:
     repo_root = request.repo_root or "."
-    artifact_dir = _create_investigation_artifact_dir()
+    artifact_dir = _create_localization_artifact_dir()
     prompt_path = artifact_dir / "prompt.txt"
     stdout_path = artifact_dir / "stdout.txt"
     stderr_path = artifact_dir / "stderr.txt"
@@ -268,13 +268,13 @@ def _run_codex_cli(prompt: str, request: NsysAnalysisRequest) -> InvestigationRe
         "--output-last-message",
         str(output_path),
     ]
-    if request.investigation_model:
-        command.extend(["--model", request.investigation_model])
+    if request.localization_model:
+        command.extend(["--model", request.localization_model])
     if not Path(repo_root).joinpath(".git").exists():
         command.append("--skip-git-repo-check")
     command.append("-")  # read prompt from stdin
 
-    _write_investigation_manifest(artifact_dir, {
+    _write_localization_manifest(artifact_dir, {
         "status": "starting",
         "backend": "codex",
         "repo_root": repo_root,
@@ -285,7 +285,7 @@ def _run_codex_cli(prompt: str, request: NsysAnalysisRequest) -> InvestigationRe
         "output_path": str(output_path),
     })
 
-    if request.emit_stage_info:
+    if request.emit_progress_info:
         _emit_status("info", f"codex 子进程启动: {' '.join(command)}")
         _emit_status("info", f"codex 工件目录: {artifact_dir}")
         _emit_status("info", f"codex prompt: {prompt_path}")
@@ -296,20 +296,20 @@ def _run_codex_cli(prompt: str, request: NsysAnalysisRequest) -> InvestigationRe
     return _run_codex_cli_sync(command, prompt, str(output_path), request, artifact_dir, prompt_path, stdout_path, stderr_path)
 
 
-def _read_investigation_output(output_path: str) -> str:
+def _read_localization_output(output_path: str) -> str:
     try:
         return Path(output_path).read_text(encoding="utf-8").strip()
     except OSError:
         return ""
 
 
-def _create_investigation_artifact_dir() -> Path:
+def _create_localization_artifact_dir() -> Path:
     base_dir = Path.cwd() / ".sysight" / "codex_runs"
     base_dir.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="run-", dir=base_dir))
 
 
-def _write_investigation_manifest(artifact_dir: Path, payload: dict[str, object]) -> None:
+def _write_localization_manifest(artifact_dir: Path, payload: dict[str, object]) -> None:
     try:
         (artifact_dir / "manifest.json").write_text(
             json.dumps(payload, indent=2, ensure_ascii=False),
@@ -330,8 +330,8 @@ def _extract_json_payload(text: str) -> str:
     return ""
 
 
-def _parse_questions(data: dict[str, object]) -> list[InvestigationQuestion]:
-    questions: list[InvestigationQuestion] = []
+def _parse_questions(data: dict[str, object]) -> list[LocalizationQuestion]:
+    questions: list[LocalizationQuestion] = []
     raw_questions = data.get("questions")
     if not isinstance(raw_questions, list):
         return questions
@@ -348,7 +348,7 @@ def _parse_questions(data: dict[str, object]) -> list[InvestigationQuestion]:
             line_no = None
         raw_window_ids = item.get("window_ids")
         window_ids = [str(v).strip() for v in raw_window_ids if str(v).strip()] if isinstance(raw_window_ids, list) else []
-        questions.append(InvestigationQuestion(
+        questions.append(LocalizationQuestion(
             question_id=question_id,
             problem_id=str(item.get("problem_id") or "").strip(),
             category=str(item.get("category") or "").strip(),
@@ -364,8 +364,8 @@ def _parse_questions(data: dict[str, object]) -> list[InvestigationQuestion]:
     return questions
 
 
-def _parse_anchors(data: dict[str, object]) -> list[InvestigationAnchor]:
-    anchors: list[InvestigationAnchor] = []
+def _parse_anchors(data: dict[str, object]) -> list[LocalizationAnchor]:
+    anchors: list[LocalizationAnchor] = []
     raw_anchors = data.get("anchors")
     if not isinstance(raw_anchors, list):
         return anchors
@@ -380,7 +380,7 @@ def _parse_anchors(data: dict[str, object]) -> list[InvestigationAnchor]:
             line_no = int(line) if line is not None else None
         except (TypeError, ValueError):
             line_no = None
-        anchors.append(InvestigationAnchor(
+        anchors.append(LocalizationAnchor(
             window_id=window_id,
             problem_id=str(item.get("problem_id") or "").strip(),
             category=str(item.get("category") or "").strip(),
@@ -395,7 +395,7 @@ def _parse_anchors(data: dict[str, object]) -> list[InvestigationAnchor]:
     return anchors
 
 
-def _parse_investigation_output(text: str) -> tuple[str, list[InvestigationQuestion], list[InvestigationAnchor], str | None, str | None]:
+def _parse_localization_output(text: str) -> tuple[str, list[LocalizationQuestion], list[LocalizationAnchor], str | None, str | None]:
     """Returns (summary, questions, anchors, workspace_mem, experience_mem).
 
     workspace.md is always append-only.
@@ -455,7 +455,7 @@ def _run_codex_cli_sync(
     prompt_path: Path,
     stdout_path: Path,
     stderr_path: Path,
-) -> InvestigationResult:
+) -> LocalizationResult:
     # Inject PYTHONPATH so that `python3 -m sysight.analyzer.cli` works inside
     # the Codex sandbox regardless of whether the package is pip-installed.
     # _analyzer_dir() points to sysight/analyzer/; the project root is 2 levels up.
@@ -478,7 +478,7 @@ def _run_codex_cli_sync(
                 env=_env,
                 start_new_session=True,
             )
-            _write_investigation_manifest(artifact_dir, {
+            _write_localization_manifest(artifact_dir, {
                 "status": "running",
                 "backend": "codex",
                 "pid": process.pid,
@@ -488,11 +488,11 @@ def _run_codex_cli_sync(
                 "stderr_path": str(stderr_path),
                 "output_path": output_path,
             })
-            if request.emit_stage_info:
+            if request.emit_progress_info:
                 _emit_status("info", "codex 调查进行中，等待细定位结果")
             process.communicate(prompt)
     except Exception as exc:
-        return InvestigationResult(
+        return LocalizationResult(
             backend="codex",
             status="error",
             prompt=prompt,
@@ -505,14 +505,14 @@ def _run_codex_cli_sync(
             stderr_path=str(stderr_path),
         )
 
-    output = _read_investigation_output(output_path)
-    summary, questions, anchors, workspace_mem, experience_mem = _parse_investigation_output(output)
+    output = _read_localization_output(output_path)
+    summary, questions, anchors, workspace_mem, experience_mem = _parse_localization_output(output)
     _flush_memory(workspace_mem, experience_mem)
     elapsed = time.monotonic() - started
     tokens_used = _parse_tokens_from_stderr(stderr_path)
     prompt_tokens_est = _estimate_prompt_tokens(prompt)
     final_status = "ok" if process.returncode == 0 else "error"
-    _write_investigation_manifest(artifact_dir, {
+    _write_localization_manifest(artifact_dir, {
         "status": final_status,
         "backend": "codex",
         "pid": process.pid,
@@ -527,7 +527,7 @@ def _run_codex_cli_sync(
     })
 
     if process.returncode != 0:
-        return InvestigationResult(
+        return LocalizationResult(
             backend="codex",
             status="error",
             prompt=prompt,
@@ -545,7 +545,7 @@ def _run_codex_cli_sync(
             stderr_path=str(stderr_path),
         )
 
-    if request.emit_stage_info:
+    if request.emit_progress_info:
         mins, secs = divmod(int(elapsed), 60)
         elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
         if tokens_used is not None:
@@ -555,7 +555,7 @@ def _run_codex_cli_sync(
             token_str = ""
         _emit_status("info", f"codex 调查完成，用时 {elapsed_str}{token_str}，结构化输出: {output_path}")
 
-    return InvestigationResult(
+    return LocalizationResult(
         backend="codex",
         status="ok",
         prompt=prompt,
@@ -579,7 +579,7 @@ register_cli_investigator("codex", _run_codex_cli)
 __all__ = [
     "register_cli_investigator",
     "has_cli_investigator",
-    "run_stage6_investigation",
-    "_run_stage6_investigation",
-    "_build_investigation_prompt",
+    "run_code_localization",
+    "_run_code_localization",
+    "_build_localization_prompt",
 ]

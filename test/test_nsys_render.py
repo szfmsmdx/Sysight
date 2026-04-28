@@ -138,9 +138,9 @@ class TestStage4AndStage7Rendering(unittest.TestCase):
     def test_render_includes_window_and_task_sections(self):
         from sysight.analyzer.nsys.models import (
             EvidenceWindow,
-            InvestigationAnchor,
-            InvestigationQuestion,
-            InvestigationResult,
+            LocalizationAnchor,
+            LocalizationQuestion,
+            LocalizationResult,
             NsysDiag,
             NsysFinding,
         )
@@ -179,7 +179,7 @@ class TestStage4AndStage7Rendering(unittest.TestCase):
             warnings=[],
             summary="summary",
             windows=[window],
-            investigation=InvestigationResult(
+            localization=LocalizationResult(
                 backend="codex",
                 status="ok",
                 prompt="prompt",
@@ -187,7 +187,7 @@ class TestStage4AndStage7Rendering(unittest.TestCase):
                 command=["codex", "exec"],
                 summary="定位到训练主循环",
                 questions=[
-                    InvestigationQuestion(
+                    LocalizationQuestion(
                         question_id="Q1",
                         problem_id="gpu_compute:1",
                         category="gpu_compute_hotspot",
@@ -202,7 +202,7 @@ class TestStage4AndStage7Rendering(unittest.TestCase):
                     )
                 ],
                 anchors=[
-                    InvestigationAnchor(
+                    LocalizationAnchor(
                         window_id="W1",
                         problem_id="gpu_compute:1",
                         category="gpu_compute_hotspot",
@@ -246,7 +246,7 @@ class TestStage4AndStage7Rendering(unittest.TestCase):
         self.assertEqual(stage7.count("trainer.py:42:train_step"), 1)
 
     def test_render_shows_window_identity_rank(self):
-        from sysight.analyzer.nsys.models import EvidenceWindow, InvestigationQuestion, InvestigationResult, NsysDiag, NsysFinding
+        from sysight.analyzer.nsys.models import EvidenceWindow, LocalizationQuestion, LocalizationResult, NsysDiag, NsysFinding
 
         window = EvidenceWindow(
             problem_id="sync_wait:test-rank",
@@ -282,12 +282,12 @@ class TestStage4AndStage7Rendering(unittest.TestCase):
             warnings=[],
             summary="summary",
             windows=[window],
-            investigation=InvestigationResult(
+            localization=LocalizationResult(
                 backend="codex",
                 status="ok",
                 prompt="prompt",
                 questions=[
-                    InvestigationQuestion(
+                    LocalizationQuestion(
                         question_id="Q1",
                         problem_id="sync_wait:test-rank",
                         category="sync_wait",

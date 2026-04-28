@@ -35,7 +35,7 @@ class GpuDeviceInfo:
     chip_name: str | None = None
 
 
-# ── T1: Input ─────────────────────────────────────────────────────────────────
+# ── Input ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class ProfileInput:
@@ -45,7 +45,7 @@ class ProfileInput:
     reason: str = ""
 
 
-# ── T2: Schema ────────────────────────────────────────────────────────────────
+# ── Schema ────────────────────────────────────────────────────────────────
 
 @dataclass
 class SchemaInfo:
@@ -58,7 +58,7 @@ class SchemaInfo:
     gpu_devices: list[GpuDeviceInfo] = field(default_factory=list)
 
 
-# ── T3: Timeline events ───────────────────────────────────────────────────────
+# ── Timeline events ───────────────────────────────────────────────────────
 
 @dataclass
 class TimelineEvent:
@@ -95,7 +95,7 @@ class NsysTrace:
     warnings: list[str] = field(default_factory=list)
 
 
-# ── T4: Bottleneck classification ─────────────────────────────────────────────
+# ── Bottleneck classification ─────────────────────────────────────────────
 
 @dataclass
 class BottleneckLabel:
@@ -194,7 +194,7 @@ class NsysFinding:
     stable_id: str = ""
 
 
-# ── T5: Sample aggregation ───────────────────────────────────────────────────
+# ── Sample aggregation ───────────────────────────────────────────────────
 
 @dataclass
 class SourceFrame:
@@ -272,7 +272,7 @@ class EvidenceWindow:
 
 
 @dataclass
-class InvestigationAnchor:
+class LocalizationAnchor:
     window_id: str
     problem_id: str = ""
     category: str = ""
@@ -286,7 +286,7 @@ class InvestigationAnchor:
 
 
 @dataclass
-class InvestigationQuestion:
+class LocalizationQuestion:
     question_id: str
     problem_id: str = ""
     category: str = ""
@@ -301,7 +301,7 @@ class InvestigationQuestion:
 
 
 @dataclass
-class InvestigationResult:
+class LocalizationResult:
     backend: str
     status: str                     # "ok" | "error" | "skipped" | "running"
     prompt: str
@@ -311,8 +311,8 @@ class InvestigationResult:
     output_path: str = ""
     pid: int | None = None
     summary: str = ""
-    anchors: list[InvestigationAnchor] = field(default_factory=list)
-    questions: list[InvestigationQuestion] = field(default_factory=list)
+    anchors: list[LocalizationAnchor] = field(default_factory=list)
+    questions: list[LocalizationQuestion] = field(default_factory=list)
     artifact_dir: str = ""
     prompt_path: str = ""
     stdout_path: str = ""
@@ -332,7 +332,7 @@ class NsysDiag:
     summary: str                    # brief text for quick-read; not primary data
     gpu_devices: list[GpuDeviceInfo] = field(default_factory=list)
     windows: list[EvidenceWindow] = field(default_factory=list)
-    investigation: InvestigationResult | None = None
+    localization: LocalizationResult | None = None
 
 
 # ── Request type (for analyze_nsys() entry point) ────────────────────────────
@@ -349,9 +349,9 @@ class NsysAnalysisRequest:
     repo_root: str | None = None
     top_hotspots: int = 20
     top_windows_per_finding: int = 3
-    run_investigation: bool = False
-    investigation_backend: str | None = None
-    investigation_model: str | None = None
-    emit_stage_info: bool = False
+    run_localization: bool = False
+    localization_backend: str | None = None
+    localization_model: str | None = None
+    emit_progress_info: bool = False
     include_deep_sql: bool = True
     include_evidence_windows: bool = True

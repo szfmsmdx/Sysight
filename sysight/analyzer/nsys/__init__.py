@@ -10,15 +10,15 @@ from pathlib import Path
 
 from .classify import classify_bottlenecks
 from .extract import extract_trace, inspect_schema, resolve_profile_input
-from .investigation import (
+from .localization import (
     has_cli_investigator,
     register_cli_investigator,
-    run_stage6_investigation,
+    run_code_localization,
 )
 from .models import (
     BottleneckSummary,
     EvidenceWindow,
-    InvestigationResult,
+    LocalizationResult,
     NsysAnalysisRequest,
     NsysDiag,
     NsysFinding,
@@ -45,7 +45,7 @@ __all__ = [
     "NsysDiag",
     "NsysAnalysisRequest",
     "NsysFinding",
-    "InvestigationResult",
+    "LocalizationResult",
     "EvidenceWindow",
     "BottleneckSummary",
     "SampleHotspot",
@@ -112,7 +112,7 @@ def analyze_nsys(request: NsysAnalysisRequest) -> NsysDiag:
             gpu_devices=schema.gpu_devices,
         )
 
-    if request.emit_stage_info:
+    if request.emit_progress_info:
         _emit_status("info", f"读取 SQLite schema: {sqlite_path}")
     try:
         trace = extract_trace(sqlite_path, schema)
@@ -127,7 +127,7 @@ def analyze_nsys(request: NsysAnalysisRequest) -> NsysDiag:
             gpu_devices=schema.gpu_devices,
         )
 
-    if request.emit_stage_info:
+    if request.emit_progress_info:
         _emit_status("info", f"提取 trace 事件 {len(trace.events)} 条，开始瓶颈分析")
     try:
         bottleneck_summary, findings = classify_bottlenecks(
@@ -140,9 +140,9 @@ def analyze_nsys(request: NsysAnalysisRequest) -> NsysDiag:
         findings = []
         trace.warnings.append(f"分类分析错误：{exc}")
 
-    if request.emit_stage_info:
-        stage_label = "生成证据窗口与 CPU 热点" if request.include_evidence_windows else "生成 CPU 热点"
-        _emit_status("info", stage_label)
+    if request.emit_progress_info:
+        progress_label = "生成证据窗口与 CPU 热点" if request.include_evidence_windows else "生成 CPU 热点"
+        _emit_status("info", progress_label)
     windows: list[EvidenceWindow] = []
     if request.include_evidence_windows:
         windows = extract_evidence_windows(
@@ -165,14 +165,14 @@ def analyze_nsys(request: NsysAnalysisRequest) -> NsysDiag:
         summary=summary,
         gpu_devices=schema.gpu_devices,
         windows=windows,
-        investigation=None,
+        localization=None,
     )
 
-    investigation = None
-    if request.run_investigation:
-        if request.emit_stage_info:
+    localization = None
+    if request.run_localization:
+        if request.emit_progress_info:
             _emit_status("info", "生成 Codex 调查提示并启动代码调查")
-        investigation = run_stage6_investigation(
+        localization = run_code_localization(
             request,
             summary=summary,
             findings=findings,
@@ -182,10 +182,10 @@ def analyze_nsys(request: NsysAnalysisRequest) -> NsysDiag:
             hotspots=hotspots,
             profile_report_text=render_nsys_profile_report(profile_diag, verbose=True),
         )
-        if investigation.status == "error" and investigation.error:
-            warnings = _merge_warnings(warnings, [f"Codex 调查失败：{investigation.error}"])
+        if localization.status == "error" and localization.error:
+            warnings = _merge_warnings(warnings, [f"Codex 调查失败：{localization.error}"])
 
-    if request.emit_stage_info and investigation is not None:
+    if request.emit_progress_info and localization is not None:
         _emit_status("info", "Codex 调查结果已回填")
     return _make_diag(
         status="ok",
@@ -198,7 +198,7 @@ def analyze_nsys(request: NsysAnalysisRequest) -> NsysDiag:
         summary=summary,
         gpu_devices=schema.gpu_devices,
         windows=windows,
-        investigation=investigation,
+        localization=localization,
     )
 
 
@@ -208,24 +208,24 @@ def prepare_analysis_request(request: NsysAnalysisRequest) -> NsysAnalysisReques
     profile_path = _normalize_optional_path(request.profile_path)
     sqlite_path = _normalize_optional_path(request.sqlite_path)
     repo_root = _normalize_optional_path(request.repo_root)
-    run_investigation = request.run_investigation or bool(request.investigation_backend)
-    investigation_backend = request.investigation_backend or ("codex" if run_investigation else None)
-    include_deep_sql = request.include_deep_sql or run_investigation
-    include_evidence_windows = request.include_evidence_windows or run_investigation
+    run_localization = request.run_localization or bool(request.localization_backend)
+    localization_backend = request.localization_backend or ("codex" if run_localization else None)
+    include_deep_sql = request.include_deep_sql or run_localization
+    include_evidence_windows = request.include_evidence_windows or run_localization
 
     if not profile_path and not sqlite_path:
         raise ValueError("缺少分析文件：请提供 profile_path 或 sqlite_path。")
 
-    if run_investigation:
+    if run_localization:
         if not repo_root:
             raise ValueError("Codex 调查需要 repo_root 才能启动。")
         if not Path(repo_root).is_dir():
             raise ValueError(f"repo_root 不存在或不是目录：{repo_root}")
-        if not investigation_backend:
-            raise ValueError("缺少 investigation_backend。")
-        if not has_cli_investigator(investigation_backend):
-            raise ValueError(f"未注册的 investigation backend：{investigation_backend}")
-        if investigation_backend == "codex" and shutil.which("codex") is None:
+        if not localization_backend:
+            raise ValueError("缺少 localization_backend。")
+        if not has_cli_investigator(localization_backend):
+            raise ValueError(f"未注册的 localization backend：{localization_backend}")
+        if localization_backend == "codex" and shutil.which("codex") is None:
             raise ValueError("未找到 codex CLI，请先确认 `codex` 已安装并可执行。")
 
     return NsysAnalysisRequest(
@@ -234,10 +234,10 @@ def prepare_analysis_request(request: NsysAnalysisRequest) -> NsysAnalysisReques
         repo_root=repo_root,
         top_hotspots=request.top_hotspots,
         top_windows_per_finding=request.top_windows_per_finding,
-        run_investigation=run_investigation,
-        investigation_backend=investigation_backend,
-        investigation_model=request.investigation_model,
-        emit_stage_info=request.emit_stage_info,
+        run_localization=run_localization,
+        localization_backend=localization_backend,
+        localization_model=request.localization_model,
+        emit_progress_info=request.emit_progress_info,
         include_deep_sql=include_deep_sql,
         include_evidence_windows=include_evidence_windows,
     )
@@ -293,7 +293,7 @@ def _make_diag(
     summary: str = "",
     gpu_devices: list | None = None,
     windows: list[EvidenceWindow] | None = None,
-    investigation: InvestigationResult | None = None,
+    localization: LocalizationResult | None = None,
 ) -> NsysDiag:
     return NsysDiag(
         status=status,
@@ -307,7 +307,7 @@ def _make_diag(
         summary=summary,
         gpu_devices=gpu_devices or [],
         windows=windows or [],
-        investigation=investigation,
+        localization=localization,
     )
 
 

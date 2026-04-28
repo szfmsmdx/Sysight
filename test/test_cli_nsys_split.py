@@ -164,7 +164,7 @@ class TestNsysCliSplit(unittest.TestCase):
                 def communicate(self, prompt_text=None):
                     return ("", "")
 
-            with mock.patch("sysight.analyzer.nsys.investigation.subprocess.Popen", side_effect=_FakePopen):
+            with mock.patch("sysight.analyzer.nsys.localization.subprocess.Popen", side_effect=_FakePopen):
                 data = self._run_json(["nsys", db, "--json", "--repo-root", str(root)])
 
         self.assertGreater(len(data["windows"]), 0)
@@ -181,13 +181,13 @@ class TestNsysCliSplit(unittest.TestCase):
 
             out = io.StringIO()
             err = io.StringIO()
-            with mock.patch("sysight.analyzer.nsys.investigation.subprocess.Popen") as popen:
+            with mock.patch("sysight.analyzer.nsys.localization.subprocess.Popen") as popen:
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     main(["nsys", db, "--json", "--repo-root", str(root), "--no-codex"])
 
         data = json.loads(out.getvalue())
         self.assertEqual(data["status"], "ok")
-        self.assertIsNone(data["investigation"])
+        self.assertIsNone(data["localization"])
         popen.assert_not_called()
         self.assertNotIn("codex", err.getvalue().lower())
 
@@ -215,32 +215,32 @@ class TestNsysCliSplit(unittest.TestCase):
 
             out = io.StringIO()
             err = io.StringIO()
-            with mock.patch("sysight.analyzer.nsys.investigation.subprocess.Popen", side_effect=_FakeSyncPopen):
+            with mock.patch("sysight.analyzer.nsys.localization.subprocess.Popen", side_effect=_FakeSyncPopen):
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     main(["nsys", db, "--json", "--repo-root", str(root)])
 
         data = json.loads(out.getvalue())
         self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["investigation"]["status"], "ok")
-        self.assertEqual(data["investigation"]["summary"], "同步细定位完成")
+        self.assertEqual(data["localization"]["status"], "ok")
+        self.assertEqual(data["localization"]["summary"], "同步细定位完成")
         self.assertNotIn("optimizer_handoff", data)
-        self.assertEqual(len(data["investigation"]["questions"]), 1)
-        self.assertEqual(data["investigation"]["questions"][0]["question_id"], "Q1")
-        self.assertEqual(data["investigation"]["questions"][0]["file_path"], "train.py")
-        self.assertEqual(len(data["investigation"]["anchors"]), 1)
-        self.assertEqual(data["investigation"]["anchors"][0]["file_path"], "train.py")
-        self.assertTrue(data["investigation"]["artifact_dir"])
-        self.assertTrue(data["investigation"]["prompt_path"])
-        self.assertTrue(data["investigation"]["stdout_path"])
-        self.assertTrue(data["investigation"]["stderr_path"])
+        self.assertEqual(len(data["localization"]["questions"]), 1)
+        self.assertEqual(data["localization"]["questions"][0]["question_id"], "Q1")
+        self.assertEqual(data["localization"]["questions"][0]["file_path"], "train.py")
+        self.assertEqual(len(data["localization"]["anchors"]), 1)
+        self.assertEqual(data["localization"]["anchors"][0]["file_path"], "train.py")
+        self.assertTrue(data["localization"]["artifact_dir"])
+        self.assertTrue(data["localization"]["prompt_path"])
+        self.assertTrue(data["localization"]["stdout_path"])
+        self.assertTrue(data["localization"]["stderr_path"])
         # New prompt format: TASK.txt template
-        self.assertIn("python3 -m sysight.analyzer.cli nsys-sql", data["investigation"]["prompt"])
-        self.assertIn("输出格式：", data["investigation"]["prompt"])
-        self.assertIn("workspace-write", data["investigation"]["command"])
+        self.assertIn("python3 -m sysight.analyzer.cli nsys-sql", data["localization"]["prompt"])
+        self.assertIn("输出格式：", data["localization"]["prompt"])
+        self.assertIn("workspace-write", data["localization"]["command"])
         # Old prompt artifacts should NOT be present
-        self.assertNotIn("workspace_structure.md", data["investigation"]["prompt"])
-        self.assertNotIn("=== 预计算统计", data["investigation"]["prompt"])
-        self.assertNotIn("待回答问题：", data["investigation"]["prompt"])
+        self.assertNotIn("workspace_structure.md", data["localization"]["prompt"])
+        self.assertNotIn("=== 预计算统计", data["localization"]["prompt"])
+        self.assertNotIn("待回答问题：", data["localization"]["prompt"])
         self.assertIn("codex 调查进行中", err.getvalue())
         self.assertIn("Codex 调查结果已回填", err.getvalue())
 

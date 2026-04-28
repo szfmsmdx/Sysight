@@ -1,4 +1,4 @@
-"""nsys/classify.py — T4: 瓶颈分类与 Finding 生成。
+"""nsys/classify.py — 瓶颈分类与 Finding 生成。
 
 核心 Finding（内存事件列表分析）：
   1. gpu_idle             GPU 长时间空闲
@@ -81,7 +81,7 @@ def classify_bottlenecks(
     *,
     include_deep_sql: bool = True,
 ) -> tuple[BottleneckSummary, list[NsysFinding]]:
-    """T4: 瓶颈分类，生成 Findings。返回 (BottleneckSummary, list[NsysFinding])。"""
+    """瓶颈分类，生成 Findings。返回 (BottleneckSummary, list[NsysFinding])。"""
     findings: list[NsysFinding] = []
 
     by_cat: dict[str, list[TimelineEvent]] = defaultdict(list)

@@ -1,10 +1,10 @@
-"""nsys/extract.py — T1/T2/T3 + interval math for Nsight Systems profiles.
+"""nsys/extract.py — interval math for Nsight Systems profiles.
 
 Merged from input.py, schema.py, intervals.py for fewer files.
 
-  resolve_profile_input()  T1: .nsys-rep → sqlite path
-  inspect_schema()         T2: probe SQLite schema → capabilities
-  extract_trace()          T3: sqlite → NsysTrace of TimelineEvents
+  resolve_profile_input()  .nsys-rep → sqlite path
+  inspect_schema()         probe SQLite schema → capabilities
+  extract_trace()          sqlite → NsysTrace of TimelineEvents
   union_intervals() etc.   Interval math for bottleneck classification
 """
 
@@ -21,7 +21,7 @@ from .models import GpuDeviceInfo, NsysTrace, SchemaInfo, TimelineEvent, Profile
 logger = logging.getLogger(__name__)
 
 
-# ── T1: Profile input resolution ──────────────────────────────────────────────
+# ── Profile input resolution ──────────────────────────────────────────────
 
 def resolve_profile_input(
     profile_path: str,
@@ -58,7 +58,7 @@ def resolve_profile_input(
                         reason=f"Profile 文件不存在或为空：{p}")
 
 
-# ── T2: Schema inspection ─────────────────────────────────────────────────────
+# ── Schema inspection ─────────────────────────────────────────────────────
 
 _CAPABILITY_TABLES: dict[str, list[str]] = {
     "cuda_kernel":  ["CUPTI_ACTIVITY_KIND_KERNEL"],
@@ -86,7 +86,7 @@ _KNOWN_PREFIXES = {"CUPTI_", "NVTX_", "OSRT_", "MPI", "StringIds",
 
 
 def inspect_schema(sqlite_path: str) -> SchemaInfo:
-    """T2: Probe SQLite schema and return capabilities."""
+    """Probe SQLite schema and return capabilities."""
     warnings: list[str] = []
     tables: dict[str, list[str]] = {}
     table_roles: dict[str, str] = {}
@@ -317,7 +317,7 @@ def extract_trace(
     *,
     max_events: int = 0,
 ) -> NsysTrace:
-    """T3: Extract timeline events from a Nsight Systems SQLite file.
+    """Extract timeline events from a Nsight Systems SQLite file.
 
     Args:
         sqlite_path:  Path to .sqlite export.

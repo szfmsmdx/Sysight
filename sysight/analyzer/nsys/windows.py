@@ -1,4 +1,4 @@
-"""Stage 4: deterministic evidence-window extraction for nsys."""
+"""deterministic evidence-window extraction for nsys."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def extract_evidence_windows(
     findings: list[NsysFinding],
     top_n: int = 3,
 ) -> list[EvidenceWindow]:
-    """Stage 4: extract deterministic coarse evidence windows from findings."""
+    """extract deterministic coarse evidence windows from findings."""
     if not findings:
         return []
 

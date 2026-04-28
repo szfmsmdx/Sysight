@@ -39,7 +39,7 @@ def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
         "required_action": diag.required_action,
         "summary": diag.summary,
         "warnings": diag.warnings,
-        "investigation": None,
+        "localization": None,
     }
 
     if diag.bottlenecks:
@@ -149,21 +149,21 @@ def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
         for w in diag.windows
     ]
 
-    if diag.investigation is not None:
-        d["investigation"] = {
-            "backend": diag.investigation.backend,
-            "status": diag.investigation.status,
-            "output": diag.investigation.output,
-            "error": diag.investigation.error,
-            "command": diag.investigation.command,
-            "prompt": diag.investigation.prompt,
-            "output_path": diag.investigation.output_path,
-            "pid": diag.investigation.pid,
-            "summary": diag.investigation.summary,
-            "artifact_dir": diag.investigation.artifact_dir,
-            "prompt_path": diag.investigation.prompt_path,
-            "stdout_path": diag.investigation.stdout_path,
-            "stderr_path": diag.investigation.stderr_path,
+    if diag.localization is not None:
+        d["localization"] = {
+            "backend": diag.localization.backend,
+            "status": diag.localization.status,
+            "output": diag.localization.output,
+            "error": diag.localization.error,
+            "command": diag.localization.command,
+            "prompt": diag.localization.prompt,
+            "output_path": diag.localization.output_path,
+            "pid": diag.localization.pid,
+            "summary": diag.localization.summary,
+            "artifact_dir": diag.localization.artifact_dir,
+            "prompt_path": diag.localization.prompt_path,
+            "stdout_path": diag.localization.stdout_path,
+            "stderr_path": diag.localization.stderr_path,
             "questions": [
                 {
                     "question_id": question.question_id,
@@ -178,7 +178,7 @@ def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
                     "status": question.status,
                     "window_ids": question.window_ids,
                 }
-                for question in diag.investigation.questions
+                for question in diag.localization.questions
             ],
             "anchors": [
                 {
@@ -193,7 +193,7 @@ def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
                     "suggestion": anchor.suggestion,
                     "status": anchor.status,
                 }
-                for anchor in diag.investigation.anchors
+                for anchor in diag.localization.anchors
             ],
         }
 
@@ -262,7 +262,7 @@ def _add_nsys_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--repo-root", metavar="DIR",
-        help="Stage 6 调查使用的 repo 根目录；未指定时自动推断 workspace/ 目录",
+        help="代码定位使用的 repo 根目录；未指定时自动推断 workspace/ 目录",
     )
     parser.add_argument(
         "--no-codex", action="store_true",
@@ -303,10 +303,10 @@ def _emit_nsys(args: argparse.Namespace, default_repo_root: str | None = None) -
         repo_root=repo_root,
         top_hotspots=getattr(args, "top_hotspots", 20),
         top_windows_per_finding=getattr(args, "top_windows_per_finding", 3),
-        run_investigation=use_codex,
-        investigation_backend="codex" if use_codex else None,
-        investigation_model=getattr(args, "codex_model", None),
-        emit_stage_info=True,
+        run_localization=use_codex,
+        localization_backend="codex" if use_codex else None,
+        localization_model=getattr(args, "codex_model", None),
+        emit_progress_info=True,
         include_deep_sql=True,
         include_evidence_windows=include_evidence_windows,
     )
@@ -530,7 +530,7 @@ def _main_standalone_nsys_windows(argv: list[str]) -> None:
         sqlite_path=args.profile_path if args.profile_path.endswith(".sqlite") else None,
         include_deep_sql=False,
         include_evidence_windows=False,  # we do it manually below
-        emit_stage_info=True,
+        emit_progress_info=True,
         top_windows_per_finding=args.top,
     )
     diag = analyze_nsys(req)

@@ -129,15 +129,15 @@ def _render_gpu_inventory(diag: NsysDiag) -> str | None:
 
 
 def _question_lookup(diag: NsysDiag) -> dict[str, object]:
-    if not diag.investigation:
+    if not diag.localization:
         return {}
-    return {question.question_id: question for question in diag.investigation.questions}
+    return {question.question_id: question for question in diag.localization.questions}
 
 
 def _anchor_lookup(diag: NsysDiag) -> dict[str, object]:
-    if not diag.investigation:
+    if not diag.localization:
         return {}
-    return {anchor.window_id: anchor for anchor in diag.investigation.anchors}
+    return {anchor.window_id: anchor for anchor in diag.localization.anchors}
 
 
 def _window_lookup(diag: NsysDiag) -> dict[str, object]:
@@ -180,7 +180,7 @@ def _window_identity_label(window) -> str:
 
 
 
-def _window_location_label(window, investigation_status: str | None, question=None, anchor=None) -> tuple[str, str]:
+def _window_location_label(window, localization_status: str | None, question=None, anchor=None) -> tuple[str, str]:
     if question and getattr(question, "file_path", ""):
         return "细定位", _callsite_from_result(question)
     if anchor and getattr(anchor, "file_path", ""):
@@ -189,9 +189,9 @@ def _window_location_label(window, investigation_status: str | None, question=No
         return "细定位", question.rationale
     if anchor and getattr(anchor, "rationale", ""):
         return "细定位", anchor.rationale
-    if investigation_status == "ok":
+    if localization_status == "ok":
         return "细定位", "见下方 Codex 调查结果"
-    if investigation_status == "running":
+    if localization_status == "running":
         return "定位", "Codex 调查进行中；当前无稳定代码锚点，请查看工件目录中的结果文件"
     if window.coarse_location:
         return "粗定位", window.coarse_location
@@ -384,7 +384,7 @@ _DOMAIN_HINT: dict[str, str] = {
 }
 
 
-def _build_investigation_queue(
+def _build_localization_queue(
     findings: list[NsysFinding],
     bottlenecks: BottleneckSummary | None,
 ) -> list[tuple[str, str, str]]:
@@ -532,11 +532,11 @@ def _render_summary(diag: NsysDiag, width: int) -> list[str]:
     return lines
 
 
-def _render_investigation_queue(diag: NsysDiag, width: int) -> list[str]:
+def _render_localization_queue(diag: NsysDiag, width: int) -> list[str]:
     if not diag.findings:
         return []
 
-    queue = _build_investigation_queue(diag.findings, diag.bottlenecks)
+    queue = _build_localization_queue(diag.findings, diag.bottlenecks)
     if not queue:
         return []
 
@@ -556,8 +556,8 @@ def _render_investigation_queue(diag: NsysDiag, width: int) -> list[str]:
 
 
 
-def _render_investigation_result(diag: NsysDiag, width: int, verbose: bool = False) -> list[str]:
-    inv = diag.investigation
+def _render_localization_result(diag: NsysDiag, width: int, verbose: bool = False) -> list[str]:
+    inv = diag.localization
     if inv is None:
         return []
     if inv.status == "ok" and inv.questions and not verbose:
@@ -618,7 +618,7 @@ def _priority_from_severity(severity: str) -> str:
 
 
 def _render_recommendations(diag: NsysDiag, width: int, verbose: bool = False) -> list[str]:
-    if diag.investigation is None or not diag.investigation.questions:
+    if diag.localization is None or not diag.localization.questions:
         return []
 
     lines: list[str] = []
@@ -626,7 +626,7 @@ def _render_recommendations(diag: NsysDiag, width: int, verbose: bool = False) -
     lines.append(_section("优化建议", width))
     lines.append("")
 
-    investigation_status = diag.investigation.status
+    localization_status = diag.localization.status
     anchor_by_id = _anchor_lookup(diag)
     window_by_id = _window_lookup(diag)
     finding_by_problem = {
@@ -634,7 +634,7 @@ def _render_recommendations(diag: NsysDiag, width: int, verbose: bool = False) -
         for finding in diag.findings
     }
 
-    for idx, question in enumerate(diag.investigation.questions[:12], start=1):
+    for idx, question in enumerate(diag.localization.questions[:12], start=1):
         finding = finding_by_problem.get(question.problem_id)
         priority = _priority_from_severity(finding.severity if finding else "warning")
         title = question.title or (finding.title if finding else question.category or question.problem_id)
@@ -654,7 +654,7 @@ def _render_recommendations(diag: NsysDiag, width: int, verbose: bool = False) -
                 if window is None:
                     continue
                 anchor = anchor_by_id.get(window_id)
-                loc_label, loc_value = _window_location_label(window, investigation_status, question=question, anchor=anchor)
+                loc_label, loc_value = _window_location_label(window, localization_status, question=question, anchor=anchor)
                 identity = _window_identity_label(window)
                 prefix = f"{identity} / " if identity else ""
                 lines.append(_wrap(f"{loc_label}：  {prefix}{window.event_name}@{window.start_ns/1e6:.3f}ms -> {loc_value}", indent=5, width=width - 6))
@@ -911,7 +911,7 @@ def _render_warnings(diag: NsysDiag, width: int) -> list[str]:
 # ── 公共入口 ───────────────────────────────────────────────────────────────────
 
 def render_nsys_profile_report(diag: NsysDiag, verbose: bool = False) -> str:
-    """Render the profile-side report only, without Codex investigation output.
+    """Render the profile-side report only, without Codex localization output.
 
     Section order (compact):
       1. Header
@@ -922,7 +922,7 @@ def render_nsys_profile_report(diag: NsysDiag, verbose: bool = False) -> str:
 
     Sections intentionally omitted (noise for Codex / downstream consumers):
       - Capture quality  (metadata, not signal)
-      - Investigation queue / suggested order  (analyzer heuristics, not ground truth)
+      - Localization queue / suggested order  (analyzer heuristics, not ground truth)
       - Domain findings  (heuristic layer; Codex should reason from raw numbers)
     """
     width = _term_width()
@@ -988,8 +988,8 @@ def render_nsys_terminal(diag: NsysDiag, verbose: bool = False) -> str:
     parts.append(_render_bottlenecks(diag, width))
     parts.append(_render_cpu_hotspots(diag, width, verbose=verbose))
     parts.append(_render_sql_overview(diag, width))
-    if diag.investigation is not None:
-        parts.append(_render_investigation_result(diag, width, verbose=verbose))
+    if diag.localization is not None:
+        parts.append(_render_localization_result(diag, width, verbose=verbose))
         parts.append(_render_recommendations(diag, width, verbose=verbose))
     parts.append(_render_warnings(diag, width))
 

@@ -9,37 +9,36 @@ No external dependencies — stdlib only (`sqlite3`, `pathlib`, `ast`).
 
 ```
 nsys profile (.sqlite)
-  → extract trace           # T1-T3: schema probe, event extraction, interval math
-  → classify bottlenecks    # T4-T5: findings, SQL deep analysis
+  → extract trace           # schema probe, event extraction, interval math
+  → classify bottlenecks    # findings, SQL deep analysis
   → evidence windows        # callstack summaries, coarse location
-  → Codex investigation     # Stage 6: agent-driven code localization
+  → Codex localization      # agent-driven code localization
 ```
 
 ```
 analyzer/
 ├── cli.py                  # CLI entry (sysight nsys / nsys-sql / scanner)
-├── analyzer.py             # repo three-stage analysis core
-├── callsite.py             # callsite index for scanner
-├── scanner_cli.py          # scanner subcommands
-├── scanners/
-│   ├── base.py             # FunctionFacts, FileFacts, BaseScanner
-│   ├── python.py           # AST-based Python scanner
-│   └── cpp.py              # CUDA/C++ scanner
+├── SKILL.txt               # Codex agent investigation prompt template
+├── scanner/
+│   ├── __init__.py         # Scanner facade
+│   ├── callsites.py        # call sites indexing
+│   ├── fs.py               # file enumeration
+│   ├── reader.py           # file reading with line numbers
+│   ├── search.py           # AST text/regex search
+│   ├── symbols.py          # callers / callees / trace 
+│   └── variants.py         # mapping classes/methods
 └── nsys/
+    ├── __init__.py         # core analysis logic
     ├── models.py           # all dataclasses (single source of truth)
     ├── extract.py          # trace extraction + interval math
     ├── classify.py         # bottleneck classification + findings
     ├── classify_sql.py     # SQL deep analysis (kernels/sync/nccl/nvtx/health)
-    ├── classify_sql_nvtx.py# NVTX layer breakdown
     ├── stacks.py           # callstack summarization + coarse location
+    ├── text.py             # text formatting utilities
     ├── windows.py          # evidence window extraction
     ├── render.py           # terminal rendering
-    ├── investigation.py    # Stage 6: Codex prompt build + execution + memory flush
-    ├── sql_cli.py          # nsys-sql subcommand implementations
-    └── skills/nsys-investigation/
-        ├── TASK.txt        # Codex prompt template
-        ├── SKILL.md        # harness reference
-        └── memory/         # workspace.md + experience.md
+    ├── localization.py     # Agent-driven code localization (Codex) + memory flush
+    └── sql_cli.py          # nsys-sql subcommand implementations
 ```
 
 ---
@@ -50,10 +49,10 @@ analyzer/
 
 ```bash
 # Profile statistics only
-sysight nsys /path/to/trace.sqlite
+sysight nsys /path/to/trace.sqlite --no-codex
 
 # With Codex investigation (waits synchronously)
-sysight nsys /path/to/trace.sqlite --repo-root /path/to/repo --report full
+sysight nsys /path/to/trace.sqlite --repo-root /path/to/repo
 
 # JSON output
 sysight nsys /path/to/trace.sqlite --json
@@ -70,32 +69,34 @@ sysight nsys-sql memcpy  /path/to/trace.sqlite
 sysight nsys-sql nccl    /path/to/trace.sqlite
 sysight nsys-sql overlap /path/to/trace.sqlite
 sysight nsys-sql stream-concurrency /path/to/trace.sqlite
+sysight nsys-sql kernel-launch    /path/to/trace.sqlite
 sysight nsys-sql schema  /path/to/trace.sqlite
 ```
 
 ### Static repo tools
 
 ```bash
-sysight scanner callsites /path/to/repo --call to        # search call sites (most common)
-sysight scanner search    /path/to/repo <query>           # search symbols / filenames
-sysight scanner lookup    /path/to/repo --file f --line n # locate context at line
-sysight scanner callers   /path/to/repo <symbol>          # who calls this
-sysight scanner callees   /path/to/repo <symbol>          # what this calls
-sysight scanner trace     /path/to/repo <symbol>          # call chain trace
-sysight scanner manifest  /path/to/repo                   # repo manifest
-sysight scanner index     /path/to/repo                   # build index
+sysight scanner files     <repo>                          # list files
+sysight scanner search    <repo> <query>                  # search symbols / filenames
+sysight scanner read      <repo> <file> [--start n]       # read file with line numbers
+sysight scanner callsites <repo> --call <sym>             # search call sites
+sysight scanner symbols   <repo> --file <f>               # list symbols in a file
+sysight scanner callers   <repo> <sym>                    # who calls this
+sysight scanner callees   <repo> --file <f> --symbol <s>  # what this calls
+sysight scanner trace     <repo> <sym>                    # call chain trace
+sysight scanner variants  <repo>                          # variant mapping
 ```
 
 ---
 
-## Stage 6 Investigation
+## Agent-driven Code Localization
 
-When `--report full` is set, the analyzer launches a Codex subprocess to perform code-level localization:
+By default, the analyzer launches a Codex subprocess to perform code-level localization (unless `--no-codex` is passed):
 
 - Pre-injects profile data (nvtx / sync / memcpy / kernels / gaps / kernel-launch) into the prompt
 - Codex uses `sysight scanner` tools to locate exact file/function/line
 - Results are parsed from JSON output and written back to the analysis result
-- Memory is persisted to `skills/nsys-investigation/memory/` for cross-run accumulation
+- Memory is persisted to `sysight/memory/` for cross-run accumulation
 
 Artifact directory: `.sysight/codex_runs/run-<id>/` (prompt, stdout, stderr, last_message).
 
@@ -114,11 +115,11 @@ PYTHONPATH=src python3 -m unittest discover -s test -v
 
 | Component | Status |
 |-----------|--------|
-| nsys SQLite extraction (T1–T3) | ✅ |
-| Bottleneck classification + findings (T4–T5) | ✅ |
+| nsys SQLite extraction | ✅ |
+| Bottleneck classification + findings | ✅ |
 | SQL deep analysis (kernels / sync / nccl / nvtx / health) | ✅ |
 | Evidence windows + callstack summarization | ✅ |
 | nsys-sql CLI | ✅ |
-| scanner CLI (callsites / search / lookup / callers / callees / trace) | ✅ |
-| Stage 6 Codex investigation | ✅ |
+| scanner CLI (files / search / read / callsites / symbols / callers / callees / trace / variants) | ✅ |
+| Codex code localization | ✅ |
 | Memory accumulation (workspace + experience) | ✅ |
