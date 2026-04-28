@@ -314,11 +314,14 @@ class TestInvestigationModuleSurface(unittest.TestCase):
         )
 
         # New prompt format: TASK.txt template, no pre-generated Q-items
-        self.assertIn("sysight nsys-sql", prompt)
-        self.assertIn("sysight scanner", prompt)
+        self.assertIn("python3 -m sysight.analyzer.cli nsys-sql", prompt)
         self.assertIn("输出格式：", prompt)
         self.assertIn("/tmp/repo", prompt)
         self.assertIn("trace.sqlite", prompt)
+        self.assertIn("effect-first", prompt)
+        self.assertIn("dominant effect", prompt)
+        self.assertIn("coverage audit", prompt)
+        self.assertIn("runtime / request-build / hot-loop / postprocess", prompt)
         # Old prompt artifacts should NOT be present
         self.assertNotIn("Q1. problem_id=", prompt)
         self.assertNotIn("待回答问题：", prompt)
@@ -395,8 +398,10 @@ class TestInvestigationModuleSurface(unittest.TestCase):
         )
 
         # New prompt format: TASK.txt template, raw stats come from profile report
-        self.assertIn("sysight nsys-sql", prompt)
+        self.assertIn("python3 -m sysight.analyzer.cli nsys-sql", prompt)
         self.assertIn("输出格式：", prompt)
+        self.assertIn("effect-first", prompt)
+        self.assertIn("coverage audit", prompt)
         # Old pre-computed stats block should NOT be present
         self.assertNotIn("=== 预计算统计", prompt)
 
@@ -431,7 +436,7 @@ class TestStage6Investigation(unittest.TestCase):
             ])
 
             class _FakePopen:
-                def __init__(self, command, stdin=None, stdout=None, stderr=None, text=None, start_new_session=None):
+                def __init__(self, command, stdin=None, stdout=None, stderr=None, text=None, env=None, start_new_session=None):
                     out_idx = command.index("--output-last-message") + 1
                     self.output_path = command[out_idx]
                     self.command = command
@@ -478,8 +483,7 @@ class TestStage6Investigation(unittest.TestCase):
         self.assertIn("codex 调查进行中", err.getvalue())
         self.assertIn("Codex 调查结果已回填", err.getvalue())
         # New prompt format: TASK.txt template
-        self.assertIn("sysight nsys-sql", diag.investigation.prompt)
-        self.assertIn("sysight scanner", diag.investigation.prompt)
+        self.assertIn("python3 -m sysight.analyzer.cli nsys-sql", diag.investigation.prompt)
         self.assertIn("输出格式：", diag.investigation.prompt)
         # Old prompt artifacts should NOT be present
         self.assertNotIn("待回答问题：", diag.investigation.prompt)

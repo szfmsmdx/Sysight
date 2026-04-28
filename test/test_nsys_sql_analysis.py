@@ -6,8 +6,8 @@ from contextlib import closing
 import unittest
 from pathlib import Path
 
-from sysight.analyzer.nsys.classify_sql import _sql_profile_health
-from sysight.analyzer.nsys.classify_sql_nvtx import (
+from sysight.analyzer.nsys.classify_sql import (
+    _sql_profile_health,
     _sql_nvtx_hotspots,
     attribute_kernels_to_nvtx,
 )

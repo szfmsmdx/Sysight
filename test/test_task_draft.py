@@ -1,8 +1,7 @@
-"""Tests for nsys analysis findings and repo callsite scope.
+"""Tests for nsys analysis findings and stable_finding_id.
 
 Covers:
   - analyze_nsys() → NsysDiag.findings (gpu_memcpy_hotspot etc.)
-  - Repo callsite layer: derive_analysis_scope + search_calls → finds .to() in loop
   - stable_finding_id determinism and format
 """
 
@@ -15,12 +14,6 @@ from pathlib import Path
 
 from sysight.analyzer.nsys import analyze_nsys
 from sysight.analyzer.nsys.models import NsysAnalysisRequest, NsysFinding
-from sysight.analyzer.analyzer import (
-    build_callsite_index,
-    derive_analysis_scope,
-    scan_repo,
-    search_calls,
-)
 
 
 # ── SQLite builder helpers ────────────────────────────────────────────────────
@@ -154,47 +147,7 @@ class TestNsysFindings(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. End-to-end: profile finding → scope → search_calls finds .to() in loop
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class TestE2EMemcpyToRepo(unittest.TestCase):
-
-    def test_memcpy_finding_scope_finds_loop_inner_to(self):
-        """Full path: gpu_memcpy_hotspot scope selects train.py and finds .to() in loop."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-
-            # A repo with two files: only train.py is in scope for memcpy
-            _write(root, "train.py", """
-                def setup(model, device):
-                    model.to(device)  # init phase, loop_depth=0
-
-                def train_step(loader, device):
-                    for batch in loader:
-                        x = batch.to(device)  # loop, loop_depth=1
-            """)
-            _write(root, "config.py", """
-                def get_config():
-                    return {"lr": 0.001}
-            """)
-
-            files, _ = scan_repo(root)
-            scope = derive_analysis_scope("gpu_memcpy_hotspot", files)
-            index = build_callsite_index(files)
-            results = search_calls(index, scope, names=["to"])
-
-            # train.py should be in scope, config.py should not
-            self.assertIn("train.py", scope.selected_files)
-            self.assertNotIn("config.py", scope.selected_files)
-
-            # The top-ranked result must be the loop-inner one (loop_depth=1)
-            self.assertGreater(len(results), 0)
-            self.assertGreater(results[0].loop_depth, 0,
-                               f"Expected loop-inner .to() first, got {results[0]}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. stable_finding_id
+# 2. stable_finding_id
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestStableModels(unittest.TestCase):

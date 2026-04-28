@@ -136,35 +136,6 @@ class TestNsysCliSplit(unittest.TestCase):
             self.assertIn("window_rank_in_iter", data["windows"][0])
             self.assertIn("actionable_chain", data["windows"][0])
 
-    def test_legacy_repo_nsys_codex_flag_starts_codex(self):
-        """With repo-root, Codex runs by default (no explicit flag needed)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "repo"
-            root.mkdir()
-            (root / "train.py").write_text("def train():\n    return 1\n", encoding="utf-8")
-            db = str(Path(tmp) / "trace.sqlite")
-            _write_minimal_nsys_sqlite(db)
-
-            class _FakePopen:
-                def __init__(self, command, stdin=None, stdout=None, stderr=None, text=None, start_new_session=None):
-                    out_idx = command.index("--output-last-message") + 1
-                    Path(command[out_idx]).write_text("{}", encoding="utf-8")
-                    self.pid = 11111
-                    self.returncode = 0
-                def communicate(self, prompt_text=None):
-                    return ("", "")
-
-            out = io.StringIO()
-            with mock.patch("sysight.analyzer.nsys.investigation.subprocess.Popen", side_effect=_FakePopen):
-                with contextlib.redirect_stdout(out):
-                    main(["--json", str(root), "nsys", db])
-
-        data = json.loads(out.getvalue())
-        self.assertEqual(data["status"], "ok")
-        self.assertNotIn("repo_context_enabled", data)
-        self.assertIsNotNone(data.get("investigation"))
-        self.assertEqual(data["investigation"]["backend"], "codex")
-
     def test_no_codex_skips_windows(self):
         """--no-codex: fast mode, no windows, SQL findings still present."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,7 +156,7 @@ class TestNsysCliSplit(unittest.TestCase):
             _write_minimal_nsys_sqlite(db)
 
             class _FakePopen:
-                def __init__(self, command, stdin=None, stdout=None, stderr=None, text=None, start_new_session=None):
+                def __init__(self, command, stdin=None, stdout=None, stderr=None, text=None, env=None, start_new_session=None):
                     out_idx = command.index("--output-last-message") + 1
                     Path(command[out_idx]).write_text("{}", encoding="utf-8")
                     self.pid = 99
@@ -229,7 +200,7 @@ class TestNsysCliSplit(unittest.TestCase):
             _write_minimal_nsys_sqlite(db)
 
             class _FakeSyncPopen:
-                def __init__(self, command, stdin=None, stdout=None, stderr=None, text=None, start_new_session=None):
+                def __init__(self, command, stdin=None, stdout=None, stderr=None, text=None, env=None, start_new_session=None):
                     out_idx = command.index("--output-last-message") + 1
                     self.output_path = command[out_idx]
                     self.pid = 34567
@@ -263,8 +234,7 @@ class TestNsysCliSplit(unittest.TestCase):
         self.assertTrue(data["investigation"]["stdout_path"])
         self.assertTrue(data["investigation"]["stderr_path"])
         # New prompt format: TASK.txt template
-        self.assertIn("sysight nsys-sql", data["investigation"]["prompt"])
-        self.assertIn("sysight scanner", data["investigation"]["prompt"])
+        self.assertIn("python3 -m sysight.analyzer.cli nsys-sql", data["investigation"]["prompt"])
         self.assertIn("输出格式：", data["investigation"]["prompt"])
         self.assertIn("workspace-write", data["investigation"]["command"])
         # Old prompt artifacts should NOT be present

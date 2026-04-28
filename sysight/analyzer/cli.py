@@ -1,7 +1,6 @@
 """cli — Command-line interface for sysight.analyzer.
 
-Dispatches to repo analysis (repo.py) and nsys profile analysis (nsys/).
-All rendering / serialisation helpers live here so repo.py stays pure.
+Dispatches to nsys profile analysis (nsys/).
 """
 
 from __future__ import annotations
@@ -14,11 +13,6 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .analyzer import (
-    analyze_repo, render_summary, render_trace,
-    discover_repo, scan_repo, build_dag,
-    search_symbols, impact_radius, trace_from,
-)
 from .nsys import analyze_nsys
 from .nsys.models import NsysAnalysisRequest, NsysDiag
 from .nsys.render import render_nsys_terminal
@@ -27,11 +21,12 @@ from .nsys.sql_cli import (
     run_sql_sync, run_sql_nvtx, run_sql_memcpy, run_sql_nccl,
     run_sql_kernel_launch, run_sql_stream_concurrency, run_sql_overlap,
 )
-from .scanner_cli import (
-    run_search, run_lookup,
-    run_callers, run_callees, run_impact, run_trace,
-    run_callsites, run_callsite_context, to_json,
-)
+from .scanner.fs import list_files
+from .scanner.search import search as scanner_search
+from .scanner.reader import read_file as scanner_read_file
+from .scanner.callsites import find_callsites
+from .scanner.symbols import list_symbols, find_callers, find_callees, trace_symbol
+from .scanner.variants import find_variants
 
 
 def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
@@ -330,237 +325,28 @@ def _emit_nsys(args: argparse.Namespace, default_repo_root: str | None = None) -
 
 # ── nsys-sql CLI helpers ────────────────────────────────────────────────────────
 
-def _emit_nsys_sql_schema(args: argparse.Namespace) -> None:
-    """Emit nsys-sql schema result as JSON."""
+def _emit_sql_result(result: object) -> None:
     from dataclasses import asdict
-    result = run_sql_schema(args.sqlite_path)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
+    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))  # type: ignore[arg-type]
 
 
-def _emit_nsys_sql_kernels(args: argparse.Namespace) -> None:
-    """Emit nsys-sql kernels result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_kernels(args.sqlite_path, limit=args.limit)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
+# Maps sql_cmd → (runner, extra_kwargs_from_args)
+_SQL_RUNNERS: dict[str, tuple] = {
+    "schema":             (run_sql_schema,             lambda a: {}),
+    "kernels":            (run_sql_kernels,            lambda a: {"limit": a.limit}),
+    "gaps":               (run_sql_gaps,               lambda a: {"min_gap_ns": a.min_gap_ns, "limit": a.limit}),
+    "sync":               (run_sql_sync,               lambda a: {}),
+    "nvtx":               (run_sql_nvtx,               lambda a: {"limit": a.limit}),
+    "memcpy":             (run_sql_memcpy,             lambda a: {}),
+    "nccl":               (run_sql_nccl,               lambda a: {"limit": a.limit}),
+    "kernel-launch":      (run_sql_kernel_launch,      lambda a: {"limit": a.limit}),
+    "stream-concurrency": (run_sql_stream_concurrency, lambda a: {"limit": a.limit}),
+    "overlap":            (run_sql_overlap,            lambda a: {}),
+}
 
 
-def _emit_nsys_sql_gaps(args: argparse.Namespace) -> None:
-    """Emit nsys-sql gaps result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_gaps(args.sqlite_path, min_gap_ns=args.min_gap_ns, limit=args.limit)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
-
-
-def _emit_nsys_sql_sync(args: argparse.Namespace) -> None:
-    """Emit nsys-sql sync result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_sync(args.sqlite_path)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
-
-
-def _emit_nsys_sql_nvtx(args: argparse.Namespace) -> None:
-    """Emit nsys-sql nvtx result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_nvtx(args.sqlite_path, limit=args.limit)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
-
-
-def _emit_nsys_sql_memcpy(args: argparse.Namespace) -> None:
-    """Emit nsys-sql memcpy result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_memcpy(args.sqlite_path)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
-
-
-def _emit_nsys_sql_nccl(args: argparse.Namespace) -> None:
-    """Emit nsys-sql nccl result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_nccl(args.sqlite_path, limit=args.limit)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
-
-
-def _emit_nsys_sql_kernel_launch(args: argparse.Namespace) -> None:
-    """Emit nsys-sql kernel-launch result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_kernel_launch(args.sqlite_path, limit=args.limit)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
-
-
-def _emit_nsys_sql_stream_concurrency(args: argparse.Namespace) -> None:
-    """Emit nsys-sql stream-concurrency result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_stream_concurrency(args.sqlite_path, limit=args.limit)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
-
-
-def _emit_nsys_sql_overlap(args: argparse.Namespace) -> None:
-    """Emit nsys-sql overlap result as JSON."""
-    from dataclasses import asdict
-    result = run_sql_overlap(args.sqlite_path)
-    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))
-
-
-def _add_nsys_sql_subparser(subparsers: argparse._SubParsersAction) -> None:
-    """Add nsys-sql subcommands to the given subparsers."""
-    sql_parser = subparsers.add_parser(
-        "nsys-sql",
-        help="直接查询 nsys SQLite 数据库（供 agent 使用）",
-        description=(
-            "直接查询 nsys SQLite 数据库，输出结构化 JSON。\n\n"
-            "每个子命令都是只读的，输出有界的 JSON，适合 agent/Codex 直接调用。\n\n"
-            "  sysight nsys-sql schema <db>    — 列出表、列和能力\n"
-            "  sysight nsys-sql kernels <db>   — Top-N GPU 内核（按总时间）\n"
-            "  sysight nsys-sql gaps <db>      — GPU 空闲气泡分析\n"
-            "  sysight nsys-sql sync <db>      — CUDA 同步事件代价\n"
-            "  sysight nsys-sql nvtx <db>      — NVTX range 分解\n"
-            "  sysight nsys-sql memcpy <db>    — 内存带宽分析\n"
-            "  sysight nsys-sql nccl <db>      — NCCL 通信分解\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    sql_sub = sql_parser.add_subparsers(dest="sql_cmd")
-
-    # schema
-    sc = sql_sub.add_parser("schema", help="查询 SQLite schema 和能力")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # kernels
-    sc = sql_sub.add_parser("kernels", help="查询 Top-N GPU 内核")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--limit", type=int, default=20, help="返回内核数量上限")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # gaps
-    sc = sql_sub.add_parser("gaps", help="查询 GPU 空闲气泡")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--min-gap-ns", type=int, default=1000000, help="最小间隙（ns）")
-    sc.add_argument("--limit", type=int, default=20, help="返回间隙数量上限")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # sync
-    sc = sql_sub.add_parser("sync", help="查询 CUDA 同步事件代价")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # nvtx
-    sc = sql_sub.add_parser("nvtx", help="查询 NVTX range 分解")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--limit", type=int, default=20, help="返回 range 数量上限")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # memcpy
-    sc = sql_sub.add_parser("memcpy", help="查询内存带宽分析")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # nccl
-    sc = sql_sub.add_parser("nccl", help="查询 NCCL 通信分解")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--limit", type=int, default=20, help="返回 stream 数量上限")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # kernel-launch
-    sc = sql_sub.add_parser("kernel-launch", help="内核启动开销分析（API→GPU 延迟）")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--limit", type=int, default=20, help="返回条目数量上限")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # stream-concurrency
-    sc = sql_sub.add_parser("stream-concurrency", help="Stream 并发率分析")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--limit", type=int, default=20, help="返回 stream 数量上限")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-    # overlap
-    sc = sql_sub.add_parser("overlap", help="Compute/NCCL 重叠估算")
-    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
-    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
-
-
-def _dispatch_nsys_sql(args: argparse.Namespace) -> bool:
-    """Dispatch nsys-sql subcommand. Returns True if handled."""
-    if getattr(args, "sql_cmd", None) is None:
-        return False
-
-    sql_cmd = args.sql_cmd
-    if sql_cmd == "schema":
-        _emit_nsys_sql_schema(args)
-    elif sql_cmd == "kernels":
-        _emit_nsys_sql_kernels(args)
-    elif sql_cmd == "gaps":
-        _emit_nsys_sql_gaps(args)
-    elif sql_cmd == "sync":
-        _emit_nsys_sql_sync(args)
-    elif sql_cmd == "nvtx":
-        _emit_nsys_sql_nvtx(args)
-    elif sql_cmd == "memcpy":
-        _emit_nsys_sql_memcpy(args)
-    elif sql_cmd == "nccl":
-        _emit_nsys_sql_nccl(args)
-    elif sql_cmd == "kernel-launch":
-        _emit_nsys_sql_kernel_launch(args)
-    elif sql_cmd == "stream-concurrency":
-        _emit_nsys_sql_stream_concurrency(args)
-    elif sql_cmd == "overlap":
-        _emit_nsys_sql_overlap(args)
-    else:
-        return False
-    return True
-
-
-def _standalone_nsys_argv(argv: list[str]) -> list[str] | None:
-    """Return args for top-level `sysight nsys ...`, preserving simple globals."""
-    prefix: list[str] = []
-    idx = 0
-    while idx < len(argv):
-        token = argv[idx]
-        if token == "nsys":
-            return prefix + argv[idx + 1:]
-        if token == "nsys-sql":
-            # nsys-sql is handled separately as a top-level command
-            return None
-        if token in ("--json", "--verbose", "-v"):
-            prefix.append(token)
-            idx += 1
-            continue
-        return None
-    return None
-
-
-def _main_standalone_nsys(argv: list[str]) -> None:
-    p = argparse.ArgumentParser(
-        prog="sysight nsys",
-        description="分析 Nsight Systems profile",
-    )
-    p.add_argument("--verbose", "-v", action="store_true", help="开启调试日志")
-    p.add_argument("--json", action="store_true", help="输出 JSON 格式")
-    _add_nsys_args(p)
-
-    args = p.parse_args(argv)
-    _configure_logging(args.verbose)
-    _emit_nsys(args)
-
-
-def _main_standalone_nsys_sql(argv: list[str]) -> None:
-    """Handle standalone `sysight nsys-sql ...` command."""
-    p = argparse.ArgumentParser(
-        prog="sysight nsys-sql",
-        description=(
-            "直接查询 nsys SQLite 数据库，输出结构化 JSON。\n\n"
-            "每个子命令都是只读的，输出有界的 JSON，适合 agent/Codex 直接调用。\n\n"
-            "  sysight nsys-sql schema <db>    — 列出表、列和能力\n"
-            "  sysight nsys-sql kernels <db>   — Top-N GPU 内核（按总时间）\n"
-            "  sysight nsys-sql gaps <db>      — GPU 空闲气泡分析\n"
-            "  sysight nsys-sql sync <db>      — CUDA 同步事件代价\n"
-            "  sysight nsys-sql nvtx <db>      — NVTX range 分解\n"
-            "  sysight nsys-sql memcpy <db>    — 内存带宽分析\n"
-            "  sysight nsys-sql nccl <db>      — NCCL 通信分解\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    sub = p.add_subparsers(dest="sql_cmd")
-
+def _register_nsys_sql_subparsers(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register all nsys-sql sub-sub-commands onto *sub* (a subparsers object)."""
     # schema
     sc = sub.add_parser("schema", help="查询 SQLite schema 和能力")
     sc.add_argument("sqlite_path", help=".sqlite 文件路径")
@@ -617,6 +403,90 @@ def _main_standalone_nsys_sql(argv: list[str]) -> None:
     sc = sub.add_parser("overlap", help="Compute/NCCL 重叠估算")
     sc.add_argument("sqlite_path", help=".sqlite 文件路径")
     sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+
+_NSYS_SQL_DESCRIPTION = (
+    "直接查询 nsys SQLite 数据库，输出结构化 JSON。\n\n"
+    "每个子命令都是只读的，输出有界的 JSON，适合 agent/Codex 直接调用。\n\n"
+    "  sysight nsys-sql schema <db>    — 列出表、列和能力\n"
+    "  sysight nsys-sql kernels <db>   — Top-N GPU 内核（按总时间）\n"
+    "  sysight nsys-sql gaps <db>      — GPU 空闲气泡分析\n"
+    "  sysight nsys-sql sync <db>      — CUDA 同步事件代价\n"
+    "  sysight nsys-sql nvtx <db>      — NVTX range 分解\n"
+    "  sysight nsys-sql memcpy <db>    — 内存带宽分析\n"
+    "  sysight nsys-sql nccl <db>      — NCCL 通信分解\n"
+)
+
+
+def _add_nsys_sql_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Add nsys-sql subcommands to the given subparsers."""
+    sql_parser = subparsers.add_parser(
+        "nsys-sql",
+        help="直接查询 nsys SQLite 数据库（供 agent 使用）",
+        description=_NSYS_SQL_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sql_sub = sql_parser.add_subparsers(dest="sql_cmd")
+    _register_nsys_sql_subparsers(sql_sub)
+
+
+def _dispatch_nsys_sql(args: argparse.Namespace) -> bool:
+    """Dispatch nsys-sql subcommand. Returns True if handled."""
+    if getattr(args, "sql_cmd", None) is None:
+        return False
+
+    sql_cmd = args.sql_cmd
+    entry = _SQL_RUNNERS.get(sql_cmd)
+    if entry is not None:
+        runner, build_kwargs = entry
+        _emit_sql_result(runner(args.sqlite_path, **build_kwargs(args)))
+    else:
+        return False
+    return True
+
+
+def _standalone_nsys_argv(argv: list[str]) -> list[str] | None:
+    """Return args for top-level `sysight nsys ...`, preserving simple globals."""
+    prefix: list[str] = []
+    idx = 0
+    while idx < len(argv):
+        token = argv[idx]
+        if token == "nsys":
+            return prefix + argv[idx + 1:]
+        if token == "nsys-sql":
+            # nsys-sql is handled separately as a top-level command
+            return None
+        if token in ("--json", "--verbose", "-v"):
+            prefix.append(token)
+            idx += 1
+            continue
+        return None
+    return None
+
+
+def _main_standalone_nsys(argv: list[str]) -> None:
+    p = argparse.ArgumentParser(
+        prog="sysight nsys",
+        description="分析 Nsight Systems profile",
+    )
+    p.add_argument("--verbose", "-v", action="store_true", help="开启调试日志")
+    p.add_argument("--json", action="store_true", help="输出 JSON 格式")
+    _add_nsys_args(p)
+
+    args = p.parse_args(argv)
+    _configure_logging(args.verbose)
+    _emit_nsys(args)
+
+
+def _main_standalone_nsys_sql(argv: list[str]) -> None:
+    """Handle standalone `sysight nsys-sql ...` command."""
+    p = argparse.ArgumentParser(
+        prog="sysight nsys-sql",
+        description=_NSYS_SQL_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="sql_cmd")
+    _register_nsys_sql_subparsers(sub)
 
     args = p.parse_args(argv)
     if not getattr(args, "sql_cmd", None):
@@ -708,258 +578,282 @@ def _main_standalone_nsys_windows(argv: list[str]) -> None:
     print(f"\n{'─' * 80}")
 
 
-# ── scanner CLI helpers ────────────────────────────────────────────────────────
+# ── Scanner CLI ───────────────────────────────────────────────────────────────
 
-def _emit_scanner_search(args: argparse.Namespace) -> None:
-    """Emit scanner search result as JSON."""
-    result = run_search(args.repo_root, args.query, limit=args.limit)
-    print(to_json(result))
-
-
-def _emit_scanner_lookup(args: argparse.Namespace) -> None:
-    """Emit scanner lookup result as JSON."""
-    result = run_lookup(
-        args.repo_root,
-        file=getattr(args, "file", None),
-        symbol=getattr(args, "symbol", None),
-        line=getattr(args, "line", None),
-        include_context=not getattr(args, "no_context", False),
-    )
-    print(to_json(result))
-
-
-def _emit_scanner_callers(args: argparse.Namespace) -> None:
-    """Emit scanner callers result as JSON."""
-    result = run_callers(args.repo_root, args.symbol, limit=args.limit)
-    print(to_json(result))
-
-
-def _emit_scanner_callees(args: argparse.Namespace) -> None:
-    """Emit scanner callees result as JSON."""
-    result = run_callees(args.repo_root, args.symbol, limit=args.limit)
-    print(to_json(result))
-
-
-def _emit_scanner_impact(args: argparse.Namespace) -> None:
-    """Emit scanner impact result as JSON."""
-    result = run_impact(
-        args.repo_root,
-        args.files,
-        max_depth=getattr(args, "depth", 5),
-    )
-    print(to_json(result))
-
-
-def _emit_scanner_trace(args: argparse.Namespace) -> None:
-    """Emit scanner trace result as JSON."""
-    result = run_trace(
-        args.repo_root,
-        args.target,
-        symbol=getattr(args, "symbol", None),
-        max_depth=getattr(args, "depth", 8),
-    )
-    print(to_json(result))
-
-
-def _emit_scanner_callsites(args: argparse.Namespace) -> None:
-    """Emit scanner callsites result as JSON."""
-    result = run_callsites(
-        args.repo_root,
-        call_name=getattr(args, "call", None),
-        file_filter=getattr(args, "file", None),
-        finding_type=getattr(args, "finding_type", None),
-        limit=getattr(args, "limit", 50),
-    )
-    print(to_json(result))
-
-
-def _emit_scanner_callsite_context(args: argparse.Namespace) -> None:
-    """Emit scanner callsite context result as JSON."""
-    result = run_callsite_context(args.repo_root, args.callsite_id)
-    if result is None:
-        print(json.dumps({"error": f"Callsite not found: {args.callsite_id}"}))
-    else:
-        print(to_json(result))
-
-
-def _add_scanner_subparser(subparsers: argparse._SubParsersAction) -> None:
-    """Add scanner subcommands to the given subparsers."""
-    scanner_parser = subparsers.add_parser(
+def _add_scanner_subparser(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Add `sysight scanner` subcommand with all sub-sub-commands."""
+    sc = sub.add_parser(
         "scanner",
-        help="静态代码分析工具（供 agent 使用）",
+        help="静态 repo 代码分析工具集",
         description=(
-            "静态代码分析 CLI，输出结构化 JSON，适合 agent/Codex 直接调用。\n\n"
-            "每个子命令都是只读的，输出有界的 JSON。\n\n"
-            "  sysight scanner search <repo> <query>        — 符号/文件搜索\n"
-            "  sysight scanner lookup <repo> [opts]         — 精确定位\n"
-            "  sysight scanner callers <repo> <symbol>      — 查找调用者\n"
-            "  sysight scanner callees <repo> <symbol>      — 查找被调用者\n"
-            "  sysight scanner impact <repo> <files...>     — 影响范围分析\n"
-            "  sysight scanner trace <repo> <target>        — 调用链追踪\n"
-            "  sysight scanner callsites <repo> [opts]      — 调用点搜索\n"
+            "静态 repo 代码分析工具集（只读，不执行目标代码）\n\n"
+            "  sysight scanner files   <repo>                文件列举\n"
+            "  sysight scanner search  <repo> <query>        全文搜索\n"
+            "  sysight scanner read    <repo> <file>         读取文件\n"
+            "  sysight scanner callsites <repo> --call <sym> 调用点定位\n"
+            "  sysight scanner symbols <repo> --file <f>     符号列表\n"
+            "  sysight scanner callers <repo> <sym>          查调用者\n"
+            "  sysight scanner callees <repo> --file <f> --symbol <s>  查被调用\n"
+            "  sysight scanner trace   <repo> <sym>          调用链追踪\n"
+            "  sysight scanner variants <repo>               variant 映射"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    scanner_sub = scanner_parser.add_subparsers(dest="scanner_cmd")
+    ssub = sc.add_subparsers(dest="scanner_cmd")
+
+    # files
+    p_files = ssub.add_parser("files", help="列出 repo 中的文件")
+    p_files.add_argument("repo", help="repo 根目录")
+    p_files.add_argument("--ext", help="只列此扩展名（如 py）")
+    p_files.add_argument("--pattern", help="glob 过滤（如 '*/data/*'）")
+    p_files.add_argument("--max", type=int, default=2000, dest="max_results")
+    p_files.add_argument("--json", action="store_true", help="JSON 输出")
 
     # search
-    sc = scanner_sub.add_parser("search", help="符号/文件搜索")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("query", help="搜索关键词")
-    sc.add_argument("--limit", type=int, default=20, help="返回结果上限")
+    p_search = ssub.add_parser("search", help="全文搜索")
+    p_search.add_argument("repo", help="repo 根目录")
+    p_search.add_argument("query", help="搜索关键字或正则")
+    p_search.add_argument("--ext", help="只搜此扩展名")
+    p_search.add_argument("--fixed", action="store_true", help="字面字符串（非正则）")
+    p_search.add_argument("--ignore-case", "-i", action="store_true")
+    p_search.add_argument("--max", type=int, default=500, dest="max_results")
+    p_search.add_argument("--json", action="store_true")
 
-    # lookup
-    sc = scanner_sub.add_parser("lookup", help="精确定位（文件+行号 或 符号）")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("--file", "-f", help="文件路径")
-    sc.add_argument("--symbol", "-s", help="符号名")
-    sc.add_argument("--line", "-l", type=int, help="行号")
-    sc.add_argument("--no-context", action="store_true", help="不返回源码上下文")
-
-    # callers
-    sc = scanner_sub.add_parser("callers", help="查找符号的所有调用者")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("symbol", help="符号名（qualified_name）")
-    sc.add_argument("--limit", type=int, default=20, help="返回结果上限")
-
-    # callees
-    sc = scanner_sub.add_parser("callees", help="查找符号调用的所有函数")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("symbol", help="符号名（qualified_name）")
-    sc.add_argument("--limit", type=int, default=20, help="返回结果上限")
-
-    # impact
-    sc = scanner_sub.add_parser("impact", help="影响范围分析")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("files", nargs="+", help="变更的文件")
-    sc.add_argument("--depth", type=int, default=5, help="最大追踪深度")
-
-    # trace
-    sc = scanner_sub.add_parser("trace", help="调用链追踪")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("target", help="目标文件或符号")
-    sc.add_argument("--symbol", "-s", help="指定目标文件中的函数名")
-    sc.add_argument("--depth", type=int, default=8, help="最大追踪深度")
+    # read
+    p_read = ssub.add_parser("read", help="读取文件（带行号）")
+    p_read.add_argument("repo", help="repo 根目录")
+    p_read.add_argument("file", help="相对于 repo 的文件路径")
+    p_read.add_argument("--start", type=int, help="起始行（含）")
+    p_read.add_argument("--end", type=int, help="结束行（含）")
+    p_read.add_argument("--around", type=int, help="中心行，配合 --context 使用")
+    p_read.add_argument("--context", type=int, default=10, help="around 上下文行数（默认 10）")
+    p_read.add_argument("--json", action="store_true")
 
     # callsites
-    sc = scanner_sub.add_parser("callsites", help="调用点搜索")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("--call", "-c", help="调用函数名（如 to, cuda, synchronize）")
-    sc.add_argument("--file", "-f", help="限定文件")
-    sc.add_argument("--finding-type", help="发现类型（自动填充搜索参数）")
-    sc.add_argument("--limit", type=int, default=50, help="返回结果上限")
+    p_cs = ssub.add_parser("callsites", help="查找符号的所有调用点")
+    p_cs.add_argument("repo", help="repo 根目录")
+    p_cs.add_argument("--call", required=True, dest="symbol", metavar="SYMBOL")
+    p_cs.add_argument("--file", dest="file_filter", help="只在此文件中搜索")
+    p_cs.add_argument("--ext", help="只搜此扩展名")
+    p_cs.add_argument("--max", type=int, default=300, dest="max_results")
+    p_cs.add_argument("--json", action="store_true")
 
-    # callsite-context
-    sc = scanner_sub.add_parser("callsite-context", help="获取调用点上下文")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("callsite_id", help="调用点 ID")
-
-
-def _dispatch_scanner(args: argparse.Namespace) -> bool:
-    """Dispatch scanner subcommand. Returns True if handled."""
-    if getattr(args, "scanner_cmd", None) is None:
-        return False
-
-    scanner_cmd = args.scanner_cmd
-    if scanner_cmd == "search":
-        _emit_scanner_search(args)
-    elif scanner_cmd == "lookup":
-        _emit_scanner_lookup(args)
-    elif scanner_cmd == "callers":
-        _emit_scanner_callers(args)
-    elif scanner_cmd == "callees":
-        _emit_scanner_callees(args)
-    elif scanner_cmd == "impact":
-        _emit_scanner_impact(args)
-    elif scanner_cmd == "trace":
-        _emit_scanner_trace(args)
-    elif scanner_cmd == "callsites":
-        _emit_scanner_callsites(args)
-    elif scanner_cmd == "callsite-context":
-        _emit_scanner_callsite_context(args)
-    else:
-        return False
-    return True
-
-
-def _main_standalone_scanner(argv: list[str]) -> None:
-    """Handle standalone `sysight scanner ...` command."""
-    p = argparse.ArgumentParser(
-        prog="sysight scanner",
-        description=(
-            "静态代码分析 CLI，输出结构化 JSON，适合 agent/Codex 直接调用。\n\n"
-            "每个子命令都是只读的，输出有界的 JSON。\n\n"
-            "  sysight scanner search <repo> <query>        — 符号/文件搜索\n"
-            "  sysight scanner lookup <repo> [opts]         — 精确定位\n"
-            "  sysight scanner callers <repo> <symbol>      — 查找调用者\n"
-            "  sysight scanner callees <repo> <symbol>      — 查找被调用者\n"
-            "  sysight scanner impact <repo> <files...>     — 影响范围分析\n"
-            "  sysight scanner trace <repo> <target>        — 调用链追踪\n"
-            "  sysight scanner callsites <repo> [opts]      — 调用点搜索\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    sub = p.add_subparsers(dest="scanner_cmd")
-
-    # search
-    sc = sub.add_parser("search", help="符号/文件搜索")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("query", help="搜索关键词")
-    sc.add_argument("--limit", type=int, default=20, help="返回结果上限")
-
-    # lookup
-    sc = sub.add_parser("lookup", help="精确定位（文件+行号 或 符号）")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("--file", "-f", help="文件路径")
-    sc.add_argument("--symbol", "-s", help="符号名")
-    sc.add_argument("--line", "-l", type=int, help="行号")
-    sc.add_argument("--no-context", action="store_true", help="不返回源码上下文")
+    # symbols
+    p_sym = ssub.add_parser("symbols", help="列出文件中的所有符号定义")
+    p_sym.add_argument("repo", help="repo 根目录")
+    p_sym.add_argument("--file", required=True, dest="file", metavar="FILE")
+    p_sym.add_argument("--symbol", dest="symbol", help="只显示此符号的详情")
+    p_sym.add_argument("--json", action="store_true")
 
     # callers
-    sc = sub.add_parser("callers", help="查找符号的所有调用者")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("symbol", help="符号名（qualified_name）")
-    sc.add_argument("--limit", type=int, default=20, help="返回结果上限")
+    p_callers = ssub.add_parser("callers", help="查找调用某符号的所有位置")
+    p_callers.add_argument("repo", help="repo 根目录")
+    p_callers.add_argument("symbol", help="目标符号名")
+    p_callers.add_argument("--json", action="store_true")
 
     # callees
-    sc = sub.add_parser("callees", help="查找符号调用的所有函数")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("symbol", help="符号名（qualified_name）")
-    sc.add_argument("--limit", type=int, default=20, help="返回结果上限")
-
-    # impact
-    sc = sub.add_parser("impact", help="影响范围分析")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("files", nargs="+", help="变更的文件")
-    sc.add_argument("--depth", type=int, default=5, help="最大追踪深度")
+    p_callees = ssub.add_parser("callees", help="查找符号内部调用了哪些函数")
+    p_callees.add_argument("repo", help="repo 根目录")
+    p_callees.add_argument("--file", required=True, dest="file", metavar="FILE")
+    p_callees.add_argument("--symbol", required=True, dest="symbol")
+    p_callees.add_argument("--json", action="store_true")
 
     # trace
-    sc = sub.add_parser("trace", help="调用链追踪")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("target", help="目标文件或符号")
-    sc.add_argument("--symbol", "-s", help="指定目标文件中的函数名")
-    sc.add_argument("--depth", type=int, default=8, help="最大追踪深度")
+    p_trace = ssub.add_parser("trace", help="浅层调用链追踪")
+    p_trace.add_argument("repo", help="repo 根目录")
+    p_trace.add_argument("symbol", help="起始符号名")
+    p_trace.add_argument("--depth", type=int, default=2, help="追踪深度（默认 2）")
+    p_trace.add_argument("--json", action="store_true")
 
-    # callsites
-    sc = sub.add_parser("callsites", help="调用点搜索")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("--call", "-c", help="调用函数名（如 to, cuda, synchronize）")
-    sc.add_argument("--file", "-f", help="限定文件")
-    sc.add_argument("--finding-type", help="发现类型（自动填充搜索参数）")
-    sc.add_argument("--limit", type=int, default=50, help="返回结果上限")
+    # variants
+    p_var = ssub.add_parser("variants", help="Variant/Factory 映射解析")
+    p_var.add_argument("repo", help="repo 根目录")
+    p_var.add_argument("--key", help="只显示此 key 对应的映射")
+    p_var.add_argument("--file", dest="file_filter", help="只搜此文件")
+    p_var.add_argument("--max", type=int, default=500, dest="max_results")
+    p_var.add_argument("--json", action="store_true")
 
-    # callsite-context
-    sc = sub.add_parser("callsite-context", help="获取调用点上下文")
-    sc.add_argument("repo_root", help="仓库根目录")
-    sc.add_argument("callsite_id", help="调用点 ID")
 
-    args = p.parse_args(argv)
-    if not getattr(args, "scanner_cmd", None):
-        p.print_help()
+def _dispatch_scanner(args: argparse.Namespace) -> None:
+    """Dispatch scanner sub-commands."""
+    cmd = getattr(args, "scanner_cmd", None)
+    if cmd is None:
+        print(
+            "scanner 命令：files / search / read / callsites / symbols / "
+            "callers / callees / trace / variants\n"
+            "使用 `sysight scanner <cmd> --help` 查看详情",
+            file=sys.stderr,
+        )
         return
 
-    if not _dispatch_scanner(args):
-        print("错误：未知的 scanner 子命令", file=sys.stderr)
+    use_json = getattr(args, "json", False)
+
+    if cmd == "files":
+        result = list_files(args.repo, ext=getattr(args, "ext", None),
+                            pattern=getattr(args, "pattern", None),
+                            max_results=args.max_results)
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "total": result.total,
+                "files": [{"path": f.path, "ext": f.ext, "size_bytes": f.size_bytes}
+                          for f in result.files],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# {result.repo}  ({result.total} files)")
+            for f in result.files:
+                print(f"  {f.path}  [{f.ext}  {f.size_bytes}B]")
+
+    elif cmd == "search":
+        result = scanner_search(
+            args.repo, args.query,
+            ext=getattr(args, "ext", None),
+            fixed=args.fixed,
+            case_sensitive=not args.ignore_case,
+            max_results=args.max_results,
+        )
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "query": result.query,
+                "total_matches": result.total_matches,
+                "matches": [{"path": m.path, "line": m.line, "column": m.column, "text": m.text}
+                            for m in result.matches],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# {result.total_matches} matches for {result.query!r} in {result.repo}")
+            for m in result.matches:
+                print(f"  {m.path}:{m.line}:{m.column}  {m.text}")
+
+    elif cmd == "read":
+        result = scanner_read_file(
+            args.repo, args.file,
+            start=getattr(args, "start", None),
+            end=getattr(args, "end", None),
+            around=getattr(args, "around", None),
+            context=args.context,
+        )
+        if result.error:
+            print(f"错误：{result.error}", file=sys.stderr)
+            sys.exit(1)
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "path": result.path,
+                "total_lines": result.total_lines,
+                "shown_start": result.shown_start, "shown_end": result.shown_end,
+                "lines": [{"line": ln.line, "text": ln.text} for ln in result.lines],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# {result.path}  (lines {result.shown_start}-{result.shown_end} / {result.total_lines})")
+            for ln in result.lines:
+                print(f"{ln.line:6d}  {ln.text}")
+
+    elif cmd == "callsites":
+        result = find_callsites(
+            args.repo, args.symbol,
+            file_filter=getattr(args, "file_filter", None),
+            ext=getattr(args, "ext", None),
+            max_results=args.max_results,
+        )
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "symbol": result.symbol, "total": result.total,
+                "sites": [{"path": s.path, "line": s.line, "enclosing": s.enclosing, "source": s.source}
+                          for s in result.sites],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# {result.total} call-sites for {result.symbol!r} in {result.repo}")
+            for s in result.sites:
+                enc = f"  [{s.enclosing}]" if s.enclosing else ""
+                print(f"  {s.path}:{s.line}{enc}  {s.source}")
+
+    elif cmd == "symbols":
+        result = list_symbols(args.repo, args.file)
+        if result.error:
+            print(f"错误：{result.error}", file=sys.stderr)
+            sys.exit(1)
+        filter_sym = getattr(args, "symbol", None)
+        syms = result.symbols
+        if filter_sym:
+            syms = [s for s in syms if s.name == filter_sym]
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "file": result.file,
+                "symbols": [
+                    {"name": s.name, "kind": s.kind, "file": s.file,
+                     "line": s.line, "end_line": s.end_line,
+                     "signature": s.signature, "docstring": s.docstring}
+                    for s in syms
+                ],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# {result.file}  ({len(syms)} symbols)")
+            for s in syms:
+                doc = f"  # {s.docstring}" if s.docstring else ""
+                print(f"  L{s.line:4d}  [{s.kind:14s}]  {s.name}{doc}")
+
+    elif cmd == "callers":
+        result = find_callers(args.repo, args.symbol)
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "symbol": result.symbol, "total": result.total,
+                "sites": result.sites,
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# {result.total} callers of {result.symbol!r} in {result.repo}")
+            for s in result.sites:
+                enc = f"  [{s['enclosing']}]" if s.get("enclosing") else ""
+                print(f"  {s['path']}:{s['line']}{enc}  {s['source']}")
+
+    elif cmd == "callees":
+        result = find_callees(args.repo, args.file, args.symbol)
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "symbol": result.symbol,
+                "file": result.file, "callees": result.callees,
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# callees of {result.symbol!r} in {result.file}")
+            for name in result.callees:
+                print(f"  {name}")
+
+    elif cmd == "trace":
+        result = trace_symbol(args.repo, args.symbol, max_depth=args.depth)
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "root_symbol": result.root_symbol,
+                "chain": result.chain,
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# trace {result.root_symbol!r}  (depth={args.depth})")
+            for entry in result.chain:
+                ext_mark = " [external]" if entry.get("external") else ""
+                loc = f"  {entry['file']}:{entry['line']}" if entry.get("file") else ""
+                print(f"  {entry['symbol']}{ext_mark}{loc}")
+                for callee in entry.get("callees", []):
+                    print(f"    → {callee}")
+
+    elif cmd == "variants":
+        result = find_variants(
+            args.repo,
+            key=getattr(args, "key", None),
+            file_filter=getattr(args, "file_filter", None),
+            max_results=args.max_results,
+        )
+        if use_json:
+            print(json.dumps({
+                "repo": result.repo, "total": result.total,
+                "entries": [
+                    {"key": e.key, "target": e.target, "file": e.file,
+                     "line": e.line, "kind": e.kind, "context": e.context}
+                    for e in result.entries
+                ],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(f"# {result.total} variant mappings in {result.repo}")
+            for e in result.entries:
+                print(f"  [{e.kind:12s}]  {e.key!r:30s} → {e.target}  ({e.file}:{e.line})")
+
+    else:
+        print(f"未知 scanner 子命令：{cmd}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -967,11 +861,6 @@ def _main_standalone_scanner(argv: list[str]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> None:
     argv_list = list(sys.argv[1:] if argv is None else argv)
-
-    # Check for scanner as top-level command first
-    if argv_list and argv_list[0] == "scanner":
-        _main_standalone_scanner(argv_list[1:])
-        return
 
     # Check for nsys-sql as top-level command
     if argv_list and argv_list[0] == "nsys-sql":
@@ -983,6 +872,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         _main_standalone_nsys_windows(argv_list[2:])
         return
 
+    # Check for scanner as top-level command
+    if argv_list and argv_list[0] == "scanner":
+        # Parse as `sysight scanner <cmd> ...` with full argparse
+        pass  # falls through to main argparse below
+
     standalone_nsys = _standalone_nsys_argv(argv_list)
     if standalone_nsys is not None:
         _main_standalone_nsys(standalone_nsys)
@@ -991,39 +885,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     p = argparse.ArgumentParser(
         prog="sysight",
         description=(
-            "仓库静态分析 + nsys 性能分析工具\n\n"
-            "  sysight scanner <cmd> <repo> [opts]       静态代码分析（供 agent 使用）\n"
-            "  sysight nsys <profile>                    独立 nsys profile 分析\n"
-            "  sysight nsys-sql <cmd> <db>               直接查询 nsys SQLite（供 agent 使用）\n"
-            "  sysight <repo>                             全量扫描分析\n"
-            "  sysight <repo> search <query>              搜索符号/文件\n"
-            "  sysight <repo> impact <files...>           影响范围分析\n"
-            "  sysight <repo> trace <file-or-sym>         调用链追踪\n"
-            "  sysight <repo> manifest                    路径清单（仅 Stage 1）\n"
-            "  sysight <repo> nsys <profile>              兼容旧用法"
+            "nsys 性能分析工具 + 静态代码分析工具集\n\n"
+            "  sysight nsys <profile>           nsys profile 分析\n"
+            "  sysight nsys-sql <cmd> <db>      直接查询 nsys SQLite\n"
+            "  sysight scanner <cmd> <repo>     静态 repo 代码分析"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("repo_path", help="仓库路径（当前目录用 '.'）")
     p.add_argument("--verbose", "-v", action="store_true", help="开启调试日志")
-    p.add_argument("--json", action="store_true", help="输出 JSON 格式")
-    p.add_argument("--top", type=int, default=10, help="显示 Top N 入口点")
-    p.add_argument("--depth", type=int, default=8, help="最大调用链深度")
 
     sub = p.add_subparsers(dest="subcmd")
-
-    sc = sub.add_parser("search", help="按关键词搜索符号/文件")
-    sc.add_argument("query")
-    sc.add_argument("--limit", type=int, default=20)
-
-    sc = sub.add_parser("impact", help="计算文件变更的影响范围")
-    sc.add_argument("files", nargs="+", help="变更的文件路径（相对仓库根）")
-
-    sc = sub.add_parser("trace", help="从文件或符号追踪调用链")
-    sc.add_argument("target", help="文件路径（支持模糊匹配）或符号名")
-    sc.add_argument("--symbol", "-s", help="指定目标文件中的函数名")
-
-    sub.add_parser("manifest", help="Stage-1 路径清单，不读文件内容")
 
     sc = sub.add_parser(
         "nsys",
@@ -1049,71 +920,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             print("错误：未指定 nsys-sql 子命令。使用 --help 查看帮助。", file=sys.stderr)
             sys.exit(1)
 
-    # Handle scanner subcommand
-    if args.subcmd == "scanner":
-        if _dispatch_scanner(args):
-            return
-        else:
-            print("错误：未指定 scanner 子命令。使用 --help 查看帮助。", file=sys.stderr)
-            sys.exit(1)
-
-    if args.subcmd == "manifest":
-        m = discover_repo(Path(args.repo_path).resolve())
-        if args.json:
-            print(json.dumps(asdict(m), indent=2))
-        else:
-            print(f"仓库：{m.repo_root}")
-            print(f"文件数：{len(m.files)}  跳过目录：{m.ignored_dir_count}")
-            print(f"语言：{m.languages}")
-            print(f"GPU 候选文件：{len(m.candidate_gpu_files)}")
-            print(f"入口候选文件：{len(m.candidate_entry_files)}")
-            for w in m.warnings:
-                print(f"  注意：{w}")
-
-    elif args.subcmd == "search":
-        files, _ = scan_repo(Path(args.repo_path).resolve())
-        results = search_symbols(files, args.query, limit=args.limit)
-        if args.json:
-            print(json.dumps([asdict(r) for r in results], indent=2))
-        else:
-            for r in results:
-                print(f"  [{r.kind}] {r.symbol}  行={r.line}  得分={r.score:.1f}")
-
-    elif args.subcmd == "impact":
-        files, _ = scan_repo(Path(args.repo_path).resolve())
-        dag = build_dag(files)
-        ir = impact_radius(files, dag, args.files, max_depth=args.depth)
-        if args.json:
-            print(json.dumps(asdict(ir), indent=2))
-        else:
-            print(f"起始文件：{ir.seed_files}")
-            print(f"影响范围（{len(ir.impacted_files)} 个文件）：")
-            for f in ir.impacted_files:
-                print(f"  深度={ir.depth_map.get(f, '?')}  {f}")
-
-    elif args.subcmd == "trace":
-        files, _ = scan_repo(Path(args.repo_path).resolve())
-        dag = build_dag(files)
-        chains = trace_from(files, dag, args.target,
-                            symbol=getattr(args, "symbol", None),
-                            max_depth=args.depth)
-        if not chains:
-            print(f"未找到：{args.target!r}")
-            print("建议：先用 'search' 子命令确认文件/符号名称")
-        elif args.json:
-            print(json.dumps([asdict(c) for c in chains], indent=2))
-        else:
-            print(render_trace(chains, args.target))
-
     elif args.subcmd == "nsys":
-        _emit_nsys(args, default_repo_root=str(Path(args.repo_path).resolve()))
+        _emit_nsys(args)
+
+    elif args.subcmd == "scanner":
+        _dispatch_scanner(args)
 
     else:
-        result = analyze_repo(args.repo_path, top_n=args.top, max_chain_depth=args.depth)
-        if args.json:
-            print(json.dumps(result.to_dict(), indent=2))
-        else:
-            print(render_summary(result))
+        p.print_help()
 
 
 if __name__ == "__main__":

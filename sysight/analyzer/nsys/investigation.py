@@ -75,12 +75,17 @@ def run_stage6_investigation(
 _run_stage6_investigation = run_stage6_investigation
 
 
-def _skill_dir() -> Path:
-    return Path(__file__).resolve().parents[1] / "skills" / "nsys-investigation"
+def _analyzer_dir() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _memory_dir() -> Path:
+    # memory/ lives at sysight/memory/, one level above sysight/analyzer/
+    return Path(__file__).resolve().parents[2] / "memory"
 
 
 def _task_path() -> Path:
-    return _skill_dir() / "TASK.txt"
+    return _analyzer_dir() / "SKILL.txt"
 
 
 def _read_harness_file(path: Path) -> str:
@@ -119,9 +124,9 @@ def _build_investigation_prompt(
     prompt = prompt.replace("{{SQLITE_PATH}}", sqlite_path)
     prompt = prompt.replace("{{REPO_ROOT}}", request.repo_root or ".")
     prompt = prompt.replace("{{PRE_INJECTED_SQL}}", _build_pre_injected_sql(sqlite_path))
-    memory_dir = _skill_dir() / "memory"
+    memory_dir = _memory_dir()
     prompt = prompt.replace("{{WORKSPACE_MEMORY}}", _read_harness_file(memory_dir / "workspace.md") or "(空)")
-    prompt = prompt.replace("{{EXPERIENCE_MEMORY}}", _read_harness_file(memory_dir / "experience.md") or "(空)")
+    prompt = prompt.replace("{{EXPERIENCE_MEMORY_PATH}}", str(memory_dir / "experience.md"))
 
     return prompt
 
@@ -267,6 +272,7 @@ def _run_codex_cli(prompt: str, request: NsysAnalysisRequest) -> InvestigationRe
         command.extend(["--model", request.investigation_model])
     if not Path(repo_root).joinpath(".git").exists():
         command.append("--skip-git-repo-check")
+    command.append("-")  # read prompt from stdin
 
     _write_investigation_manifest(artifact_dir, {
         "status": "starting",
@@ -389,63 +395,49 @@ def _parse_anchors(data: dict[str, object]) -> list[InvestigationAnchor]:
     return anchors
 
 
-def _parse_investigation_output(text: str) -> tuple[str, list[InvestigationQuestion], list[InvestigationAnchor], str | None, str, str | None]:
-    """Returns (summary, questions, anchors, workspace_mem, workspace_mode, experience_mem).
+def _parse_investigation_output(text: str) -> tuple[str, list[InvestigationQuestion], list[InvestigationAnchor], str | None, str | None]:
+    """Returns (summary, questions, anchors, workspace_mem, experience_mem).
 
-    workspace_mode is 'append' or 'overwrite' (default 'append').
+    workspace.md is always append-only.
     """
     payload = _extract_json_payload(text)
     if not payload:
-        return "", [], [], None, "append", None
+        return "", [], [], None, None
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
-        return "", [], [], None, "append", None
+        return "", [], [], None, None
     if not isinstance(data, dict):
-        return "", [], [], None, "append", None
+        return "", [], [], None, None
 
     summary = str(data.get("summary") or "").strip()
     questions = _parse_questions(data)
     anchors = _parse_anchors(data)
     workspace_memory = data.get("workspace_memory") or None
-    workspace_mode = str(data.get("workspace_memory_mode") or "append").strip().lower()
-    if workspace_mode not in ("append", "overwrite"):
-        workspace_mode = "append"
     experience_memory = data.get("experience_memory") or None
     if isinstance(workspace_memory, str):
         workspace_memory = workspace_memory.strip() or None
     if isinstance(experience_memory, str):
         experience_memory = experience_memory.strip() or None
-    return summary, questions, anchors, workspace_memory, workspace_mode, experience_memory
+    return summary, questions, anchors, workspace_memory, experience_memory
 
 
-def _flush_memory(workspace_mem: str | None, workspace_mode: str, experience_mem: str | None) -> None:
+def _flush_memory(workspace_mem: str | None, experience_mem: str | None) -> None:
     """Persist codex-provided memory updates.
 
-    workspace.md  — overwrite or append, decided by codex via workspace_memory_mode
+    workspace.md  — always append-only
     experience.md — always append-only
     """
-    memory_dir = _skill_dir() / "memory"
+    memory_dir = _memory_dir()
     memory_dir.mkdir(parents=True, exist_ok=True)
     if workspace_mem:
-        if workspace_mode == "overwrite":
-            _overwrite_memory(memory_dir / "workspace.md", workspace_mem)
-        else:
-            _append_memory(memory_dir / "workspace.md", workspace_mem)
+        _append_memory(memory_dir / "workspace.md", workspace_mem)
     if experience_mem:
         _append_memory(memory_dir / "experience.md", experience_mem)
 
 
-def _overwrite_memory(path: Path, content: str) -> None:
-    """Full replacement — used for workspace.md."""
-    try:
-        path.write_text(content if content.endswith("\n") else content + "\n", encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _append_memory(path: Path, content: str) -> None:
-    """Append-only — used for experience.md."""
+    """Append-only — used for workspace.md and experience.md."""
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
         separator = "\n\n---\n\n" if existing.strip() else ""
@@ -464,6 +456,15 @@ def _run_codex_cli_sync(
     stdout_path: Path,
     stderr_path: Path,
 ) -> InvestigationResult:
+    # Inject PYTHONPATH so that `python3 -m sysight.analyzer.cli` works inside
+    # the Codex sandbox regardless of whether the package is pip-installed.
+    # _analyzer_dir() points to sysight/analyzer/; the project root is 2 levels up.
+    import os as _os
+    _project_root = str(Path(__file__).resolve().parents[3])
+    _env = dict(_os.environ)
+    existing_pp = _env.get("PYTHONPATH", "")
+    _env["PYTHONPATH"] = f"{_project_root}:{existing_pp}" if existing_pp else _project_root
+
     started = time.monotonic()
     try:
         with stdout_path.open("w", encoding="utf-8") as stdout_file, \
@@ -474,6 +475,7 @@ def _run_codex_cli_sync(
                 stdout=stdout_file,
                 stderr=stderr_file,
                 text=True,
+                env=_env,
                 start_new_session=True,
             )
             _write_investigation_manifest(artifact_dir, {
@@ -504,8 +506,8 @@ def _run_codex_cli_sync(
         )
 
     output = _read_investigation_output(output_path)
-    summary, questions, anchors, workspace_mem, workspace_mode, experience_mem = _parse_investigation_output(output)
-    _flush_memory(workspace_mem, workspace_mode, experience_mem)
+    summary, questions, anchors, workspace_mem, experience_mem = _parse_investigation_output(output)
+    _flush_memory(workspace_mem, experience_mem)
     elapsed = time.monotonic() - started
     tokens_used = _parse_tokens_from_stderr(stderr_path)
     prompt_tokens_est = _estimate_prompt_tokens(prompt)
