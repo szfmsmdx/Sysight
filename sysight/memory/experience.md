@@ -88,7 +88,6 @@
 
 - 场景：Nsight 显示 D2H 总字节几乎为 0，但 D2H 次数与 step 数呈稳定倍数关系，同时伴随少量 sync_wait / stream wait。
 - 规则：优先在日志、监控、callback 路径搜索 `.item()`、`.cpu()`、`.numpy()`、`.tolist()`、`torch.cuda.synchronize()`；这类 tiny transfer 往往不是带宽瓶颈，而是把训练主线程和 GPU 强制对齐的同步点。
-- 示例：24 个 step 里出现 72 次 D2H，常常对应每步 3 次 host 读取（如 loss 标量、preview 拷贝、统计标量）。
 
 ---
 
@@ -159,7 +158,6 @@
 
 - 场景：benchmark 或 toy case 使用 synthetic dataset，profile 显示 step 间 GPU 大量 idle，而 DataLoader 又是单线程。
 - 规则：不要只看 collate/transform；还要检查 `Dataset.__getitem__` 是否每样本新建 `torch.Generator`、`manual_seed`、`torch.randn` 或拼接文本。这类即时造样本会直接占用 host gap。
-- 示例：当 `steps × batch_size` 次 `randn` 与 step 间 gap 同量纲时，应优先把数据预生成、按 batch 生成，或交给 worker 进程。
 
 ---
 
@@ -191,55 +189,11 @@
 
 
 
----
-
-## 用零权重残差识别重复前向分支
-- 场景：源码中存在 `shadow = module(x)` 后再通过 `main + shadow.mul(0.0)` 或类似零权重路径接回主图，profile 中同类 Conv/GEMM kernel 数量约为结构预期的 2 倍。
-- 规则：必须把被零权重乘掉但仍执行的分支归为 zero-contribution compute；优化时删除该分支或用配置条件完全跳过，不要把乘零路径当成有效模型计算。
-- 示例：2 层 stem 每 step 调用两次，在 24 step 中对应 96 个 forward conv kernel。
----
 
 ---
 
-## 用 indexSelectSmallIndex 次数反推按 token embedding 循环
-- 场景：Nsight top kernel 出现大量 `indexSelectSmallIndex`，同时小 GEMM/kernel launch 数很多，模型包含 embedding + projection。
-- 规则：用 `steps × seq_len` 反推 embedding 调用次数；若与 `indexSelectSmallIndex` count 对齐，应优先检查是否在 Python 中按 token position 循环调用 embedding/linear，而不是判断为 GPU 算力不足。
-- 示例（可选）：steps=24、seq_len=32 时，`indexSelectSmallIndex` count=768，通常对应每步 32 次逐 token embedding。
----
-
----
-
-## Nsight reduce_kernel 不等于 NCCL\n- 场景：nsys 报告或自动分类把 reduce_kernel 归为 gpu_comm，但 SQLite StringIds 没有 nccl/NCCL，源码也没有 torch.distributed 初始化。\n- 规则：C6 finding 必须同时有 profile NCCL 字符串或 NCCL API 信号，以及源码中的分布式通信调用；否则应按普通 reduce/compute 小 kernel 或框架算子分析。\n---
-
----
-
-## Profile Window 配置必须与 nsys capture 对齐
-- 场景：配置文件声明 profile_window_start/end，但 nsys 命令仍 full-run 捕获，首步初始化会污染 GPU idle 与 NVTX top。
-- 规则：看到首步远高于稳态时，先检查 nsys capture-range 或 cudaProfilerStart/Stop 是否真的启用；未启用时将 profile 结论限定为 full-run，优化建议先补 warmup/capture window。
-- 示例：config_v2.yaml 有 profile_window_start=10/end=20，但 profile_local.sh 未使用 capture-range，iteration_000=1203.567ms 而稳态约 20ms。
----
-
----
-
-## 单请求微批会伪装成 GPU 空闲
-- 场景：配置里 batch_size>1，但 NVTX serve_batch 数量等于 request_count，且 GPU active 很低、kernel 很短。
-- 规则：优先检查队列/调度层是否把 batch window 再拆成单元素 microbatch；这类问题会同时放大 kernel launch、H2D/D2H 小拷贝和 postprocess 同步次数。
-- 示例：batch_size=4、request_count=12 却出现 12 个 serve_batch，应检查 iter_batches 是否 yield [request]。
----
-## cache materialize 中的 cpu().to(cuda) 是同步往返信号
-- 场景：D2H/H2D count 很高但 bytes 很小，并伴随 stream wait，同步点分散在每 token decode 中。
-- 规则：搜索 .cpu().to(device) 和 .item()；cache/state 类 tensor 如果每步从 GPU 拉回 CPU 再传回 GPU，通常应改为全程 device-resident 或明确保持 CPU-only。
-- 示例：cache["state"].cpu().to(device) 在 decode_step 内调用时，会制造 D2H+H2D ping-pong。
----
-
----
-
-## Nsight 首步冷启动与 capture window
-- 场景：NSys trace 中首个 iteration 远大于稳态，且配置里有 profile_window_start/profile_window_end 但代码未使用。
-- 规则：先把首步冷启动与采集窗口污染作为独立 finding；性能结论应基于 warmup 后的稳态窗口，而不是完整进程生命周期。
-- 示例：iteration_000 超过 1s、稳态 step 约 20ms 时，GPU idle 可能主要反映初始化和 host 冷启动，而非稳态模型吞吐。
----
-## 小字节 D2H count 识别同步热点
-- 场景：D2H bytes 显示为 0.00MB 但 count 较高，同时存在 .item()、.cpu().numpy() 或 cuda.synchronize。
-- 规则：优先按 C3 同步问题定位到训练热路径行；不要因为字节量小就忽略，它通常会破坏 CUDA 异步流水。
+## 单卡 reduce kernel 不等于 NCCL
+- 场景：Nsight 报告里出现 reduce_kernel 或工具误把单流 kernel 归到 gpu_comm，但源码没有分布式初始化。
+- 规则：C6 必须同时看到 profile StringIds 含 nccl/NCCL 且源码有 torch.distributed/init_process_group/all_reduce；否则将 reduce_kernel 归为碎粒度 CUDA op 或模型 reduce，不输出通信 finding。
+- 示例：case_5 的 StringIds 无 nccl，源码无 torch.distributed，reduce_kernel 来自 at::native::reduce_kernel。
 ---

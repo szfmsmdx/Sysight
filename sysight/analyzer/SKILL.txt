@@ -40,17 +40,17 @@ Repo root：{{REPO_ROOT}}
 - 若只能看到 library/kernel/NVTX 名称、无法找到 repo 层代码，标记 `file: null` 并在 `description` 中说明缺少信号。
 - callstack 没有 Python frame 时，不要停在底层运行时符号，改从 NVTX label 和 kernel 名称推断操作类型，再通过阅读源码定位对应调用点。
 - **主动探索**：完成明显热点定位后，主动检查是否还有遗漏的高信号区域，通过阅读源码验证。
-- 调查按以下顺序逐类检查，每类有信号则定位到具体行，无信号则跳过，不得因某一类信号突出就省略其余类别：
-  1. C1：判断 GPU stream gap 是否源于 host-side data starvation，追查数据供给链路
-  2. C7：识别训练热路径中的 CPU-bound Python pipeline 瓶颈
-  3. C2：当 kernel count 与 duration 严重不匹配时，追查 Python 侧 fine-grained dispatch 来源
-  4. C3：对比 D2H count 与 bytes，定位隐式 host/device 同步点
-  5. C4：按 step 粒度统计 H2D/D2H，逐一定位每处 host/device 数据搬运
-  6. C5：识别 redundant computation 与 zero-contribution code path
-  7. C6：仅在 profile 与源码均确认分布式通信存在时才检查
+- **基于证据的全量摸排（Evidence-Driven Exhaustive Search）**：作为性能工程师，首先全局观察 Profile 的核心瓶颈（如 GPU idle 占大头、大量细粒度 kernel、或内存搬运繁重）。在此基础上，为了一次性挖出所有隐患，请严格对照 C1-C7 维度进行发散排查，尽可能多地找出导致该瓶颈的所有代码行：
+  1. C1：不仅判断 GPU stream gap 追查数据供给，还要全局检查 `runtime` / 初始化文件中是否有限制并发（如 `torch.set_num_threads`）。
+  2. C7：除了泛泛寻找 `json.dumps`，还必须深入阅读 `DataLoader` / `tokenizer` / `codec` 的内部实现，主动寻找原生且低效的 Python 操作（如按字符遍历拼接等）。
+  3. C2：当 kernel count 极高时，深入查找底层的 head/维度 循环，以及最外层的自回归（autoregressive）按步 `for` 循环带来的开销。
+  4. C3：对比 D2H count 与 bytes，定位隐式 host/device 同步点（如 `.item()`, `cudaDeviceSynchronize()`）。
+  5. C4：按 step 粒度统计 H2D/D2H，逐一定位每处不必要的数据搬运（如频繁调用的 `.to()`, `.cpu()`, `.tolist()`）。
+  6. C5：识别冗余计算（redundant computation），包括在前向热路径中重复构造固定 shape 的 tensor（如 mask）、不必要的 clone 或 torch.cat。
+  7. C6：识别任何多卡或分布式通信操作（即使是单卡 profile 中未激活的分支），重点查找 `all_reduce`, `all_gather`, `barrier` 及 `DDP` 相关的配置参数。
 - 同一函数内如有多处独立的问题代码行，每行须单独输出一个 finding，不得将多行合并为一个 finding；finding 数量没有上限。
 - `line` 填写前先通过阅读源码确认，行号以实际代码为准，不得凭印象估算。
-- `for` 循环问题：`line` 指向 `for` 关键字所在行。
+- `for` 循环定界原则：如果是循环粒度太细导致的问题（如在 Python 中按元素/按字符循环、自回归逐 token 循环产生大量 kernel launch），`line` 指向 `for` 关键字所在行。如果是循环内部的具体某行代码导致了逻辑错误或低效（如错误地将 batch 拆碎、在循环内部重复申请显存或拷贝），`line` 必须指向内部那行具体出错的操作代码，而不能指向 `for`。
 - `description` 和 `suggestion` 字段使用中文。
 - 只输出 JSON，不输出任何其他内容。
 
@@ -124,10 +124,10 @@ category（必须使用 C1-C7）：
 
 | 值 | 含义 | 典型信号 | 判断边界 |
 |----|------|---------|----------|
-| C1 | Host Scheduling | DataLoader worker=0、CPU 单线程、GPU 等待数据 | — |
-| C2 | Kernel Launch Overhead | Python 循环触发大量小 CUDA op | — |
-| C3 | Synchronization | `.item()`、`cudaDeviceSynchronize()`、blocking copy | 须有 D2H/sync profile 信号或明确 blocking call，不凭 kernel 名称推断；`.cpu()`/`.numpy()`/`.tolist()`/`.item()` 在训练热路径内触发时归 C3（主要危害是强制 host/device 同步），仅当 profile D2H bytes 显著且无明显 sync 信号时才考虑 C4 |
-| C4 | Memory Copy | `.to()`、`.cuda()`、H2D/D2H、缺少 pinned memory | 多行独立拷贝各自输出 finding；`.cpu()`/`.numpy()` 同步语义优先判 C3，见上 |
-| C5 | Compute Inefficiency | 低效算子、重复计算、不必要的 clone/cat | — |
-| C6 | Communication | NCCL all_reduce/all_gather、通信未重叠 | 须确认源码有 `init_process_group` 且 profile StringIds 含 `nccl` |
-| C7 | Framework / Python Pipeline | tokenizer、collate、Python 序列化、checkpoint 热路径 | 须定位到具体函数行，不要泛指 DataLoader；`json.dumps`/`json.loads`/Python 序列化在热路径内归 C7，不是 C3 |
+| C1 | Host Scheduling | DataLoader worker=0、单线程配置、GPU 等待数据 | 包含全局并发数限制等调度阻塞。 |
+| C2 | Kernel Launch Overhead | Python 循环触发大量小 CUDA op | 包含模型层的 fine-grained 循环及顶层自回归 token 循环。 |
+| C3 | Synchronization | `.item()`、`cudaDeviceSynchronize()` | 产生 host/device 隐式或显式同步的操作。 |
+| C4 | Memory Copy | `.to()`、`.cuda()`、`.cpu()`、`.tolist()` | 热路径上发生的数据设备往返与拷贝（多行独立拷贝各自输出 finding）。 |
+| C5 | Compute Inefficiency | 低效算子、重复计算、不必要的 clone/cat | 包括每次 forward 重复分配构造 fixed tensor 或 mask。 |
+| C6 | Communication | NCCL all_reduce/all_gather、通信未重叠 | 只要源码中存在分布式相关操作（如 `all_reduce`、`barrier`、`DDP` 的 `bucket_cap_mb`），无论 profile 是否捕捉到 nccl，都必须作为 finding 报出。 |
+| C7 | Framework / Python Pipeline | tokenizer/codec 内纯 Python 遍历拼接、JSON 等序列化 | 须定位到具体函数行，不要泛指 DataLoader。 |

@@ -23,27 +23,25 @@ profile 脚本=<名称>；capture-range=<有/无>；warmup=<有/无>
 
 -->
 
+
 ---
 
 ## 基本配置
-active_config=configs/config_v2.yaml
-batch_size=8、steps=24、model_variant=v5、trainer_variant=standard、image_size=32、seq_len=32、hidden_size=128、loader_workers=0、pin_memory=False、device=cuda
-profile 脚本=run.py；capture-range=无（profile_window_start=10/profile_window_end=20 未在训练循环中使用）；warmup=无
-首步 NVTX=1203.567ms，稳态 step=19.799ms（iteration_001-023 平均）；NCCL/nccl StringIds=无
+active_config=configs/config_v6.yaml
+batch_size=6、num_steps=12、eval_interval=2、checkpoint_interval=3、feature_dim=32、hidden_size=64、num_heads=4、model=eval_v5、dataset=alternating_c、loader_workers=0、pin_memory=false、callback=sync_v4、checkpoint=metadata_v3、metric=dist_v2
+profile 脚本=scripts/profile_local.sh；capture-range=无；warmup=无
+首步 NVTX=505.993ms，稳态 step=2.500-9.012ms；NCCL/nccl StringIds=无，repo 内 init_process_group=无；profile 中 reduce_kernel/gpu_comm 应优先按本地 reduction/metric overhead 排查，不直接按 C6 NCCL 归因
 
 ## 文件链路
 入口：run.py
-  -> src/runtime/launcher.py / src/runtime/settings.py（解析 configs/config_v2.yaml，构建 CaseConfig）
-  -> src/trainers/factory.py -> src/trainers/loop.py（fit/training_step，batch_to_device / model_forward / loss_backward / optimizer_step / sync_metrics）
-  -> src/data/module.py -> src/data/source.py / src/data/transforms.py（DataLoader num_workers=0 pin_memory=False；SyntheticPairDataset；collate_records/image_transform/encode_text）
-  -> src/models/registry.py -> src/models/variants/v5.py -> src/models/assembly.py -> src/modules/fusion.py -> src/models/blocks.py -> src/ops/tensor_ops.py（VisionTower/TextTower/FusionHead；stack_text_states 与 append_visual_tokens 为细粒度 dispatch 来源）
-  -> src/callbacks/training.py -> src/utils/monitor.py（MetricRecorder/RuntimeObserver 在 sync_metrics 中读取 GPU 标量并同步）
+  -> src/runtime/launcher.py + configs/config_v6.yaml
+  -> src/workflow/runner.py（stager / forward / loss / backward / optimizer_step / callback / checkpoint / validation）
+  -> src/data/factory.py -> src/data/catalog.py -> src/data/collate.py
+  -> src/pipeline/staging.py
+  -> src/models/registry.py -> src/models/core.py -> src/models/ops.py
+  -> src/callbacks/sync.py、src/checkpoint/manager.py、src/eval/validator.py、src/communication/metrics.py
 
----
-
-## 本次调查增量（2026-04-28）
-- 首步冷启动/采集窗口问题确认：iteration_000=1203.567ms，稳态 iteration_001-023 平均约 19.8ms；configs/config_v2.yaml 的 profile_window_start/profile_window_end 未在 src/trainers/loop.py 中使用。
-- 数据链路确认：src/data/module.py 固定 worker_count=0、page_locked=False；SyntheticPairDataset.__getitem__ 逐样本创建 Generator/randn；collate_records 串行执行 image_transform、encode_text、pack_metadata。
-- 模型热路径确认：TextTower 通过 stack_text_states 按 seq_len=32 逐 token 调 embedding+linear；FusionHead 通过 append_visual_tokens 按 16 个 visual token 循环 mix+cat+clone；VisionTower.forward 存在重复 stem 和 shadow.mul(0.0) 零贡献路径。
-- 同步链路确认：MetricRecorder.capture 每步 loss.item、logits.cpu().numpy、json.dumps；RuntimeObserver.after_step 每步 torch.cuda.synchronize 和 logits mean item。
-- 分布式检查：源码搜索未发现 init_process_group/all_reduce/nccl，已有 profile 记忆中 NCCL/nccl StringIds=无；本次不输出 C6 finding。
+## 本次增量发现
+- 主要瓶颈模式：短 profile + 冷启动采集 + tiny batch/model 导致 GPU active 仅 3.5ms、kernel 980 个且 avg 3.3us，cudaLaunchKernel API inclusive 103.842ms。
+- 高风险源码点：scripts/profile_local.sh:11 无 warmup/capture-range；configs/config_v6.yaml:16 loader_workers=0；src/runtime/device.py:10 set_num_threads(1)；src/workflow/runner.py:34 micro-step 训练循环；src/models/ops.py:8/10 Python head loop + cat；src/models/core.py:24/25 redundant shadow encoder；src/callbacks/sync.py:14/15 每步同步和 item；src/eval/validator.py:20/21 D2H/tolist/item；src/communication/metrics.py:13/17 重复 metric reduction/item。
+- C6 结论：本轮查询 StringIds 未发现 nccl，scanner search 未发现 init_process_group；虽然 analyzer 报 gpu_comm/reduce_kernel，但不输出确定 NCCL 通信瓶颈。若远程 launcher 外部初始化 process group，再单独复核 src/communication/metrics.py:15-16 的 all_reduce/broadcast。
