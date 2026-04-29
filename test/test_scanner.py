@@ -14,14 +14,14 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from sysight.analyzer.scanner.fs import list_files
-from sysight.analyzer.scanner.search import search
-from sysight.analyzer.scanner.reader import read_file
-from sysight.analyzer.scanner.callsites import find_callsites
-from sysight.analyzer.scanner.symbols import (
+from sysight.shared.scanner.fs import list_files
+from sysight.shared.scanner.search import search
+from sysight.shared.scanner.reader import read_file
+from sysight.shared.scanner.callsites import find_callsites
+from sysight.shared.scanner.symbols import (
     list_symbols, find_callers, find_callees, trace_symbol,
 )
-from sysight.analyzer.scanner.variants import find_variants
+from sysight.shared.scanner.variants import find_variants
 
 
 def _write(root: Path, rel: str, content: str) -> None:
@@ -306,7 +306,7 @@ class TestSymbols(unittest.TestCase):
 
 class TestScannerCliModule(unittest.TestCase):
     def test_module_can_register_and_dispatch_files_command(self):
-        from sysight.analyzer.scanner import scanner_cli
+        from sysight.shared.scanner import scanner_cli
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -16,9 +16,10 @@ from pathlib import Path
 from .nsys import analyze_nsys
 from .nsys.models import NsysAnalysisRequest, NsysDiag
 from .nsys.render import render_nsys_terminal
-from .memory.memory_cli import add_memory_subparser, dispatch_memory
+from ..shared.memory.memory_cli import add_memory_subparser, dispatch_memory
 from .nsys.sql_cli import add_nsys_sql_subparser, dispatch_nsys_sql, main_standalone_nsys_sql
-from .scanner.scanner_cli import add_scanner_subparser, dispatch_scanner
+from ..shared.scanner.scanner_cli import add_scanner_subparser, dispatch_scanner
+from ..optimizer.cli import add_optimizer_subparser, dispatch_optimizer
 
 
 def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
@@ -487,6 +488,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # Add memory as a subcommand under sysight
     add_memory_subparser(sub)
+
+    # Add optimizer as a subcommand under sysight
+    add_optimizer_subparser(sub)
 
     args = p.parse_args(argv_list)
 

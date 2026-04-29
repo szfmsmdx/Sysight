@@ -11,7 +11,7 @@ from unittest import mock
 
 from benchmark import extract_findings, run_sysight_streaming
 from sysight.analyzer.cli import main
-from sysight.analyzer.memory.store import (
+from sysight.shared.memory.store import (
     apply_memory_updates,
     build_memory_brief,
     read_memory_file,

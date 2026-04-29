@@ -25,7 +25,7 @@ from sysight.analyzer.nsys.localization import (
     _memory_dir,
     _parse_localization_output,
 )
-from sysight.analyzer.memory.store import apply_memory_updates
+from sysight.shared.memory.store import apply_memory_updates
 from sysight.analyzer.nsys.models import NsysAnalysisRequest, NsysFinding
 
 

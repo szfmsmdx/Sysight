@@ -14,7 +14,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ..memory.store import build_memory_brief, resolve_memory_path
+from ...shared.memory.store import build_memory_brief, resolve_memory_path
 from .sql_cli import run_sql_nvtx, run_sql_sync, run_sql_memcpy, run_sql_kernels, run_sql_gaps, run_sql_kernel_launch
 
 from .models import (
