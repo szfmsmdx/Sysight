@@ -20,6 +20,7 @@ from ..shared.memory.memory_cli import add_memory_subparser, dispatch_memory
 from .nsys.sql_cli import add_nsys_sql_subparser, dispatch_nsys_sql, main_standalone_nsys_sql
 from ..shared.scanner.scanner_cli import add_scanner_subparser, dispatch_scanner
 from ..optimizer.cli import add_optimizer_subparser, dispatch_optimizer
+from ..executor.cli import add_executor_subparser, dispatch_executor
 
 
 def _nsys_diag_to_dict(diag: NsysDiag) -> dict:
@@ -492,6 +493,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     # Add optimizer as a subcommand under sysight
     add_optimizer_subparser(sub)
 
+    # Add executor as a subcommand under sysight
+    add_executor_subparser(sub)
+
     args = p.parse_args(argv_list)
 
     _configure_logging(args.verbose)
@@ -509,6 +513,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     elif args.subcmd == "scanner":
         dispatch_scanner(args)
+
+    elif args.subcmd == "optimize":
+        dispatch_optimizer(args)
+
+    elif args.subcmd == "execute":
+        dispatch_executor(args)
 
     elif args.subcmd == "memory":
         if dispatch_memory(args):
