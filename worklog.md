@@ -1,3 +1,18 @@
+## v0.5 — 2026-04-29
+
+- **memory 组件重构**：`sysight/memory/` 迁移到 `sysight/analyzer/memory/`，memory 逻辑与 analyzer 包内聚；原顶层 `sysight/memory/experience.md`、`workspace.md` 删除，运行时落盘路径统一为 `.sysight/memory/`。
+- **SKILL.txt 规则加固**：SOP 步骤 3 增加"active variant 类文件必须显式确认"约束，防止落到 decoy 文件；`for` 循环定界原则补充"循环行与循环体内独立问题行需各自输出 finding"；C7 排查规则补充"热路径函数需从入口逐行覆盖，不能只报末尾显眼操作"。
+- **benchmark 得分**：case_4=69%、case_5=94%、case_6=100%，三 case 平均 88%。
+
+## v0.4 — 2026-04-28
+
+- **Analyzer 架构继续收口**：`sysight/analyzer/cli.py` 完成第一轮小拆分，`scanner` 子命令迁移到 `sysight/analyzer/scanner/scanner_cli.py`，`nsys-sql` 子命令迁移到 `sysight/analyzer/nsys/sql_cli.py`，主入口继续保持兼容。
+- **SQL 深分析模块化**：`sysight/analyzer/nsys/classify_sql.py` 从单体文件继续按职责拆分为 `sql_compute.py`、`sql_memory.py`、`sql_comm.py`、`sql_sync.py`、`sql_root_cause.py`、`sql_profile.py`、`sql_nvtx.py`；`classify_sql.py` 收敛为 facade + orchestrator，外部导入面保持稳定。
+- **NVTX / Profile / Root-Cause 保真**：保留 NVTX→Kernel attribution、GIL NVTX host anchor、profile health、root cause 反模式检测等高价值逻辑；修复 split 后 `_NCCL_KEYWORDS` 丢失导致的回归，并补齐无 `StringIds` 但有 `demangledName` 时的 kernel 命名归因。
+- **Prompt 与文档对齐**：更新 `sysight/analyzer/SKILL.txt`，继续弱化盲扫式措辞，收敛到 Evidence-Driven Top-Down Trace；同步更新 `sysight/analyzer/README.md` 说明当前 analyzer 结构与定位职责。
+- **测试瘦身与加固**：删除低价值 surface tests，合并重复 legacy 字段断言，清理无用 helper/import；补充 `test/test_nsys_sql_analysis.py` focused tests，覆盖 facade re-export、NCCL same-stream regression、NVTX GIL anchor 与 demangled-name attribution。
+- **验证**：本轮聚焦 SQL 单测与完整 `test/` 单测通过。
+
 ## v0.3 — 2026-04-23
 
 - **nsys-bench 测评框架**：新增 `nsys-bench/` 基准测试套件（6 个 case），自动化 JSON 评分，覆盖 C1-C7 全类别

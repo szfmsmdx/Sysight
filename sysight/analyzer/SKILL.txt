@@ -42,7 +42,7 @@ Repo root：{{REPO_ROOT}}
 - **主动探索**：完成明显热点定位后，主动检查是否还有遗漏的高信号区域，通过阅读源码验证。
 - **基于证据的全量摸排（Evidence-Driven Exhaustive Search）**：作为性能工程师，首先全局观察 Profile 的核心瓶颈（如 GPU idle 占大头、大量细粒度 kernel、或内存搬运繁重）。在此基础上，为了一次性挖出所有隐患，请严格对照 C1-C7 维度进行发散排查，尽可能多地找出导致该瓶颈的所有代码行：
   1. C1：不仅判断 GPU stream gap 追查数据供给，还要全局检查 `runtime` / 初始化文件中是否有限制并发（如 `torch.set_num_threads`）。
-  2. C7：除了泛泛寻找 `json.dumps`，还必须深入阅读 `DataLoader` / `tokenizer` / `codec` 的内部实现，主动寻找原生且低效的 Python 操作（如按字符遍历拼接等）。
+  2. C7：除了泛泛寻找 `json.dumps`，还必须深入阅读 `DataLoader` / `tokenizer` / `codec` 的内部实现，主动寻找原生且低效的 Python 操作（如按字符遍历拼接等）。对同一热路径函数（如 collate 的 per-record 循环体），需从函数入口逐行审查，不能只报最显眼的末尾操作而漏掉前面的同步调用——函数内每一行独立的热路径操作都须单独作为 finding 输出。
   3. C2：当 kernel count 极高时，深入查找底层的 head/维度 循环，以及最外层的自回归（autoregressive）按步 `for` 循环带来的开销。
   4. C3：对比 D2H count 与 bytes，定位隐式 host/device 同步点（如 `.item()`, `cudaDeviceSynchronize()`）。
   5. C4：按 step 粒度统计 H2D/D2H，逐一定位每处不必要的数据搬运（如频繁调用的 `.to()`, `.cpu()`, `.tolist()`）。
@@ -50,55 +50,34 @@ Repo root：{{REPO_ROOT}}
   7. C6：识别任何多卡或分布式通信操作（即使是单卡 profile 中未激活的分支），重点查找 `all_reduce`, `all_gather`, `barrier` 及 `DDP` 相关的配置参数。
 - 同一函数内如有多处独立的问题代码行，每行须单独输出一个 finding，不得将多行合并为一个 finding；finding 数量没有上限。
 - `line` 填写前先通过阅读源码确认，行号以实际代码为准，不得凭印象估算。
-- `for` 循环定界原则：如果是循环粒度太细导致的问题（如在 Python 中按元素/按字符循环、自回归逐 token 循环产生大量 kernel launch），`line` 指向 `for` 关键字所在行。如果是循环内部的具体某行代码导致了逻辑错误或低效（如错误地将 batch 拆碎、在循环内部重复申请显存或拷贝），`line` 必须指向内部那行具体出错的操作代码，而不能指向 `for`。
+- `for` 循环定界原则：如果是循环粒度太细导致的问题（如在 Python 中按元素/按字符循环、自回归逐 token 循环产生大量 kernel launch），`line` 指向 `for` 关键字所在行。如果是循环内部的具体某行代码导致了逻辑错误或低效（如错误地将 batch 拆碎、在循环内部重复申请显存或拷贝），`line` 必须指向内部那行具体出错的操作代码，而不能指向 `for`。两者并不互斥：若循环行本身是 C2 问题（细粒度 launch），且循环体内还有独立的 C4/C5 等问题行，则循环行和问题行必须各自单独输出 finding，不得合并。
 - `description` 和 `suggestion` 字段使用中文。
 - 只输出 JSON，不输出任何其他内容。
 
 Repo 调查 SOP（层 2 工具使用顺序，workspace.md 有记录时跳到步骤 4）：
   步骤 1 【定入口】scanner files <repo> --ext py，找 trainer/runner/main 等入口文件
   步骤 2 【看结构】scanner symbols <repo> --file <入口文件>，了解类/函数布局
-  步骤 3 【锁版本】scanner variants <repo>，或 scanner search <repo> <model_key>，确认实际加载的 variant
+  步骤 3 【锁版本】scanner variants <repo>，或 scanner search <repo> <model_key>，确认实际加载的 variant；随后用 scanner search <repo> <ClassName> 确认该 variant 类定义在哪个文件，再进入步骤 4——不允许凭关键字猜测跳过此确认，同一功能可能存在多个同名或相近实现文件（decoy），只有 active variant 对应的文件才是定位目标。
   步骤 4 【读热路径】scanner read <repo> <file>，阅读核心训练/推理循环
   步骤 5 【追调用】scanner callees / callers / trace，顺着热路径向下追到具体实现
   步骤 6 【找调用点】scanner callsites <repo> --call <sym>，确认调用频率和上下文
   步骤 7 【确认行号】scanner read <repo> <file> --around <line> --context 5，核实行号后填入 finding
   每步有明确终止条件：找到应用层代码行即停，不继续往 framework/lib 深挖。
 
-Memory（当前已有内容如下，按需参考）：
+Memory
 
-workspace.md（当前 workspace 专属，含基本配置和文件链路索引）：
-{{WORKSPACE_MEMORY}}
+{{MEMORY_BRIEF}}
 
-experience.md（通用经验，跨 workspace 复用，**按需读取**）：
-路径：{{EXPERIENCE_MEMORY_PATH}}
-如需参考已有经验，使用 `sysight scanner read <path>` 读取该文件；无需阅读时跳过。
-
-**workspace.md 使用规则（必读）**：
-- 有内容（含"## 基本配置"）→ 直接复用，Repo 调查 SOP 步骤 1-3 跳过。
-- 空或只有模板注释 → 首次调查，先执行 SOP 步骤 1-3，将结果按以下模板写入 `workspace_memory`：
-
-  workspace.md 写入模板（首次调查时填写）：
-  ```
-  ## 基本配置
-  active_config=<配置文件路径>
-  <key>=<val>、...（batch_size/steps/model/loader_workers/pin_memory 等关键参数）
-  profile 脚本=<名称>；capture-range=<有/无>；warmup=<有/无>
-  首步 NVTX=<时长>ms，稳态 step=<时长>ms；NCCL/nccl StringIds=<有/无>
-
-  ## 文件链路
-  入口：<run.py / main 文件>
-    -> <配置/launcher>
-    -> <trainer / 核心循环文件>  （含 batch_to_device / forward / backward / optimizer_step / callback 等主要调用）
-    -> <data pipeline 文件>       （loader / collate / transform / dataset）
-    -> <model 文件>               （variant 映射 / 核心 block / op 实现）
-    -> <callback / monitor 文件>  （训练热路径上的回调和监控）
-  （只记录热路径上的关键文件，略去 pure-utils/config/test；格式为缩进树，从入口向下展开）
-  ```
-
-**禁止写任何文件**。调查结束后，**必须**更新 memory（不允许全部返回 null）：
-
-- `workspace_memory`：本次新发现追加到 workspace.md；首次调查时必须包含完整模板（基本配置 + 文件链路）；后续调查只追加增量发现；必填，不允许 null
-- `experience_memory`：本次新增的通用经验（追加到 experience.md），无新经验则 null；写入时**必须遵循 experience.md 开头的写作规范**：用 `## [短标题]` + `- 场景：` + `- 规则：` + `- 示例（可选）：` 格式，每条末尾加 `---`
+- 用 profile 证据 + repo 调查完成定位。
+- 需要查历史记录时，按需使用：
+  - `python3 -m sysight.analyzer.cli memory search <query> --root .sysight/memory`
+  - `python3 -m sysight.analyzer.cli memory read <path> --root .sysight/memory`
+- 需要补充本次新知识时，可使用：
+  - `python3 -m sysight.analyzer.cli memory write <path> --root .sysight/memory --append --stdin`
+- 优先返回 `memory_updates` 做结构化写回；兼容时才使用 `workspace_memory` / `experience_memory`。
+- `workspace` 只写稳定的 repo 结构、入口链路、关键配置。
+- `experience` 只写跨 workspace 可复用经验；格式固定为 `## 标题` + `场景/规则/示例`。
+- 避免重复追加同一条经验；若只是本次 case 的一次性观察，不要写入 memory。
 
 输出格式：
 {
@@ -116,8 +95,15 @@ experience.md（通用经验，跨 workspace 复用，**按需读取**）：
       "suggestion": "改进建议"
     }
   ],
-  "workspace_memory": "本次新发现，追加到 workspace.md（必填，不允许 null）",
-  "experience_memory": "本次新增通用经验（无新经验则 null）"
+  "memory_updates": [
+    {
+      "path": "workspace|experience|相对路径",
+      "append": true,
+      "content": "要写入的内容"
+    }
+  ],
+  "workspace_memory": "兼容字段：本次新增的稳定 workspace 结构信息；无新增则 null",
+  "experience_memory": "兼容字段：本次新增通用经验；无新增则 null"
 }
 
 category（必须使用 C1-C7）：

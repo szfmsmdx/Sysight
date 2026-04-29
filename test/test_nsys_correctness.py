@@ -9,6 +9,7 @@ Tests:
 
 import contextlib
 import io
+import json
 import sqlite3
 import tempfile
 from contextlib import closing
@@ -20,9 +21,11 @@ from sysight.analyzer.nsys import analyze_nsys
 from sysight.analyzer.nsys.extract import extract_trace, inspect_schema
 from sysight.analyzer.nsys.localization import (
     _build_localization_prompt,
-    _run_code_localization,
-    register_cli_investigator,
+    _flush_memory,
+    _memory_dir,
+    _parse_localization_output,
 )
+from sysight.analyzer.memory.store import apply_memory_updates
 from sysight.analyzer.nsys.models import NsysAnalysisRequest, NsysFinding
 
 
@@ -263,12 +266,91 @@ class TestAnalyzePipelineInput(unittest.TestCase):
         )
 
 
-class TestLocalizationModuleSurface(unittest.TestCase):
+class TestMemoryWriteback(unittest.TestCase):
 
-    def test_stage6_api_lives_in_dedicated_module(self):
-        self.assertTrue(callable(register_cli_investigator))
-        self.assertTrue(callable(_build_localization_prompt))
-        self.assertTrue(callable(_run_code_localization))
+    def test_parse_localization_output_supports_memory_updates(self):
+        text = json.dumps(
+            {
+                "summary": "done",
+                "memory_updates": [
+                    {"path": "workspace", "content": "## 基本配置\nactive_config=a", "append": True},
+                    {"path": "experience", "content": "## 新经验\n- 场景：x\n- 规则：y\n---", "append": True},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        summary, questions, anchors, workspace_mem, experience_mem, memory_updates = _parse_localization_output(text)
+
+        self.assertEqual(summary, "done")
+        self.assertEqual(questions, [])
+        self.assertEqual(anchors, [])
+        self.assertIsNone(workspace_mem)
+        self.assertIsNone(experience_mem)
+        self.assertEqual(len(memory_updates), 2)
+        self.assertEqual(memory_updates[0]["path"], "workspace")
+        self.assertEqual(memory_updates[1]["path"], "experience")
+
+    def test_flush_memory_migrates_legacy_files_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_dir = root / "sysight" / "memory"
+            runtime_dir = root / ".sysight" / "memory"
+            legacy_dir.mkdir(parents=True)
+            (legacy_dir / "workspace.md").write_text("legacy workspace", encoding="utf-8")
+            (legacy_dir / "experience.md").write_text("legacy experience", encoding="utf-8")
+            with mock.patch("sysight.analyzer.nsys.localization._memory_dir", return_value=runtime_dir):
+                _flush_memory(None, None, [])
+
+            self.assertEqual((runtime_dir / "workspace.md").read_text(encoding="utf-8"), "legacy workspace")
+            self.assertEqual((runtime_dir / "experience.md").read_text(encoding="utf-8"), "legacy experience")
+
+    def test_flush_memory_dedups_same_experience_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / ".sysight" / "memory"
+            runtime_dir.mkdir(parents=True)
+            update = [{"path": "experience", "content": "## 新经验\n- 场景：x\n- 规则：y\n---", "append": True}]
+            with mock.patch("sysight.analyzer.nsys.localization._memory_dir", return_value=runtime_dir):
+                _flush_memory(None, None, update)
+                _flush_memory(None, None, update)
+
+            text = (runtime_dir / "experience.md").read_text(encoding="utf-8")
+            self.assertEqual(text.count("## 新经验"), 1)
+
+
+class TestLocalizationPrompt(unittest.TestCase):
+
+    def test_memory_root_uses_runtime_sysight_dir(self):
+        self.assertEqual(_memory_dir().name, "memory")
+        self.assertEqual(_memory_dir().parent.name, ".sysight")
+        self.assertNotEqual(_memory_dir().parent.name, "sysight")
+
+    def test_prompt_does_not_inline_memory_files_or_paths(self):
+        req = NsysAnalysisRequest(
+            profile_path="trace.sqlite",
+            sqlite_path="trace.sqlite",
+            repo_root="/tmp/repo",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp)
+            workspace_path = memory_dir / "workspace.md"
+            experience_path = memory_dir / "experience.md"
+            workspace_path.write_text("WORKSPACE_SENTINEL", encoding="utf-8")
+            experience_path.write_text("EXPERIENCE_SENTINEL", encoding="utf-8")
+            with mock.patch("sysight.analyzer.nsys.localization._memory_dir", return_value=memory_dir):
+                prompt = _build_localization_prompt(
+                    req,
+                    summary="summary",
+                    findings=[],
+                    windows=[],
+                    sqlite_path="trace.sqlite",
+                )
+
+        self.assertNotIn("WORKSPACE_SENTINEL", prompt)
+        self.assertNotIn("EXPERIENCE_SENTINEL", prompt)
+        self.assertNotIn(str(workspace_path), prompt)
+        self.assertNotIn(str(experience_path), prompt)
+        self.assertNotIn("workspace.md（当前 workspace 专属", prompt)
+        self.assertNotIn("experience.md（通用经验", prompt)
 
     def test_prompt_limits_questions_and_context_volume(self):
         from sysight.analyzer.nsys.models import EvidenceWindow
@@ -318,14 +400,45 @@ class TestLocalizationModuleSurface(unittest.TestCase):
         self.assertIn("输出格式：", prompt)
         self.assertIn("/tmp/repo", prompt)
         self.assertIn("trace.sqlite", prompt)
-        pass
-        pass
-        pass
-        pass
+        self.assertIn("python3 -m sysight.analyzer.cli memory search", prompt)
+        self.assertIn("python3 -m sysight.analyzer.cli memory read", prompt)
+        self.assertIn("python3 -m sysight.analyzer.cli memory write", prompt)
         # Old prompt artifacts should NOT be present
         self.assertNotIn("Q1. problem_id=", prompt)
         self.assertNotIn("待回答问题：", prompt)
         self.assertNotIn("Analyzer harness（必须先阅读并遵守）：", prompt)
+
+    def test_prompt_includes_memory_brief_and_namespace(self):
+        req = NsysAnalysisRequest(
+            profile_path="trace.sqlite",
+            sqlite_path="trace.sqlite",
+            repo_root="/tmp/repo",
+            memory_namespace="bench/case_prompt",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_dir = Path(tmp) / ".sysight" / "memory"
+            apply_memory_updates(
+                str(memory_dir),
+                [{"path": "experience", "title": "Loop", "content": "## Loop\n- 规则：批处理\n---", "append": True, "category": "C2"}],
+                repo_root="/tmp/repo",
+                namespace="bench/case_prompt",
+                raw_run={"run_id": "run-prompt", "manifest_path": "raw/runs/run-prompt/manifest.json"},
+            )
+            with mock.patch("sysight.analyzer.nsys.localization._memory_dir", return_value=memory_dir):
+                prompt = _build_localization_prompt(
+                    req,
+                    summary="summary",
+                    findings=[],
+                    windows=[],
+                    sqlite_path="trace.sqlite",
+                )
+
+        self.assertIn("bench/case_prompt", prompt)
+        self.assertIn("raw/runs/run-prompt/manifest.json", prompt)
+        # MEMORY_BRIEF is replaced with actual brief content (namespace, paths, etc.)
+        # so we check for characteristic brief content, not the literal placeholder
+        self.assertIn("namespace: bench/case_prompt", prompt)
+        self.assertIn("查询工具", prompt)
 
     def test_prompt_includes_precomputed_context(self):
         from sysight.analyzer.nsys.models import (
@@ -400,8 +513,6 @@ class TestLocalizationModuleSurface(unittest.TestCase):
         # New prompt format: TASK.txt template, raw stats come from profile report
         self.assertIn("python3 -m sysight.analyzer.cli nsys-sql", prompt)
         self.assertIn("输出格式：", prompt)
-        pass
-        pass
         # Old pre-computed stats block should NOT be present
         self.assertNotIn("=== 预计算统计", prompt)
 

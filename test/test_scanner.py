@@ -5,6 +5,10 @@ No external repos required; tests are deterministic and fast.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
+import json
 import textwrap
 import unittest
 from pathlib import Path
@@ -299,6 +303,28 @@ class TestSymbols(unittest.TestCase):
 
 
 # ── variants tests ────────────────────────────────────────────────────────────
+
+class TestScannerCliModule(unittest.TestCase):
+    def test_module_can_register_and_dispatch_files_command(self):
+        from sysight.analyzer.scanner import scanner_cli
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, "src/a.py", "x = 1\n")
+
+            parser = argparse.ArgumentParser()
+            sub = parser.add_subparsers(dest="subcmd")
+            scanner_cli.add_scanner_subparser(sub)
+            args = parser.parse_args(["scanner", "files", str(root), "--json"])
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                scanner_cli.dispatch_scanner(args)
+
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["files"][0]["path"], "src/a.py")
+
 
 class TestVariants(unittest.TestCase):
     def setUp(self):

@@ -355,3 +355,4 @@ class NsysAnalysisRequest:
     emit_progress_info: bool = False
     include_deep_sql: bool = True
     include_evidence_windows: bool = True
+    memory_namespace: str | None = None      # e.g. "bench/case_1" for benchmark isolation

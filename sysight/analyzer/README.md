@@ -1,6 +1,7 @@
 # sysight · analyzer
 
-Profile-side analysis pipeline and agent tooling for GPU performance diagnosis.  
+Profile-side analysis pipeline and localization tooling for GPU performance diagnosis.  
+Current scope stays within `analyzer v0.3`; downstream optimization/execution loops are documented at the repo root, not implemented here.  
 No external dependencies — stdlib only (`sqlite3`, `pathlib`, `ast`).
 
 ---
@@ -12,7 +13,7 @@ nsys profile (.sqlite)
   → extract trace           # schema probe, event extraction, interval math
   → classify bottlenecks    # findings, SQL deep analysis
   → evidence windows        # callstack summaries, coarse location
-  → Codex localization      # agent-driven code localization
+  → code localization       # CLI-backed source localization + memory update
 ```
 
 ```
@@ -32,12 +33,17 @@ analyzer/
     ├── models.py           # all dataclasses (single source of truth)
     ├── extract.py          # trace extraction + interval math
     ├── classify.py         # bottleneck classification + findings
-    ├── classify_sql.py     # SQL deep analysis (kernels/sync/nccl/nvtx/health)
+    ├── classify_sql.py     # deep SQL facade + root-cause/profile health
+    ├── sql_compute.py      # kernel / idle-gap SQL analyzers
+    ├── sql_memory.py       # memcpy bandwidth SQL analyzers
+    ├── sql_comm.py         # NCCL SQL analyzers
+    ├── sql_sync.py         # synchronization SQL analyzers
+    ├── sql_shared.py       # shared SQL helpers
     ├── stacks.py           # callstack summarization + coarse location
     ├── text.py             # text formatting utilities
     ├── windows.py          # evidence window extraction
     ├── render.py           # terminal rendering
-    ├── localization.py     # Agent-driven code localization (Codex) + memory flush
+    ├── localization.py     # CLI-backed code localization + memory flush
     └── sql_cli.py          # nsys-sql subcommand implementations
 ```
 
@@ -89,14 +95,14 @@ sysight scanner variants  <repo>                          # variant mapping
 
 ---
 
-## Agent-driven Code Localization
+## Code Localization And Memory
 
-By default, the analyzer launches a Codex subprocess to perform code-level localization (unless `--no-codex` is passed):
+By default, the analyzer launches its configured CLI localization backend (current default: `codex`) unless `--no-codex` is passed:
 
 - Pre-injects profile data (nvtx / sync / memcpy / kernels / gaps / kernel-launch) into the prompt
-- Codex uses `sysight scanner` tools to locate exact file/function/line
-- Results are parsed from JSON output and written back to the analysis result
-- Memory is persisted to `sysight/memory/` for cross-run accumulation
+- Uses `sysight scanner` tools to resolve exact file/function/line from profile evidence
+- Parses JSON output back into the analyzer result
+- Persists workspace and experience memory under `.sysight/memory/` via `sysight/analyzer/memory/`
 
 Artifact directory: `.sysight/codex_runs/run-<id>/` (prompt, stdout, stderr, last_message).
 
@@ -121,5 +127,5 @@ PYTHONPATH=src python3 -m unittest discover -s test -v
 | Evidence windows + callstack summarization | ✅ |
 | nsys-sql CLI | ✅ |
 | scanner CLI (files / search / read / callsites / symbols / callers / callees / trace / variants) | ✅ |
-| Codex code localization | ✅ |
+| CLI-backed code localization | ✅ |
 | Memory accumulation (workspace + experience) | ✅ |

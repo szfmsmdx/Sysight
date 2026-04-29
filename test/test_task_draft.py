@@ -8,12 +8,11 @@ Covers:
 import sqlite3
 import tempfile
 from contextlib import closing
-import textwrap
 import unittest
 from pathlib import Path
 
 from sysight.analyzer.nsys import analyze_nsys
-from sysight.analyzer.nsys.models import NsysAnalysisRequest, NsysFinding
+from sysight.analyzer.nsys.models import NsysAnalysisRequest
 
 
 # ── SQLite builder helpers ────────────────────────────────────────────────────
@@ -70,12 +69,6 @@ def _make_minimal_sqlite(path: str) -> None:
         conn.commit()
 
 
-def _write(root: Path, rel: str, src: str) -> None:
-    p = root / rel
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(textwrap.dedent(src).strip() + "\n", encoding="utf-8")
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. NsysDiag.findings from analyze_nsys
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -115,8 +108,8 @@ class TestNsysFindings(unittest.TestCase):
         memcpy_findings = [f for f in diag.findings if "memcpy" in f.category]
         self.assertEqual(len(memcpy_findings), 0)
 
-    def test_nsys_diag_has_no_task_drafts(self):
-        """NsysDiag should not have task_drafts (removed in clean nsys refactor)."""
+    def test_nsys_diag_omits_legacy_fields(self):
+        """NsysDiag should omit legacy repo/task fields removed by the refactor."""
         with tempfile.TemporaryDirectory() as tmp:
             sq = str(Path(tmp) / "trace.sqlite")
             _make_minimal_sqlite(sq)
@@ -127,23 +120,8 @@ class TestNsysFindings(unittest.TestCase):
             )
             diag = analyze_nsys(req)
 
-        self.assertFalse(hasattr(diag, "task_drafts"),
-                         "NsysDiag should not have task_drafts field")
-
-    def test_nsys_diag_has_no_repo_context_enabled(self):
-        """NsysDiag should not have repo_context_enabled (removed)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            sq = str(Path(tmp) / "trace.sqlite")
-            _make_minimal_sqlite(sq)
-
-            req = NsysAnalysisRequest(
-                profile_path=sq,
-                sqlite_path=sq,
-            )
-            diag = analyze_nsys(req)
-
-        self.assertFalse(hasattr(diag, "repo_context_enabled"),
-                         "NsysDiag should not have repo_context_enabled field")
+        self.assertFalse(hasattr(diag, "task_drafts"))
+        self.assertFalse(hasattr(diag, "repo_context_enabled"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -1,110 +1,126 @@
 # Sysight
 
-Sysight is an end-to-end AI performance tuning Agent platform driven by Nsight Systems (nsys). By deeply extracting features from `.nsys-rep` and `.sqlite` performance trace files and combining them with LLM inference, the system automates the diagnosis of compute and communication bottlenecks, the generation of expert-level optimization strategies, and source-level (AST) precise cross-file localization. Concurrently, leveraging the Agent's autonomous refactoring and end-to-end Benchmark loop validation mechanisms, Sysight achieves a closed loop from "issue discovery" to "code fix validation". Currently, platform v0.1 has been deployed internally, aiming to drive autonomous performance maintenance of codebases via AI, replacing traditional high-barrier manual tuning workflows, and fully unleashing the productivity of AI Infra teams.
+Sysight is an evidence-driven agent loop for Nsight Systems analysis. The repository currently focuses on `analyzer v0.5`: it turns `.sqlite` profile data and target-repo source code into structured bottleneck findings, source-level localization, and benchmarkable outputs for downstream `optimizer` and `executor` stages.
 
 ---
 
 ## Architecture
 
-Sysight operates on a closed-loop Agent architecture consisting of three peer modules:
+```mermaid
+flowchart LR
+    Trace["Nsight Systems trace<br/>.sqlite"] --> Extract["analyzer<br/>extract + classify"]
+    Repo["target repo"] --> Locate["agent localization<br/>scanner + nsys-sql"]
+    Extract --> Locate
+    Locate --> Findings["structured findings<br/>JSON + readable report"]
+    Findings --> Bench["benchmark loop<br/>benchmark.py / nsys-bench"]
+    Bench --> Memory["memory<br/>workspace.md + experience.md"]
+    Memory -. informs next run .-> Locate
 
-```text
- ┌─────────────────────────────────────────────────────────────────────────┐
- │                      Sysight Autonomous Tuning Loop                     │
- │                                                                         │
- │   ┌───────────────┐                             ┌───────────────┐       │
- │   │               │       1. Profiling          │               │       │
- │   │               ├────────────────────────────▶│  1. Analyzer  │       │
- │   │               │   (nsys-rep / sqlite)       │  (AI Agent)   │       │
- │   │               │                             │               │       │
- │   │ Target Repo   │◀────────────────────────────┤ • Extract     │       │
- │   │  (Workspace)  │       Code Localization     │ • Classify    │       │
- │   │               │       (AST / File Reads)    │ • Locate      │       │
- │   │               │                             └───────┬───────┘       │
- │   │               │                                     │               │
- │   │               │                             Structured Findings     │
- │   │               │                                  (JSON)             │
- │   │               │                                     │               │
- │   │               │                             ┌───────▼───────┐       │
- │   │               │       3. Execution          │               │       │
- │   │               │◀────────────────────────────┤  2. Optimizer │       │
- │   │               │   (Safe Patch & Verify)     │  (AI Agent)   │       │
- │   └───────▲───────┘                             │               │       │
- │           │                                     │ • Propose Fix │       │
- │           │                                     │ • Gen Patch   │       │
- │           │                                     └───────────────┘       │
- │           │                                                             │
- │           └─────────────────────────────────────────────────────────────┘
- │                         4. Benchmark Verification                       │
- └─────────────────────────────────────────────────────────────────────────┘
+planned path:
+    findings --> optimizer --> executor --> benchmark
 ```
 
-- **analyzer**: Parses nsys profiles deterministically, classifies bottlenecks, and dispatches a Codex AI agent to perform evidence-driven, top-down code localization to find the exact file, function, and line.
-- **optimizer**: Consumes analyzer JSON findings and proposes code-level fixes via intelligent AST-aware patching. *(planned)*
-- **executor**: Applies optimizer proposals to the repo, validating the fix through test runs or subsequent profiling. *(planned)*
-
-*Current development scope is focused on the **analyzer**.*
+- `analyzer` is implemented today.
+- `optimizer` and `executor` remain planned peer modules.
+- The loop is deliberate: benchmark feedback and accumulated memory feed the next investigation pass.
 
 ---
 
-## Design Philosophy
+## Current Scope
 
-Traditional GPU profiling tools (like Nsight Systems or nsys-ai) require heavy manual interpretation of profile data to map hardware bottlenecks back to source code. Sysight automates this loop:
+- deterministic profile analysis over Nsight Systems `.sqlite` traces
+- agent-driven source localization with `scanner` and `nsys-sql`
+- structured JSON and terminal report output for downstream consumers
+- benchmark execution against `nsys-bench`
+- persistent workspace and cross-workspace memory
 
-1. **Deterministic Extraction**: The analyzer pipeline extracts structured evidence from nsys SQLite profiles (bottleneck classification, kernel statistics, sync events, NVTX regions) without guessing.
-2. **Evidence-Driven Agent Trace**: A Codex agent uses `scanner` (AST inspection) and `nsys-sql` tools to locate the exact source line causing each bottleneck. The agent avoids blind global scanning by following strict top-down tracing SOPs guided by pre-injected profile data.
-3. **Continuous Memory**: The agent accumulates per-workspace (`workspace.md`) and cross-workspace (`experience.md`) experiences across runs, significantly reducing redundant investigation over time.
-
-**Note**: The analyzer is intentionally **not** a black-box LLM call. Profile-side evidence is extracted exactly; the AI agent handles only the complex reasoning required for final code localization.
+The repository does **not** yet ship automated patch generation or patch execution in the main loop.
 
 ---
 
-## Core Capabilities (Analyzer)
+## Evidence-Driven Analyzer Loop
 
-- **SQL Extraction**: Parses nsys `.sqlite` profiles to extract kernels, sync events, memcpy, NVTX regions, and GPU idle gaps.
-- **C1-C7 Bottleneck Classification**: Identifies and classifies issues across C1 (Host Scheduling), C2 (Kernel Launch), C3 (Sync), C4 (Memory Copy), C5 (Compute), C6 (Communication), and C7 (Framework Pipeline).
-- **Deep Profiling**: Runs SQL deep analysis for top kernels, NCCL breakdown, compute/comm overlap, and profile health.
-- **Coarse Callstack Resolution**: Summarizes CPU callstacks and identifies initial hot paths.
-- **Agent Code Localization**: Locates the exact file, function, and line number via a Codex subprocess and AST-aware `scanner` tools.
-- **Memory Persistence**: Accumulates investigation logic to avoid repeated blind traces.
-- **JSON Serialization**: Exposes fully structured JSON outputs designed for the downstream Optimizer agent.
+1. **Extract profile evidence** — parse kernels, memcpy, sync, NVTX, GPU idle gaps, and SQL-derived aggregates.
+2. **Classify bottlenecks** — normalize findings into `C1`-`C7` categories.
+3. **Localize code** — combine profile evidence with repo navigation tools to resolve file, function, and line.
+4. **Persist memory** — append reusable workspace and experience notes.
+5. **Benchmark the output** — score analyzer findings with `benchmark.py` against `nsys-bench` ground truth.
+
+This keeps the LLM focused on code localization instead of asking it to infer raw profile semantics from scratch.
+
+---
+
+## Repository Layout
+
+```text
+sysight/analyzer/         analyzer pipeline, CLI, nsys-sql helpers, scanner tools
+sysight/analyzer/memory/  memory component (workspace + experience store)
+benchmark.py              run nsys-bench and score analyzer outputs
+.sysight/bench-runs/      benchmark logs, per-run summaries, SOTA tracking
+.sysight/memory/          runtime memory files (workspace.md, experience.md)
+nsys-bench/               benchmark cases and ground truth
+test/                     unit tests for analyzer, renderer, SQL CLI, and scanner
+```
+
+For analyzer internals and the full CLI surface, see `sysight/analyzer/README.md`.
 
 ---
 
 ## Quick Start
 
-Install:
+### Install
 
 ```bash
 pip install -e .
 ```
 
-Run profile analysis:
+### Analyze a profile
 
 ```bash
-# Profile statistics only (Fast mode, no Agent)
+# Statistics only
 sysight nsys /path/to/trace.sqlite --no-codex
 
-# Full analysis with Codex Agent code localization
+# Full analysis with source localization
 sysight nsys /path/to/trace.sqlite --repo-root /path/to/repo
 
-# Output machine-readable structured JSON
-sysight nsys /path/to/trace.sqlite --json
+# Machine-readable output
+sysight nsys /path/to/trace.sqlite --repo-root /path/to/repo --json
 ```
 
-Run directly from the repository root without installing:
+### Repo-local execution
 
 ```bash
-PYTHONPATH=src python3 -m sysight.analyzer.cli --help
+PYTHONPATH=src python3 -m sysight.analyzer.cli nsys /path/to/trace.sqlite --no-codex
+PYTHONPATH=src python3 -m sysight.analyzer.cli nsys /path/to/trace.sqlite --repo-root /path/to/repo
+PYTHONPATH=src python3 -m sysight.analyzer.cli nsys /path/to/trace.sqlite --json
 ```
 
-For full CLI reference and internal mechanics, see [`sysight/analyzer/README.md`](sysight/analyzer/README.md).
+### Useful low-level tools
+
+```bash
+# Inspect profile-side evidence
+sysight nsys-sql kernels /path/to/trace.sqlite
+sysight nsys-sql overlap /path/to/trace.sqlite
+sysight nsys-sql stream-concurrency /path/to/trace.sqlite
+
+# Inspect repo-side evidence
+sysight scanner search /path/to/repo dispatch_experts
+sysight scanner trace /path/to/repo SomeSymbol
+```
 
 ---
 
-## Testing & Validation
+## Benchmark Evidence
 
-All logic is rigorously tested, specifically the deterministic extraction and parsing steps:
+- `benchmark.py` runs the analyzer on `nsys-bench` and scores outputs against ground truth.
+- Per-run artifacts live under `.sysight/bench-runs/<timestamp>/`.
+- The current best recorded scores are tracked in `.sysight/bench-runs/sota.md`, and each score is backed by the corresponding `summary.txt` file in that run directory.
+
+This keeps README claims tied to recorded benchmark artifacts instead of informal notes.
+
+---
+
+## Testing
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s test -v
@@ -112,15 +128,17 @@ PYTHONPATH=src python3 -m unittest discover -s test -v
 
 ---
 
-## Related Projects
-
-- **[nsys-bench](https://github.com/szfmsmdx/nsys-bench)** — A benchmark suite for evaluating GPU performance diagnosis agents. This is used to test and score the accuracy of Sysight analyzer's findings against ground-truth files and line numbers.
-- **[nsys-ai](https://github.com/siboehm/nsys-ai)** — AI-assisted Nsight Systems analysis toolkit, which provided initial inspiration for the agent-centric design and SQL-based profile tooling.
-
 ## Roadmap
 
-- [ ] **optimizer**: Consume analyzer JSON findings and propose AST-aware code patches.
-- [ ] **executor**: Safely apply optimizer proposals, run validations, and revert on failure.
-- [ ] Multi-profile comparison (e.g., rank0 vs rank1 analysis, run-to-run regression testing).
-- [ ] Broader profile format support (direct `.nsys-rep` parsing, Perfetto).
-- [ ] Richer C++ callstack resolution via DWARF and native symbolizer integrations.
+- `optimizer`: turn analyzer findings into patch proposals
+- `executor`: apply and validate proposed changes safely
+- multi-profile comparison and regression analysis
+- broader trace ingestion and export workflows
+- better C++ and native callstack readability
+
+---
+
+## Related Projects
+
+- [nsys-bench](https://github.com/szfmsmdx/nsys-bench) — benchmark suite used to score Sysight analyzer outputs
+- [nsys-ai](https://github.com/siboehm/nsys-ai) — earlier inspiration for agent-oriented Nsight analysis

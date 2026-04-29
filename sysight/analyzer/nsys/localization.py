@@ -14,6 +14,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from ..memory.store import build_memory_brief, resolve_memory_path
 from .sql_cli import run_sql_nvtx, run_sql_sync, run_sql_memcpy, run_sql_kernels, run_sql_gaps, run_sql_kernel_launch
 
 from .models import (
@@ -80,8 +81,8 @@ def _analyzer_dir() -> Path:
 
 
 def _memory_dir() -> Path:
-    # memory/ lives at sysight/memory/, one level above sysight/analyzer/
-    return Path(__file__).resolve().parents[2] / "memory"
+    # Runtime memory lives under workspace-local .sysight/, not under analyzer assets.
+    return Path(__file__).resolve().parents[3] / ".sysight" / "memory"
 
 
 def _task_path() -> Path:
@@ -119,14 +120,21 @@ def _build_localization_prompt(
     """
     task_text = _read_harness_file(_task_path())
 
+    # Build memory brief for prompt injection
+    memory_brief = build_memory_brief(
+        str(_memory_dir()),
+        repo_root=request.repo_root,
+        namespace=getattr(request, "memory_namespace", None),
+    )
+
     # Fill in template placeholders
     prompt = task_text.replace("{{PROFILE_REPORT}}", profile_report_text)
     prompt = prompt.replace("{{SQLITE_PATH}}", sqlite_path)
     prompt = prompt.replace("{{REPO_ROOT}}", request.repo_root or ".")
     prompt = prompt.replace("{{PRE_INJECTED_SQL}}", _build_pre_injected_sql(sqlite_path))
-    memory_dir = _memory_dir()
-    prompt = prompt.replace("{{WORKSPACE_MEMORY}}", _read_harness_file(memory_dir / "workspace.md") or "(空)")
-    prompt = prompt.replace("{{EXPERIENCE_MEMORY_PATH}}", str(memory_dir / "experience.md"))
+    prompt = prompt.replace("{{WORKSPACE_MEMORY}}", "")
+    prompt = prompt.replace("{{EXPERIENCE_MEMORY_PATH}}", str(_memory_dir()))
+    prompt = prompt.replace("{{MEMORY_BRIEF}}", memory_brief)
 
     return prompt
 
@@ -395,20 +403,40 @@ def _parse_anchors(data: dict[str, object]) -> list[LocalizationAnchor]:
     return anchors
 
 
-def _parse_localization_output(text: str) -> tuple[str, list[LocalizationQuestion], list[LocalizationAnchor], str | None, str | None]:
-    """Returns (summary, questions, anchors, workspace_mem, experience_mem).
+def _parse_memory_updates(data: dict[str, object]) -> list[dict[str, object]]:
+    updates: list[dict[str, object]] = []
+    raw_updates = data.get("memory_updates")
+    if not isinstance(raw_updates, list):
+        return updates
+    for item in raw_updates:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        content = item.get("content")
+        if not path or not isinstance(content, str):
+            continue
+        normalized = content.strip()
+        if not normalized:
+            continue
+        updates.append({
+            "path": path,
+            "content": normalized,
+            "append": bool(item.get("append", True)),
+        })
+    return updates
 
-    workspace.md is always append-only.
-    """
+
+def _parse_localization_output(text: str) -> tuple[str, list[LocalizationQuestion], list[LocalizationAnchor], str | None, str | None, list[dict[str, object]]]:
+    """Returns (summary, questions, anchors, workspace_mem, experience_mem, memory_updates)."""
     payload = _extract_json_payload(text)
     if not payload:
-        return "", [], [], None, None
+        return "", [], [], None, None, []
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
-        return "", [], [], None, None
+        return "", [], [], None, None, []
     if not isinstance(data, dict):
-        return "", [], [], None, None
+        return "", [], [], None, None, []
 
     summary = str(data.get("summary") or "").strip()
     questions = _parse_questions(data)
@@ -419,29 +447,90 @@ def _parse_localization_output(text: str) -> tuple[str, list[LocalizationQuestio
         workspace_memory = workspace_memory.strip() or None
     if isinstance(experience_memory, str):
         experience_memory = experience_memory.strip() or None
-    return summary, questions, anchors, workspace_memory, experience_memory
+    memory_updates = _parse_memory_updates(data)
+    return summary, questions, anchors, workspace_memory, experience_memory, memory_updates
 
 
-def _flush_memory(workspace_mem: str | None, experience_mem: str | None) -> None:
-    """Persist codex-provided memory updates.
+def _legacy_memory_dir(memory_dir: Path | None = None) -> Path:
+    runtime_dir = memory_dir or _memory_dir()
+    return runtime_dir.parent.parent / "sysight" / "memory"
 
-    workspace.md  — always append-only
-    experience.md — always append-only
-    """
-    memory_dir = _memory_dir()
+
+def _migrate_legacy_memory(memory_dir: Path) -> None:
+    legacy_dir = _legacy_memory_dir(memory_dir)
+    if not legacy_dir.exists():
+        return
     memory_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("workspace.md", "experience.md"):
+        legacy_path = legacy_dir / name
+        if not legacy_path.is_file():
+            continue
+        try:
+            legacy_text = legacy_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not legacy_text:
+            continue
+        target_path = memory_dir / name
+        dedup = name == "experience.md"
+        _append_memory(target_path, legacy_text, dedup=dedup)
+
+
+def _flush_memory(
+    workspace_mem: str | None,
+    experience_mem: str | None,
+    memory_updates: list[dict[str, object]] | None = None,
+) -> None:
+    """Persist codex-provided memory updates under runtime `.sysight/memory`."""
+    memory_dir = _memory_dir()
+    _migrate_legacy_memory(memory_dir)
+    memory_dir.mkdir(parents=True, exist_ok=True)
+
+    updates: list[dict[str, object]] = []
     if workspace_mem:
-        _append_memory(memory_dir / "workspace.md", workspace_mem)
+        updates.append({"path": "workspace", "content": workspace_mem, "append": True})
     if experience_mem:
-        _append_memory(memory_dir / "experience.md", experience_mem)
+        updates.append({"path": "experience", "content": experience_mem, "append": True})
+    if memory_updates:
+        updates.extend(memory_updates)
+
+    for update in updates:
+        _write_memory_update(memory_dir, update)
 
 
-def _append_memory(path: Path, content: str) -> None:
-    """Append-only — used for workspace.md and experience.md."""
+def _append_memory(path: Path, content: str, *, dedup: bool = False) -> None:
+    """Append a logical memory block with separators and optional exact dedup."""
+    block = content.strip()
+    if not block:
+        return
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        if dedup and block in existing:
+            return
         separator = "\n\n---\n\n" if existing.strip() else ""
-        path.write_text(existing + separator + content, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(existing + separator + block, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _write_memory_update(memory_dir: Path, update: dict[str, object]) -> None:
+    path = str(update.get("path") or "").strip()
+    content = str(update.get("content") or "").strip()
+    append = bool(update.get("append", True))
+    if not path or not content:
+        return
+
+    _, rel_path, target_path = resolve_memory_path(memory_dir, path)
+    target_name = Path(rel_path).name
+    if append and target_name in {"workspace.md", "experience.md"}:
+        _append_memory(target_path, content, dedup=target_name == "experience.md")
+        return
+
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = target_path.read_text(encoding="utf-8") if append and target_path.exists() else ""
+        target_path.write_text(existing + content if append else content, encoding="utf-8")
     except OSError:
         pass
 
@@ -506,8 +595,8 @@ def _run_codex_cli_sync(
         )
 
     output = _read_localization_output(output_path)
-    summary, questions, anchors, workspace_mem, experience_mem = _parse_localization_output(output)
-    _flush_memory(workspace_mem, experience_mem)
+    summary, questions, anchors, workspace_mem, experience_mem, memory_updates = _parse_localization_output(output)
+    _flush_memory(workspace_mem, experience_mem, memory_updates)
     elapsed = time.monotonic() - started
     tokens_used = _parse_tokens_from_stderr(stderr_path)
     prompt_tokens_est = _estimate_prompt_tokens(prompt)

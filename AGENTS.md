@@ -15,23 +15,7 @@ The analyzer must quickly:
 - Quickly pinpoint code files and functions based on the issue area
 - Trace the main file/function call chain within the codebase
 - Return structured output to downstream modules
-
-## Common Commands
-
-Run commands from the project root:
-
-```bash
-cd /Users/szf/Desktop/Sysight
-
-PYTHONPATH=src python3 -m unittest discover -s test -v
-
-PYTHONPATH=src python3 analyzer.py /path/to/repo
-PYTHONPATH=src python3 analyzer.py /path/to/repo --max-entries 1 --max-depth 3 --max-steps 30
-PYTHONPATH=src python3 analyzer.py /path/to/repo --verbose
-PYTHONPATH=src python3 analyzer.py /path/to/repo --json
-
-PYTHONPATH=src python3 -m sysight.analyzer.core /path/to/repo
-```
+- **Evidence-Driven Top-Down Trace**: Rely on profile evidence instead of exhaustive blind scans to avoid excessive API token costs.
 
 ## Project Constraints
 
@@ -43,6 +27,7 @@ PYTHONPATH=src python3 -m sysight.analyzer.core /path/to/repo
 - Keep `analyzer`, `optimizer`, and `executor` fully decoupled.
 - `analyzer` must not optimize or execute.
 - Every new feature should be easy to plug in or remove.
+- **Maintain Universal SOPs**: When maintaining `SKILL.txt` or system prompts, preserve generalized "Evidence-Driven" top-down flows. NEVER pile up overfitting rules or exact line-number heuristics to game benchmark scores.
 
 ## Code Style
 
@@ -63,9 +48,6 @@ PYTHONPATH=src python3 -m sysight.analyzer.core /path/to/repo
 - Keep tests deterministic and fast.
 - Document important static-analysis limitations in tests when relevant.
 - Callstack readability is a release criterion for `nsys` work.
-- If a change touches Stage 4 / Stage 6 / Stage 7, CPU hotspots, or callstack cleanup/rendering, you must run at least one real or focused rendered report check and verify the output is readable.
-- Bad cases such as `PyEval_RestoreThread <- PyGILState_Ensure`, `launch <- cfunction_call <- _PyEval_EvalFrameDefault`, or `pthread_cond_timedwait <- ...` must not be shipped as the final coarse location by themselves.
-- If the rendered output still only shows runtime wrappers / syscall leafs and no readable coarse location, the task is not done; continue improving or explicitly surface that Stage 6 / better trace signals are required.
 - Before declaring an analyzer change done, run:
 
 ```bash
@@ -85,7 +67,6 @@ PYTHONPATH=src python3 -m unittest discover -s test -v
 ## Worklog
 
 - Keep `worklog.md` short and high signal.
-- Do not add a new version section like `# v0.1` or `# v0.2` unless the user explicitly says that version is completed.
 - Before explicit version completion, keep notes under a temporary section such as `## Current`.
 - When a version is explicitly declared complete by the user, record the version header, date, short summary, and key feature / module / file changes.
 - Do not turn `worklog.md` into a full changelog.

@@ -18,19 +18,20 @@ Commands:
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import sqlite3
-from contextlib import closing
+import sys
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .extract import inspect_schema, find_gaps, union_ns, intersect_total
+from .sql_shared import _COPY_KIND_NAMES, _NCCL_KEYWORDS, _find_table, _get_cols, _kernel_name_expr
 
 logger = logging.getLogger(__name__)
-
-_NCCL_KEYWORDS = ("nccl", "allreduce", "allgather", "reducescatter", "broadcast", "sendrecv", "reduce")
-_COPY_KIND_NAMES = {0: "Unknown", 1: "H2D", 2: "D2H", 4: "H2H", 8: "D2D", 10: "P2P"}
 
 
 @dataclass
@@ -148,22 +149,129 @@ class SqlNcclResult:
     total_ops: int
 
 
-def _find_table(all_tables: set[str], prefix: str) -> str | None:
-    """Find table by exact name or prefix."""
-    if prefix in all_tables:
-        return prefix
-    for t in sorted(all_tables):
-        if t.startswith(prefix):
-            return t
-    return None
+def _load_sqlite_tables(conn: sqlite3.Connection) -> tuple[set[str], bool]:
+    all_tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    return all_tables, "StringIds" in all_tables
 
 
-def _get_cols(conn: sqlite3.Connection, tbl: str) -> list[str]:
-    """Get column names for a table."""
+@contextmanager
+def _open_sqlite_profile(sqlite_path: str) -> Iterator[tuple[sqlite3.Connection, set[str], bool]]:
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        all_tables, has_strings = _load_sqlite_tables(conn)
+        yield conn, all_tables, has_strings
+
+
+def _has_columns(conn: sqlite3.Connection, table_name: str, *column_names: str) -> bool:
+    cols = set(_get_cols(conn, table_name))
+    return all(column_name in cols for column_name in column_names)
+
+
+def _table_time_bounds(
+    conn: sqlite3.Connection,
+    table_name: str,
+    *,
+    include_total_ns: bool = False,
+) -> tuple[int, int, int]:
+    select_total = ", SUM([end] - start)" if include_total_ns else ""
     try:
-        return [row[1] for row in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]
+        row = conn.execute(
+            f"SELECT MIN(start), MAX([end]){select_total} FROM {table_name}"
+        ).fetchone()
     except sqlite3.Error:
-        return []
+        return 0, 0, 0
+    if not row or row[0] is None or row[1] is None:
+        return 0, 0, 0
+    total_ns = int(row[2] or 0) if include_total_ns else 0
+    return int(row[0]), int(row[1]), total_ns
+
+
+def _stream_span_stats(
+    conn: sqlite3.Connection,
+    kernel_tbl: str,
+    stream_ids: set[int],
+) -> tuple[int, int, int, int]:
+    if not stream_ids:
+        return 0, 0, 0, 0
+    placeholders = ",".join("?" * len(stream_ids))
+    try:
+        row = conn.execute(
+            f"""
+            SELECT MIN(start), MAX([end]),
+                   SUM([end] - start), COUNT(*)
+            FROM {kernel_tbl}
+            WHERE streamId IN ({placeholders})
+            """,
+            list(stream_ids),
+        ).fetchone()
+    except sqlite3.Error:
+        return 0, 0, 0, 0
+    if not row or row[0] is None or row[1] is None:
+        return 0, 0, 0, 0
+    return int(row[0]), int(row[1]), int(row[2] or 0), int(row[3] or 0)
+
+
+def _kernel_name_parts(
+    conn: sqlite3.Connection,
+    kernel_tbl: str,
+    has_strings: bool,
+    alias: str = "k",
+) -> tuple[str, str]:
+    return _kernel_name_expr(conn, kernel_tbl, has_strings, alias=alias)
+
+
+def _kernel_name_lookup_query(
+    conn: sqlite3.Connection,
+    kernel_tbl: str,
+    has_strings: bool,
+    *,
+    where_clause: str,
+    order_clause: str,
+) -> str:
+    name_expr, join_clause = _kernel_name_parts(conn, kernel_tbl, has_strings, alias="k")
+    return f"""
+        SELECT {name_expr} AS kernel_name
+        FROM {kernel_tbl} k
+        {join_clause}
+        WHERE {where_clause}
+        {order_clause}
+        LIMIT 1
+    """
+
+
+def _kernel_rows_with_names_query(conn: sqlite3.Connection, kernel_tbl: str, has_strings: bool) -> str:
+    name_expr, join_clause = _kernel_name_parts(conn, kernel_tbl, has_strings, alias="k")
+    return f"""
+        SELECT k.streamId,
+               k.start,
+               k.[end],
+               {name_expr} AS kernel_name
+        FROM {kernel_tbl} k
+        {join_clause}
+    """
+
+
+def _kernel_name_like_any_sql(column_name: str, keywords: tuple[str, ...]) -> str:
+    normalized = f"LOWER(COALESCE({column_name}, ''))"
+    return " OR ".join(f"{normalized} LIKE '%{keyword}%'" for keyword in keywords)
+
+
+def _nccl_kernel_name_sql(column_name: str = "kernel_name") -> str:
+    return _kernel_name_like_any_sql(column_name, _NCCL_KEYWORDS)
+
+
+def _stream_classification_query(conn: sqlite3.Connection, kernel_tbl: str, has_strings: bool) -> str:
+    nccl_sql = _nccl_kernel_name_sql()
+    return f"""
+        SELECT streamId,
+               SUM(CASE WHEN {nccl_sql} THEN 1 ELSE 0 END) AS nccl_count,
+               SUM(CASE WHEN NOT ({nccl_sql}) THEN 1 ELSE 0 END) AS compute_count
+        FROM ({_kernel_rows_with_names_query(conn, kernel_tbl, has_strings)})
+        GROUP BY streamId
+    """
 
 
 def run_sql_schema(sqlite_path: str) -> SqlSchemaResult:
@@ -198,39 +306,20 @@ def run_sql_kernels(sqlite_path: str, limit: int = 20) -> SqlKernelsResult:
     total_kernel_ns = 0
     trace_duration_ns = 0
 
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, has_strings):
 
         kernel_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL")
         if not kernel_tbl:
             return SqlKernelsResult(kernels=[], total_kernel_ns=0, trace_duration_ns=0)
 
-        has_strings = "StringIds" in all_tables
-        cols = _get_cols(conn, kernel_tbl)
-        has_demangled = "demangledName" in cols
-
-        if has_strings and has_demangled:
-            name_expr = "COALESCE(d.value, s.value, 'kernel_' || CAST(k.shortName AS TEXT))"
-            join_clause = "LEFT JOIN StringIds s ON k.shortName = s.id LEFT JOIN StringIds d ON k.demangledName = d.id"
-        elif has_strings:
-            name_expr = "COALESCE(s.value, 'kernel_' || CAST(k.shortName AS TEXT))"
-            join_clause = "LEFT JOIN StringIds s ON k.shortName = s.id"
-        else:
-            name_expr = "CAST(k.shortName AS TEXT)"
-            join_clause = ""
+        name_expr, join_clause = _kernel_name_parts(conn, kernel_tbl, has_strings, alias="k")
 
         # Get trace duration
-        dur_row = conn.execute(
-            f"SELECT MIN(start), MAX([end]), SUM([end] - start) FROM {kernel_tbl}"
-        ).fetchone()
-        if dur_row and dur_row[0] is not None:
-            trace_start = int(dur_row[0])
-            trace_end = int(dur_row[1])
+        trace_start, trace_end, total_kernel_ns = _table_time_bounds(
+            conn, kernel_tbl, include_total_ns=True
+        )
+        if trace_end > trace_start:
             trace_duration_ns = trace_end - trace_start
-            total_kernel_ns = int(dur_row[2] or 0)
 
         # Get top kernels
         sql = f"""
@@ -277,17 +366,11 @@ def run_sql_gaps(sqlite_path: str, min_gap_ns: int = 1_000_000, limit: int = 20)
     gaps: list[GapInfo] = []
     total_gap_ns = 0
 
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, has_strings):
 
         kernel_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL")
         if not kernel_tbl:
             return SqlGapsResult(gaps=[], total_gap_ns=0, gap_count=0)
-
-        has_strings = "StringIds" in all_tables
 
         # Get all kernel intervals per stream
         interval_sql = f"""
@@ -336,28 +419,33 @@ def run_sql_gaps(sqlite_path: str, min_gap_ns: int = 1_000_000, limit: int = 20)
             after_kernel = None
             total_gap_ns += dur
 
-            if has_strings:
-                try:
-                    # Before kernel
-                    before_row = conn.execute(f"""
-                        SELECT s.value FROM {kernel_tbl} k
-                        JOIN StringIds s ON k.shortName = s.id
-                        WHERE k.streamId = {sid} AND k.[end] <= {gs}
-                        ORDER BY k.[end] DESC LIMIT 1
-                    """).fetchone()
-                    if before_row:
-                        before_kernel = before_row[0]
-                    # After kernel
-                    after_row = conn.execute(f"""
-                        SELECT s.value FROM {kernel_tbl} k
-                        JOIN StringIds s ON k.shortName = s.id
-                        WHERE k.streamId = {sid} AND k.start >= {ge}
-                        ORDER BY k.start ASC LIMIT 1
-                    """).fetchone()
-                    if after_row:
-                        after_kernel = after_row[0]
-                except sqlite3.Error:
-                    pass
+            try:
+                before_row = conn.execute(
+                    _kernel_name_lookup_query(
+                        conn,
+                        kernel_tbl,
+                        has_strings,
+                        where_clause="k.streamId = ? AND k.[end] <= ?",
+                        order_clause="ORDER BY k.[end] DESC",
+                    ),
+                    (sid, gs),
+                ).fetchone()
+                if before_row:
+                    before_kernel = before_row[0]
+                after_row = conn.execute(
+                    _kernel_name_lookup_query(
+                        conn,
+                        kernel_tbl,
+                        has_strings,
+                        where_clause="k.streamId = ? AND k.start >= ?",
+                        order_clause="ORDER BY k.start ASC",
+                    ),
+                    (sid, ge),
+                ).fetchone()
+                if after_row:
+                    after_kernel = after_row[0]
+            except sqlite3.Error:
+                pass
 
             gaps.append(GapInfo(
                 stream_id=sid,
@@ -388,27 +476,19 @@ def run_sql_sync(sqlite_path: str) -> SqlSyncResult:
     total_sync_ns = 0
     sync_wall_pct = 0.0
 
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, has_strings):
 
         sync_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION")
         if not sync_tbl:
             return SqlSyncResult(sync_events=[], total_sync_ns=0, sync_wall_pct=0.0)
 
-        has_strings = "StringIds" in all_tables
-
         # Get trace duration from kernels
         kernel_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL")
         trace_duration_ns = 0
         if kernel_tbl:
-            dur_row = conn.execute(
-                f"SELECT MIN(start), MAX([end]) FROM {kernel_tbl}"
-            ).fetchone()
-            if dur_row and dur_row[0] is not None:
-                trace_duration_ns = int(dur_row[1]) - int(dur_row[0])
+            trace_start, trace_end, _ = _table_time_bounds(conn, kernel_tbl)
+            if trace_end > trace_start:
+                trace_duration_ns = trace_end - trace_start
 
         # Query sync events - try with enum table first
         sync_enum_tbl = _find_table(all_tables, "ENUM_CUPTI_SYNC_TYPE")
@@ -483,17 +563,11 @@ def run_sql_nvtx(sqlite_path: str, limit: int = 20) -> SqlNvtxResult:
     nvtx_ranges: list[NvtxRangeInfo] = []
     total_nvtx_ns = 0
 
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, has_strings):
 
         nvtx_tbl = _find_table(all_tables, "NVTX_EVENTS")
         if not nvtx_tbl:
             return SqlNvtxResult(nvtx_ranges=[], total_nvtx_ns=0)
-
-        has_strings = "StringIds" in all_tables
         cols = _get_cols(conn, nvtx_tbl)
         has_textid = "textId" in cols
 
@@ -545,18 +619,13 @@ def run_sql_memcpy(sqlite_path: str) -> SqlMemcpyResult:
     total_bytes = 0
     total_ns = 0
 
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, _):
 
         memcpy_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_MEMCPY")
         if not memcpy_tbl:
             return SqlMemcpyResult(memcpy_ops=[], total_bytes=0, total_ns=0)
 
-        cols = _get_cols(conn, memcpy_tbl)
-        if "bytes" not in cols or "copyKind" not in cols:
+        if not _has_columns(conn, memcpy_tbl, "bytes", "copyKind"):
             return SqlMemcpyResult(memcpy_ops=[], total_bytes=0, total_ns=0)
 
         sql = f"""
@@ -606,32 +675,21 @@ def run_sql_nccl(sqlite_path: str, limit: int = 20) -> SqlNcclResult:
     total_nccl_ns = 0
     total_ops = 0
 
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, has_strings):
 
         kernel_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL")
         if not kernel_tbl:
             return SqlNcclResult(streams=[], total_nccl_ns=0, total_ops=0)
 
-        has_strings = "StringIds" in all_tables
-        if not has_strings:
-            return SqlNcclResult(streams=[], total_nccl_ns=0, total_ops=0)
-
-        # Build LIKE clauses for NCCL keywords
-        like_clauses = " OR ".join(f"LOWER(s.value) LIKE '%{kw}%'" for kw in _NCCL_KEYWORDS)
-
+        nccl_sql = _nccl_kernel_name_sql()
         sql = f"""
-            SELECT k.streamId,
+            SELECT streamId,
                    COUNT(*) AS op_count,
-                   SUM(k.[end] - k.start) AS total_ns,
-                   AVG(k.[end] - k.start) AS avg_ns
-            FROM {kernel_tbl} k
-            JOIN StringIds s ON k.shortName = s.id
-            WHERE ({like_clauses})
-            GROUP BY k.streamId
+                   SUM([end] - start) AS total_ns,
+                   AVG([end] - start) AS avg_ns
+            FROM ({_kernel_rows_with_names_query(conn, kernel_tbl, has_strings)})
+            WHERE {nccl_sql}
+            GROUP BY streamId
             ORDER BY total_ns DESC
             LIMIT {limit}
         """
@@ -685,33 +743,29 @@ def run_sql_kernel_launch(sqlite_path: str, limit: int = 20) -> SqlKernelLaunchR
     """
     entries: list[KernelLaunchEntry] = []
 
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, has_strings):
 
         kernel_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL")
         runtime_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_RUNTIME")
-        has_strings = "StringIds" in all_tables
 
-        if not kernel_tbl or not runtime_tbl or not has_strings:
+        if not kernel_tbl or not runtime_tbl:
             return SqlKernelLaunchResult(entries=[], avg_overhead_us=0.0, max_overhead_us=0.0)
 
         # Check that correlationId exists in both tables
-        kernel_cols = _get_cols(conn, kernel_tbl)
-        runtime_cols = _get_cols(conn, runtime_tbl)
-        if "correlationId" not in kernel_cols or "correlationId" not in runtime_cols:
+        if not _has_columns(conn, kernel_tbl, "correlationId") or not _has_columns(
+            conn, runtime_tbl, "correlationId"
+        ):
             return SqlKernelLaunchResult(entries=[], avg_overhead_us=0.0, max_overhead_us=0.0)
 
+        name_expr, kernel_join = _kernel_name_parts(conn, kernel_tbl, has_strings, alias="k")
         sql = f"""
-            SELECT s.value AS kernel_name,
+            SELECT {name_expr} AS kernel_name,
                    ROUND((r.[end] - r.start) / 1e6, 3) AS api_ms,
                    ROUND((k.[end] - k.start) / 1e6, 3) AS kernel_ms,
                    ROUND((k.start - r.start) / 1e3, 1) AS overhead_us
             FROM {runtime_tbl} r
             JOIN {kernel_tbl} k ON r.correlationId = k.correlationId
-            JOIN StringIds s ON k.shortName = s.id
+            {kernel_join}
             WHERE k.start >= r.start
             ORDER BY overhead_us DESC
             LIMIT {limit}
@@ -767,11 +821,7 @@ def run_sql_stream_concurrency(sqlite_path: str, limit: int = 20) -> SqlStreamCo
     """
     streams: list[StreamStats] = []
 
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, _):
 
         kernel_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL")
         if not kernel_tbl:
@@ -883,35 +933,23 @@ def run_sql_overlap(sqlite_path: str) -> SqlOverlapResult:
     Returns:
         SqlOverlapResult with overlap estimates
     """
-    with closing(sqlite3.connect(sqlite_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        all_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+    with _open_sqlite_profile(sqlite_path) as (conn, all_tables, has_strings):
 
         kernel_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL")
-        has_strings = "StringIds" in all_tables
 
-        if not kernel_tbl or not has_strings:
+        if not kernel_tbl:
             return SqlOverlapResult(
                 compute_only_ns=0, nccl_only_ns=0, overlap_ns=0,
                 total_span_ns=0, overlap_pct=0.0,
                 compute_kernels=0, nccl_kernels=0,
-                note="No kernel or string data available",
+                note="No kernel data available",
             )
-
-        like_clauses = " OR ".join(f"LOWER(s.value) LIKE '%{kw}%'" for kw in _NCCL_KEYWORDS)
 
         # Classify streams into compute vs nccl
         try:
-            stream_class_rows = conn.execute(f"""
-                SELECT k.streamId,
-                    SUM(CASE WHEN {like_clauses} THEN 1 ELSE 0 END) AS nccl_count,
-                    SUM(CASE WHEN NOT ({like_clauses}) THEN 1 ELSE 0 END) AS compute_count
-                FROM {kernel_tbl} k
-                JOIN StringIds s ON k.shortName = s.id
-                GROUP BY k.streamId
-            """).fetchall()
+            stream_class_rows = conn.execute(
+                _stream_classification_query(conn, kernel_tbl, has_strings)
+            ).fetchall()
         except sqlite3.Error as e:
             logger.debug("run_sql_overlap stream classification failed: %s", e)
             return SqlOverlapResult(
@@ -938,26 +976,8 @@ def run_sql_overlap(sqlite_path: str) -> SqlOverlapResult:
                 note="No NCCL kernels found in this profile",
             )
 
-        def stream_span(stream_ids: set[int]) -> tuple[int, int, int, int]:
-            """Return (min_start, max_end, total_ns_sum, kernel_count) for given streams."""
-            if not stream_ids:
-                return 0, 0, 0, 0
-            placeholders = ",".join("?" * len(stream_ids))
-            try:
-                row = conn.execute(f"""
-                    SELECT MIN(start), MAX([end]),
-                           SUM([end] - start), COUNT(*)
-                    FROM {kernel_tbl}
-                    WHERE streamId IN ({placeholders})
-                """, list(stream_ids)).fetchone()
-                if row and row[0] is not None:
-                    return int(row[0]), int(row[1]), int(row[2] or 0), int(row[3] or 0)
-            except sqlite3.Error:
-                pass
-            return 0, 0, 0, 0
-
-        c_start, c_end, c_ns, c_count = stream_span(compute_streams)
-        n_start, n_end, n_ns, n_count = stream_span(nccl_streams)
+        c_start, c_end, c_ns, c_count = _stream_span_stats(conn, kernel_tbl, compute_streams)
+        n_start, n_end, n_ns, n_count = _stream_span_stats(conn, kernel_tbl, nccl_streams)
 
         # Overlap = intersection of the two time spans (conservative estimate)
         overlap_start = max(c_start, n_start)
@@ -985,3 +1005,126 @@ def run_sql_overlap(sqlite_path: str) -> SqlOverlapResult:
                 "Use nsys-ai overlap_breakdown for precise interval-union analysis."
             ),
         )
+
+
+def _emit_sql_result(result: object) -> None:
+    print(json.dumps(asdict(result), indent=2, ensure_ascii=False))  # type: ignore[arg-type]
+
+
+_SQL_RUNNERS: dict[str, tuple] = {
+    "schema":             (run_sql_schema,             lambda a: {}),
+    "kernels":            (run_sql_kernels,            lambda a: {"limit": a.limit}),
+    "gaps":               (run_sql_gaps,               lambda a: {"min_gap_ns": a.min_gap_ns, "limit": a.limit}),
+    "sync":               (run_sql_sync,               lambda a: {}),
+    "nvtx":               (run_sql_nvtx,               lambda a: {"limit": a.limit}),
+    "memcpy":             (run_sql_memcpy,             lambda a: {}),
+    "nccl":               (run_sql_nccl,               lambda a: {"limit": a.limit}),
+    "kernel-launch":      (run_sql_kernel_launch,      lambda a: {"limit": a.limit}),
+    "stream-concurrency": (run_sql_stream_concurrency, lambda a: {"limit": a.limit}),
+    "overlap":            (run_sql_overlap,            lambda a: {}),
+}
+
+
+_NSYS_SQL_DESCRIPTION = (
+    "直接查询 nsys SQLite 数据库，输出结构化 JSON。\n\n"
+    "每个子命令都是只读的，输出有界的 JSON，适合 agent/Codex 直接调用。\n\n"
+    "  sysight nsys-sql schema <db>    — 列出表、列和能力\n"
+    "  sysight nsys-sql kernels <db>   — Top-N GPU 内核（按总时间）\n"
+    "  sysight nsys-sql gaps <db>      — GPU 空闲气泡分析\n"
+    "  sysight nsys-sql sync <db>      — CUDA 同步事件代价\n"
+    "  sysight nsys-sql nvtx <db>      — NVTX range 分解\n"
+    "  sysight nsys-sql memcpy <db>    — 内存带宽分析\n"
+    "  sysight nsys-sql nccl <db>      — NCCL 通信分解\n"
+)
+
+
+def _register_nsys_sql_subparsers(sub: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    sc = sub.add_parser("schema", help="查询 SQLite schema 和能力")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("kernels", help="查询 Top-N GPU 内核")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--limit", type=int, default=20, help="返回内核数量上限")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("gaps", help="查询 GPU 空闲气泡")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--min-gap-ns", type=int, default=1000000, help="最小间隙（ns）")
+    sc.add_argument("--limit", type=int, default=20, help="返回间隙数量上限")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("sync", help="查询 CUDA 同步事件代价")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("nvtx", help="查询 NVTX range 分解")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--limit", type=int, default=20, help="返回 range 数量上限")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("memcpy", help="查询内存带宽分析")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("nccl", help="查询 NCCL 通信分解")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--limit", type=int, default=20, help="返回 stream 数量上限")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("kernel-launch", help="内核启动开销分析（API→GPU 延迟）")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--limit", type=int, default=20, help="返回条目数量上限")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("stream-concurrency", help="Stream 并发率分析")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--limit", type=int, default=20, help="返回 stream 数量上限")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+    sc = sub.add_parser("overlap", help="Compute/NCCL 重叠估算")
+    sc.add_argument("sqlite_path", help=".sqlite 文件路径")
+    sc.add_argument("--json", action="store_true", help="输出 JSON 格式（默认）")
+
+
+def add_nsys_sql_subparser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    sql_parser = subparsers.add_parser(
+        "nsys-sql",
+        help="直接查询 nsys SQLite 数据库（供 agent 使用）",
+        description=_NSYS_SQL_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sql_sub = sql_parser.add_subparsers(dest="sql_cmd")
+    _register_nsys_sql_subparsers(sql_sub)
+
+
+def dispatch_nsys_sql(args: argparse.Namespace) -> bool:
+    if getattr(args, "sql_cmd", None) is None:
+        return False
+
+    entry = _SQL_RUNNERS.get(args.sql_cmd)
+    if entry is None:
+        return False
+
+    runner, build_kwargs = entry
+    _emit_sql_result(runner(args.sqlite_path, **build_kwargs(args)))
+    return True
+
+
+def main_standalone_nsys_sql(argv: list[str]) -> None:
+    p = argparse.ArgumentParser(
+        prog="sysight nsys-sql",
+        description=_NSYS_SQL_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="sql_cmd")
+    _register_nsys_sql_subparsers(sub)
+
+    args = p.parse_args(argv)
+    if not getattr(args, "sql_cmd", None):
+        p.print_help()
+        return
+
+    if not dispatch_nsys_sql(args):
+        print("错误：未知的 nsys-sql 子命令", file=sys.stderr)
+        raise SystemExit(1)
