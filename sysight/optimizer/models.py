@@ -35,16 +35,20 @@ class Patch:
     diff: str
     rationale: str
     expected_metric: str
+    summary: str = ""  # one-line human-readable description (used in commit message + CSV)
 
     @classmethod
     def from_dict(cls, data: dict) -> Patch:
+        rationale = data.get("rationale", "")
         return cls(
             id=data.get("id", ""),
             finding_id=data.get("finding_id", ""),
             file=data.get("file", ""),
             diff=data.get("diff", ""),
-            rationale=data.get("rationale", ""),
+            rationale=rationale,
             expected_metric=data.get("expected_metric", ""),
+            # summary falls back to rationale when not explicitly provided
+            summary=data.get("summary", "") or rationale,
         )
 
 

@@ -56,13 +56,18 @@ def dispatch_executor(args: argparse.Namespace) -> int:
 
     logger.info("Starting executor on %s", repo_path)
     
+    # patch_log.csv sits next to execution_report.json
+    csv_path = out_path.parent / "patch_log.csv"
+
     report = execute_patch_plan(
         repo_root=str(repo_path),
         plan=plan,
+        csv_path=csv_path,
     )
 
     out_path.write_text(json.dumps(report.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
     logger.info("Execution report written to %s", out_path)
+    logger.info("Patch log written to %s", csv_path)
     return 0
 
 

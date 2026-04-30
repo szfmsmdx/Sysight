@@ -312,7 +312,7 @@ def _read_localization_output(output_path: str) -> str:
 
 
 def _create_localization_artifact_dir() -> Path:
-    base_dir = Path.cwd() / ".sysight" / "codex_runs"
+    base_dir = Path.cwd() / ".sysight" / "analysis-runs"
     base_dir.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix="run-", dir=base_dir))
 

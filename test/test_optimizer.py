@@ -2,7 +2,9 @@
 
 import unittest
 from sysight.optimizer.models import MetricProbe, Patch, PatchPlan
-from sysight.optimizer.plan import parse_patch_plan_output
+from sysight.optimizer.plan import parse_patch_plan_output, build_optimizer_prompt, resolve_findings
+from sysight.shared.findings import Finding
+
 
 class TestOptimizerModels(unittest.TestCase):
     def test_patch_plan_roundtrip(self):
@@ -18,9 +20,10 @@ class TestOptimizerModels(unittest.TestCase):
                     "id": "patch_001",
                     "finding_id": "case_5_f010",
                     "file": "src/models/experts.py",
-                    "diff": "--- a/src/models/experts.py\\n+++ b/src/models/experts.py\\n-    pass\\n+    pass",
+                    "diff": "--- a/src/models/experts.py\n+++ b/src/models/experts.py\n-    pass\n+    pass",
                     "rationale": "Avoid batch loops",
-                    "expected_metric": "iter_time -30%"
+                    "expected_metric": "iter_time -30%",
+                    "summary": "Avoid batch loops"
                 }
             ]
         }
@@ -34,9 +37,9 @@ class TestOptimizerModels(unittest.TestCase):
         out_dict = plan.to_dict()
         self.assertEqual(out_dict, plan_dict)
 
+
 class TestOptimizerPlan(unittest.TestCase):
     def test_parse_patch_plan_output(self):
-        # Agent output containing thought process and then JSON block
         output = '''I will create a patch plan.
         
 ```json
@@ -62,6 +65,22 @@ Done.
         output = "I failed to generate."
         plan = parse_patch_plan_output(output)
         self.assertIsNone(plan)
+
+    def test_build_optimizer_prompt_includes_findings(self):
+        findings = [
+            Finding(
+                id="f001", category="C1", title="worker=0",
+                file="src/data.py", function="loader", line=10,
+                description="zero workers", suggestion="add workers",
+                evidence=["GPU idle"], priority="high",
+            ),
+        ]
+        prompt = build_optimizer_prompt(repo_root="/tmp/repo", findings=findings)
+        self.assertIn("C1", prompt)
+        self.assertIn("worker=0", prompt)
+        self.assertIn("src/data.py", prompt)
+        self.assertIn("loader", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

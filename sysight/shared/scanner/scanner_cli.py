@@ -23,7 +23,8 @@ _SCANNER_DESCRIPTION = (
     "  sysight scanner callers <repo> <sym>          查调用者\n"
     "  sysight scanner callees <repo> --file <f> --symbol <s>  查被调用\n"
     "  sysight scanner trace   <repo> <sym>          调用链追踪\n"
-    "  sysight scanner variants <repo>               variant 映射"
+    "  sysight scanner variants <repo>               variant 映射\n"
+    "  sysight scanner diff-check <repo> [--fix]     校验并修正 diff hunk count（从 stdin 读取）"
 )
 
 
@@ -99,6 +100,18 @@ def add_scanner_subparser(sub: argparse._SubParsersAction) -> None:  # type: ign
     p_var.add_argument("--file", dest="file_filter", help="只搜此文件")
     p_var.add_argument("--max", type=int, default=500, dest="max_results")
     p_var.add_argument("--json", action="store_true")
+
+    p_dc = ssub.add_parser(
+        "diff-check",
+        help="校验 unified diff 的 hunk count 并可自动修正（从 stdin 读取 diff）",
+    )
+    p_dc.add_argument("repo", help="repo 根目录（用于对比实际文件行数）")
+    p_dc.add_argument(
+        "--fix",
+        action="store_true",
+        help="自动修正错误的 hunk count，输出修正后的 diff",
+    )
+    p_dc.add_argument("--json", action="store_true", help="JSON 输出检查结果")
 
 
 def dispatch_scanner(args: argparse.Namespace) -> None:
@@ -316,6 +329,145 @@ def dispatch_scanner(args: argparse.Namespace) -> None:
             for e in result.entries:
                 print(f"  [{e.kind:12s}]  {e.key!r:30s} → {e.target}  ({e.file}:{e.line})")
 
+    elif cmd == "diff-check":
+        diff_text = sys.stdin.read()
+        repo_root = args.repo
+        fix = getattr(args, "fix", False)
+        result = check_and_fix_diff(diff_text, repo_root=repo_root, fix=fix)
+        if use_json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            status = result.get("status", "unknown")
+            errors = result.get("errors", [])
+            if status == "ok":
+                print("diff OK — hunk counts 全部正确")
+            else:
+                print(f"diff 存在 {len(errors)} 处问题：")
+                for e in errors:
+                    print(f"  [{e['file']}] hunk {e['hunk_index']+1}: {e['message']}")
+            if fix and result.get("fixed_diff"):
+                print("\n--- 修正后的 diff ---")
+                print(result["fixed_diff"])
+            elif fix and status != "ok":
+                print("\n（无法自动修正，请手动检查）", file=sys.stderr)
+
     else:
         print(f"未知 scanner 子命令：{cmd}", file=sys.stderr)
         sys.exit(1)
+
+
+# ── diff-check 核心逻辑 ────────────────────────────────────────────────────────
+
+def check_and_fix_diff(
+    diff_text: str,
+    *,
+    repo_root: str = ".",
+    fix: bool = False,
+) -> dict:
+    """校验 unified diff 的 hunk count，可选自动修正。
+
+    返回 dict:
+      status: "ok" | "error"
+      errors: list of {file, hunk_index, message, expected_old, expected_new, got_old, got_new}
+      fixed_diff: 修正后的 diff 文本（仅 fix=True 时有值）
+    """
+    import re
+    from pathlib import Path
+
+    errors: list[dict] = []
+    lines = diff_text.splitlines(keepends=True)
+    output_lines: list[str] = []
+
+    current_file: str = ""
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # 文件头：+++ b/... 或 +++ /...
+        if line.startswith("+++ "):
+            raw = line[4:].rstrip()
+            # strip b/ prefix
+            current_file = raw[2:] if raw.startswith("b/") else raw
+            output_lines.append(line)
+            i += 1
+            continue
+
+        # hunk header：@@ -old_start[,old_count] +new_start[,new_count] @@
+        hunk_match = re.match(
+            r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@(.*)",
+            line,
+        )
+        if hunk_match and current_file:
+            old_start = int(hunk_match.group(1))
+            declared_old = int(hunk_match.group(2)) if hunk_match.group(2) is not None else 1
+            new_start = int(hunk_match.group(3))
+            declared_new = int(hunk_match.group(4)) if hunk_match.group(4) is not None else 1
+            rest = hunk_match.group(5)
+
+            # Collect hunk body lines
+            hunk_body: list[str] = []
+            j = i + 1
+            while j < len(lines):
+                bl = lines[j]
+                if bl.startswith(("@@", "diff ", "--- ", "+++ ")):
+                    break
+                hunk_body.append(bl)
+                j += 1
+
+            # Count actual old/new lines
+            actual_old = sum(
+                1 for bl in hunk_body if bl.startswith(" ") or bl.startswith("-")
+            )
+            actual_new = sum(
+                1 for bl in hunk_body if bl.startswith(" ") or bl.startswith("+")
+            )
+
+            hunk_idx = sum(1 for e in errors if e.get("file") == current_file)
+            ok = True
+            if declared_old != actual_old:
+                errors.append({
+                    "file": current_file,
+                    "hunk_index": hunk_idx,
+                    "message": f"old count 声明 {declared_old}，实际 {actual_old}",
+                    "got_old": declared_old,
+                    "expected_old": actual_old,
+                    "got_new": declared_new,
+                    "expected_new": actual_new,
+                })
+                ok = False
+            if declared_new != actual_new:
+                if not ok:
+                    # already appended, update
+                    errors[-1]["got_new"] = declared_new
+                    errors[-1]["expected_new"] = actual_new
+                else:
+                    errors.append({
+                        "file": current_file,
+                        "hunk_index": hunk_idx,
+                        "message": f"new count 声明 {declared_new}，实际 {actual_new}",
+                        "got_old": declared_old,
+                        "expected_old": actual_old,
+                        "got_new": declared_new,
+                        "expected_new": actual_new,
+                    })
+
+            if fix and (declared_old != actual_old or declared_new != actual_new):
+                fixed_header = f"@@ -{old_start},{actual_old} +{new_start},{actual_new} @@{rest}\n"
+                output_lines.append(fixed_header)
+            else:
+                output_lines.append(line)
+
+            output_lines.extend(hunk_body)
+            i = j
+            continue
+
+        output_lines.append(line)
+        i += 1
+
+    result: dict = {
+        "status": "ok" if not errors else "error",
+        "errors": errors,
+    }
+    if fix:
+        result["fixed_diff"] = "".join(output_lines)
+    return result

@@ -13,13 +13,21 @@ class TestExecutorModels(unittest.TestCase):
                     "id": "patch_001",
                     "status": "committed",
                     "score_after": 15.0,
-                    "delta": "+4.5"
+                    "delta": "+4.5",
+                    "adopted": True,
+                    "base_hash": "abc123",
+                    "after_hash": "def456",
+                    "summary": "Speed up loader"
                 },
                 {
                     "id": "patch_002",
-                    "status": "skipped",
+                    "status": "reverted",
                     "score_after": 14.5,
-                    "delta": "-0.5, reverted"
+                    "delta": "-0.5",
+                    "adopted": False,
+                    "base_hash": "def456",
+                    "after_hash": "",
+                    "summary": "Remove clone"
                 }
             ],
             "final_score": 15.0
@@ -29,6 +37,10 @@ class TestExecutorModels(unittest.TestCase):
         self.assertEqual(report.baseline_score, 10.5)
         self.assertEqual(len(report.patches), 2)
         self.assertEqual(report.patches[0].id, "patch_001")
+        self.assertEqual(report.patches[0].adopted, True)
+        self.assertEqual(report.patches[0].base_hash, "abc123")
+        self.assertEqual(report.patches[1].status, "reverted")
+        self.assertEqual(report.patches[1].adopted, False)
         self.assertEqual(report.final_score, 15.0)
 
         out_dict = report.to_dict()
