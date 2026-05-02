@@ -8,8 +8,6 @@ GPU 性能优化有两个难点：profile 数据量巨大（一个 8-GPU trainin
 
 Sysight 用一个确定性的分析管道预处理 profile 数据，然后把结构化的 evidence 交给 LLM 做源码级定位。分析结果不是一次性的——通过的 wiki 系统积累下来，下次分析同一个 repo 时自动注入上下文，越用越强。
 
-核心思路来自 [self-improving-nsys-expert-blueprint.md](./self-improving-nsys-expert-blueprint.md) 和 [architecture-review-20260429.md](./architecture-review-20260429.md)。
-
 ## 工作流
 
 ```
@@ -204,8 +202,7 @@ cli/            ← 依赖 pipeline/
 
 ## 相关项目
 
-- [llmwiki](https://github.com/kennyatgithub/llmwiki) — LLM-maintained knowledge workspace，FTS5 + 引用图设计的参考来源
-- [repositories-wiki](https://github.com/szfmsmdx/repositories-wiki) — 从源码自动生成 wiki，update-wiki skill 的参考来源
+- [nsys-ai](https://github.com/GindaChen/nsys-ai) — Junda Chen 的 Nsight Systems agent 分析工具，本项目的重要灵感来源
 - [nsys-bench](https://github.com/szfmsmdx/nsys-bench) — benchmark 用例和 ground truth
-- [self-improving-nsys-expert-blueprint.md](./self-improving-nsys-expert-blueprint.md) — 系统设计蓝图
-- [architecture-review-20260429.md](./architecture-review-20260429.md) — 架构审查文档
+- [llmwiki](https://github.com/kennyatgithub/llmwiki) — LLM-maintained knowledge workspace，FTS5 + 引用图的参考来源
+- [repositories-wiki](https://github.com/szfmsmdx/repositories-wiki) — 从源码自动生成 wiki，update-wiki skill 的参考来源
