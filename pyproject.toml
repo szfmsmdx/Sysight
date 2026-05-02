@@ -4,16 +4,21 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sysight"
-version = "0.1.0"
-description = "Static repository analyzer: entry-point detection, call-chain tracing, multi-language"
+version = "0.2.0"
+description = "AI-powered GPU performance analysis and optimization"
 requires-python = ">=3.10"
 license = "MIT"
 
 [project.scripts]
-sysight = "sysight.analyzer.cli:main"
+sysight = "sysight.cli.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sysight"]
 
 [tool.pytest.ini_options]
-testpaths = ["test"]
+testpaths = [
+    "test/test_types",
+    "test/test_tools",
+    "test/test_wiki",
+    "test/test_agent",
+]

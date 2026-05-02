@@ -30,16 +30,16 @@ htmlcov/
 .ipynb_checkpoints/
 *.ipynb
 
-# 子项目（独立 git 仓库，用 submodule 管理）
+# 子项目（独立 git 仓库）
 code-review-graph/
 nsys-ai/
 workspace/
-profile/
-.sysight/
+llmwiki/
+repositories-wiki/
 
-# 本地工具 & 草稿
-benchmark.py
-plan.md
+# 运行时
+.sysight/
+profile/
 
 # nsys profile 原始文件（体积大）
 *.nsys-rep
