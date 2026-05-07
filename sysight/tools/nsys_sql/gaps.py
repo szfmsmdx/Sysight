@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from sysight.tools.registry import ToolDef
-from sysight.tools.nsys_sql._helpers import _open_db, _find_table, _kernel_name_lookup
+from sysight.tools.nsys_sql._helpers import _open_db, _find_table, _kernel_name_lookup, _truncate_kernel_name
 
 
 @dataclass
@@ -73,12 +73,12 @@ def gaps(sqlite: str, min_gap_ns: int = 1_000_000, limit: int = 20) -> GapsResul
                     where="k.streamId=? AND k.[end]<=?", order="ORDER BY k.[end] DESC"),
                     (sid, gs)).fetchone()
                 if r:
-                    before = r[0]
+                    before = _truncate_kernel_name(r[0])
                 r = conn.execute(_kernel_name_lookup(conn, kernel_tbl, has_strings,
                     where="k.streamId=? AND k.start>=?", order="ORDER BY k.start ASC"),
                     (sid, ge)).fetchone()
                 if r:
-                    after = r[0]
+                    after = _truncate_kernel_name(r[0])
             except sqlite3.Error:
                 pass
             result.gaps.append(GapInfo(stream_id=sid, gap_start_ns=gs, gap_end_ns=ge,

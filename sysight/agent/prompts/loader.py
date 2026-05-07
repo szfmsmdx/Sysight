@@ -25,14 +25,19 @@ class PromptLoader:
     ) -> str:
         """Assemble system prompt from fragments.
 
-        task_type: "analyze" → analyze_system.md (role + SOP + schema)
+        task_type: "analyze"  → analyze_system.md (role + SOP + schema)
                    "optimize" → optimizer_sop + output_schema_patch
-                   "learn"     → learn_system.md (wiki knowledge extraction)
+                   "learn"    → learn_system.md (wiki knowledge extraction)
+                   "warmup"   → warmup_system.md (repo discovery + execution config)
         """
         if task_type == "analyze":
             content = self._load("analyze_system")
         elif task_type == "learn":
             content = self._load("learn_system")
+        elif task_type == "warmup":
+            content = self._load("warmup_system")
+        elif task_type == "instrument":
+            content = self._load("instrument_system")
         elif task_type == "optimize":
             content = "\n\n".join([
                 self._load("optimizer_sop"),
@@ -77,6 +82,22 @@ class PromptLoader:
             if memory_brief:
                 parts.append(f"## Memory Context\n\n{memory_brief}")
             parts.append("请输出 PatchCandidate JSON 数组。")
+
+        elif task_type == "warmup":
+            parts.append("以下是静态分析阶段收集的仓库信息，请据此完成交互式探索。")
+            if findings_json:
+                parts.append(f"## 静态分析结果\n\n{findings_json}")
+            if memory_brief:
+                parts.append(f"## Memory Context\n\n{memory_brief}")
+            parts.append("请按 SOP 逐步调查，最后输出 ExecutionConfig JSON。")
+
+        elif task_type == "instrument":
+            parts.append("以下是 Analyzer 产出的 findings，请根据这些 findings 进行针对性打标。")
+            if findings_json:
+                parts.append(f"## Analyzer Findings\n\n{findings_json}")
+            if memory_brief:
+                parts.append(f"## Memory Context\n\n{memory_brief}")
+            parts.append("请按 SOP 逐步调查，最后输出 Instrumentation JSON。")
 
         elif task_type == "learn":
             parts.append("请根据以下分析结果更新 wiki 知识。")

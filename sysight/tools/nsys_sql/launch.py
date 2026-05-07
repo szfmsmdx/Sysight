@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from sysight.tools.registry import ToolDef
-from sysight.tools.nsys_sql._helpers import _open_db, _find_table, _has_columns, _kernel_name_expr
+from sysight.tools.nsys_sql._helpers import _open_db, _find_table, _has_columns, _kernel_name_expr, _truncate_kernel_name
 
 
 @dataclass
@@ -50,7 +50,7 @@ def launch(sqlite: str, limit: int = 20) -> LaunchResult:
         try:
             for row in conn.execute(sql):
                 result.entries.append(KernelLaunchEntry(
-                    kernel_name=row["kernel_name"] or "unknown",
+                    kernel_name=_truncate_kernel_name(row["kernel_name"]),
                     api_ms=float(row["api_ms"] or 0),
                     kernel_ms=float(row["kernel_ms"] or 0),
                     overhead_us=float(row["overhead_us"] or 0),

@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from sysight.tools.registry import ToolDef
-from sysight.tools.nsys_sql._helpers import _open_db, _find_table, _kernel_name_expr, _table_bounds
+from sysight.tools.nsys_sql._helpers import _open_db, _find_table, _kernel_name_expr, _table_bounds, _truncate_kernel_name
 
 
 @dataclass
@@ -51,7 +51,7 @@ def kernels(sqlite: str, limit: int = 20) -> KernelsResult:
         try:
             for row in conn.execute(sql).fetchall():
                 result.kernels.append(KernelInfo(
-                    name=row["kernel_name"] or "unknown",
+                    name=_truncate_kernel_name(row["kernel_name"]),
                     count=int(row["cnt"]), total_ns=int(row["total_ns"] or 0),
                     avg_ns=float(row["avg_ns"] or 0), max_ns=int(row["max_ns"] or 0),
                 ))

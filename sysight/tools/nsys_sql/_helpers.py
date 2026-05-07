@@ -12,6 +12,32 @@ from collections.abc import Iterator
 _COPY_KIND_NAMES = {0: "Unknown", 1: "H2D", 2: "D2H", 4: "H2H", 8: "D2D", 10: "P2P"}
 _NCCL_KEYWORDS = ("nccl", "allreduce", "allgather", "reducescatter", "broadcast", "sendrecv", "reduce")
 
+def _truncate_kernel_name(name: str | None) -> str:
+    """Truncate a C++ kernel name to its function-signature prefix.
+
+    CUDA kernel names fall into two forms:
+      - Short names: "ampere_sgemm_32x128_nt" — no template args, keep as-is.
+      - Demangled names: "void ns::FuncName<T1, T2, ...>(args)" — the template
+        instantiation after the first '<' is rarely needed for diagnosis; strip
+        it and replace with '<…>' so the LLM retains function identity without
+        the token-expensive parameter list.
+
+    Hard cap of 120 chars after stripping templates guards against pathological
+    names (e.g. cutlass::Kernel<...> where the base name itself is verbose).
+    """
+    if not name:
+        return "unknown"
+    bracket = name.find("<")
+    if bracket == -1:
+        # No template args — short name, return as-is.
+        return name
+    base = name[:bracket]
+    result = base + "<…>"
+    # Hard cap in case base itself is unusually long.
+    if len(result) > 120:
+        return result[:117] + "…"
+    return result
+
 
 def _find_table(all_tables: set[str], prefix: str) -> str | None:
     if prefix in all_tables:
