@@ -30,19 +30,27 @@ def main(argv: list[str] | None = None):
     sub = parser.add_subparsers(dest="command")
 
     # warmup
-    p = sub.add_parser("warmup", help="Explore a repo and create RepoSetup")
+    p = sub.add_parser("warmup", help="Explore a repo (Phase 1 only — deterministic scanning)")
     p.add_argument("repo", help="Path to repo root")
+    p.add_argument("--force", action="store_true", help="Force re-run even if warmup cache exists")
 
     # analyze
     p = sub.add_parser("analyze", help="Analyze an Nsight Systems profile")
     p.add_argument("profile", help="Path to .sqlite profile")
     p.add_argument("--repo", required=True, help="Path to repo root")
+    p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal (always logged to debug.log)")
     p.add_argument("--dump-prompt", help="Write the first-turn analyze prompt bundle to this file or directory")
     p.add_argument("--no-run", action="store_true", help="Only build/dump the first-turn prompt; do not call the LLM")
 
+    # instrument
+    p = sub.add_parser("instrument", help="Targeted NVTX tagging based on analyzer findings")
+    p.add_argument("run_id", help="Analyze run_id (or path to analyze_raw.json)")
+    p.add_argument("--repo", required=True, help="Path to repo root")
+    p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal (always logged to instrument_debug.log)")
+
     # optimize
     p = sub.add_parser("optimize", help="Optimize findings from an analysis")
-    p.add_argument("analysis_json", help="Path to analysis.json")
+    p.add_argument("run_id", help="Analyze run_id (or path to analyze_raw.json)")
     p.add_argument("--repo", required=True, help="Path to repo root")
 
     # learn
@@ -70,6 +78,7 @@ def main(argv: list[str] | None = None):
     dispatch = {
         "warmup": _cmd_warmup,
         "analyze": _cmd_analyze,
+        "instrument": _cmd_instrument,
         "optimize": _cmd_optimize,
         "learn": _cmd_learn,
         "full": _cmd_full,
@@ -108,12 +117,30 @@ def _setup():
 
 
 def _cmd_warmup(args):
-    registry, provider_factory, knowledge = _setup()
-    provider = provider_factory("warmup")
+    registry, _, knowledge = _setup()
 
     from sysight.pipeline.warmup import run_warmup
-    result = run_warmup(args.repo, registry, provider, knowledge)
-    print(json.dumps(result.summary, indent=2, ensure_ascii=False))
+    result = run_warmup(args.repo, registry, knowledge, force=getattr(args, 'force', False))
+
+    s = result.summary
+    print(f"\n{'='*60}")
+    print(f"  Warmup 完成 — {s.get('source', '?')}")
+    print(f"{'='*60}")
+    print(f"  入口:     {s.get('entry_point', '?')}")
+    print(f"  profile:  {s.get('profile_sqlite', '?')}")
+    print(f"  热路径:   {s.get('hot_path_count', 0)} 文件")
+
+    warns = s.get('warnings', [])
+    errs = s.get('errors', [])
+    if warns or errs:
+        print()
+        for w in warns:
+            print(f"  ⚠ {w}")
+        for e in errs:
+            print(f"  ✗ {e}")
+
+    print(f"\n  Cache: .sysight/warmup-caches/<hash>.json")
+    print(f"  Overview: {result.summary.get('overview_path', '')}")
 
 
 def _cmd_analyze(args):
@@ -139,31 +166,107 @@ def _cmd_analyze(args):
         sys.exit(1)
 
     from sysight.pipeline.analyze import run_analyze
-    result = run_analyze(args.profile, args.repo, registry, provider, knowledge)
-    output = {
-        "run_id": result.run_id,
-        "summary": result.finding_set.summary,
-        "findings": [
-            {
-                "finding_id": f.finding_id,
-                "category": f.category,
-                "title": f.title,
-                "priority": f.priority,
-                "file_path": f.file_path,
-                "function": f.function,
-                "line": f.line,
-                "confidence": f.confidence,
-                "description": f.description,
-                "suggestion": f.suggestion,
-                "status": f.status,
-            }
-            for f in result.finding_set.findings
+    result = run_analyze(
+        args.profile, args.repo, registry, provider, knowledge,
+        verbose=getattr(args, 'debug', False),
+    )
+    # Output location already printed by run_analyze; print run_id for scripting
+    print(result.run_id)
+
+
+def _resolve_analyze_raw(run_id_or_path: str) -> Path:
+    """Resolve a run_id or file path to an analyze_raw.json Path."""
+    p = Path(run_id_or_path)
+    # Direct file path
+    if p.suffix == ".json" and p.exists():
+        return p
+    # Directory containing analyze_raw.json
+    if p.is_dir():
+        candidate = p / "analyze_raw.json"
+        if candidate.exists():
+            return candidate
+    # run_id lookup in .sysight/analysis-runs/
+    candidate = Path.cwd() / ".sysight" / "analysis-runs" / run_id_or_path / "analyze_raw.json"
+    if candidate.exists():
+        return candidate
+    print(f"Error: cannot resolve analyze_raw.json from '{run_id_or_path}'", file=sys.stderr)
+    sys.exit(1)
+
+
+def _load_findings(run_id_or_path: str):
+    """Parse analyze_raw.json (by run_id or path) into LocalizedFindingSet."""
+    path = _resolve_analyze_raw(run_id_or_path)
+    data = json.loads(path.read_text())
+    from sysight.types.findings import LocalizedFindingSet, LocalizedFinding
+    return LocalizedFindingSet(
+        run_id=data.get("run_id", ""),
+        summary=data.get("summary", ""),
+        findings=[
+            LocalizedFinding(
+                finding_id=f.get("finding_id", ""),
+                category=f.get("category", ""),
+                title=f.get("title", ""),
+                priority=f.get("priority", "medium"),
+                confidence=f.get("confidence", "unresolved"),
+                file_path=f.get("file_path"),
+                function=f.get("function"),
+                line=f.get("line"),
+                description=f.get("description", ""),
+                suggestion=f.get("suggestion", ""),
+                status=f.get("status", "accepted"),
+            )
+            for f in data.get("findings", [])
+            if f.get("status") == "accepted"
         ],
-        "rejected": len(result.finding_set.rejected),
-        "errors": result.errors,
-        "elapsed_ms": result.elapsed_ms,
-    }
-    print(json.dumps(output, indent=2, ensure_ascii=False))
+    )
+
+
+def _cmd_instrument(args):
+    registry, provider_factory, knowledge = _setup()
+    provider = provider_factory("instrument")
+    if not provider:
+        print("Error: no instrument provider configured", file=sys.stderr)
+        sys.exit(1)
+
+    findings = _load_findings(args.run_id)
+    raw_path = _resolve_analyze_raw(args.run_id)
+    run_dir = raw_path.parent  # .sysight/analysis-runs/<run_id>/
+
+    from sysight.pipeline.instrument import run_instrument
+    from sysight.pipeline.warmup import _warmup_cache_path
+    from sysight.types.repo_setup import RepoSetup
+    cache_path = _warmup_cache_path(Path(args.repo))
+    repo_setup = RepoSetup.load_cache(cache_path)
+    result = run_instrument(
+        findings, args.repo, registry, provider, knowledge,
+        repo_setup=repo_setup,
+        verbose=getattr(args, 'debug', False),
+        run_dir=run_dir,
+    )
+
+    s = result.summary
+    print(f"\n{'='*60}")
+    print(f"  Instrument 完成")
+    print(f"{'='*60}")
+    print(f"  入口:         {s.get('entry_point', '?')}")
+    print(f"  smoke:        {'✓ 通过' if s.get('smoke_test_passed') else '? 未验证'}")
+    print(f"  NVTX 已有:    {'是' if s.get('has_nvtx') else '否'}")
+    print(f"  建议打标:     {s.get('suggested_tags', 0)} 处")
+
+    hai = s.get('human_action_items', [])
+    if hai:
+        print(f"\n  ⚠ 需要人工操作 ({len(hai)} 项):")
+        for item in hai:
+            print(f"    • {item}")
+
+    warns = s.get('warnings', [])
+    errs = s.get('errors', [])
+    if warns or errs:
+        print()
+        for w in warns:
+            print(f"  ⚠ {w}")
+        for e in errs:
+            print(f"  ✗ {e}")
 
 
 def _write_prompt_dump(target: str, bundle: dict) -> None:
@@ -190,28 +293,7 @@ def _cmd_optimize(args):
         print("Error: no optimize provider configured", file=sys.stderr)
         sys.exit(1)
 
-    data = json.loads(Path(args.analysis_json).read_text())
-    from sysight.types.findings import LocalizedFindingSet, LocalizedFinding
-    findings = LocalizedFindingSet(
-        run_id=data.get("run_id", ""),
-        summary=data.get("summary", ""),
-        findings=[
-            LocalizedFinding(
-                finding_id=f.get("finding_id", ""),
-                category=f.get("category", ""),
-                title=f.get("title", ""),
-                priority=f.get("priority", "medium"),
-                confidence=f.get("confidence", "unresolved"),
-                file_path=f.get("file_path"),
-                function=f.get("function"),
-                line=f.get("line"),
-                description=f.get("description", ""),
-                suggestion=f.get("suggestion", ""),
-                status=f.get("status", "accepted"),
-            )
-            for f in data.get("findings", [])
-        ],
-    )
+    findings = _load_findings(args.run_id)
 
     from sysight.pipeline.optimize import run_optimize
     result = run_optimize(findings, args.repo, registry, provider, knowledge)

@@ -81,7 +81,25 @@ class AgentLoop:
             self._registry.reset_call_counts()
         if hasattr(self._provider, "reset_cache"):
             self._provider.reset_cache()
-        context = AgentContext(task.user_prompt, task.context_policy)
+        # Inject model_name into context policy for model-aware thresholds
+        policy = task.context_policy or ContextPolicy()
+        if not policy.model_name and hasattr(self._provider, 'model'):
+            policy = ContextPolicy(
+                model_name=getattr(self._provider, 'model', ''),
+                soft_token_limit=policy.soft_token_limit,
+                compact_token_limit=policy.compact_token_limit,
+                hard_token_limit=policy.hard_token_limit,
+                full_tool_result_once=policy.full_tool_result_once,
+                compact_after_first_exposure=policy.compact_after_first_exposure,
+                keep_recent_turns_full=policy.keep_recent_turns_full,
+                large_result_threshold_tokens=policy.large_result_threshold_tokens,
+                large_result_preview_tokens=policy.large_result_preview_tokens,
+                restore_recent_files=policy.restore_recent_files,
+                restore_file_count=policy.restore_file_count,
+                restore_max_tokens_per_file=policy.restore_max_tokens_per_file,
+                circuit_breaker_max=policy.circuit_breaker_max,
+            )
+        context = AgentContext(task.user_prompt, policy)
         system_prompt = task.system_prompt
 
         tool_calls_log: list[dict] = []
@@ -155,6 +173,8 @@ class AgentLoop:
             if response.usage:
                 context_stats.prompt_tokens = response.usage.prompt_tokens
                 context_stats.output_tokens = response.usage.output_tokens
+                # Feed token usage back for progressive compaction estimation
+                context.update_token_usage(response.usage.prompt_tokens)
             context_stats_log.append(context_stats.to_dict())
 
             if response.finish_reason == "error":

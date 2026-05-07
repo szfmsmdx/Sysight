@@ -24,6 +24,14 @@ def main(argv: list[str] | None = None):
         help="Log all LLM requests/responses to debug.log",
     )
     parser.add_argument(
+        "--force-warmup", action="store_true",
+        help="Force re-run warmup even if cache exists",
+    )
+    parser.add_argument(
+        "--no-warmup", action="store_true",
+        help="Skip warmup entirely (use existing cache; error if no cache found)",
+    )
+    parser.add_argument(
         "--output-dir", default=".sysight/bench-runs",
         help="Output directory for benchmark results (default: .sysight/bench-runs)",
     )
@@ -48,6 +56,8 @@ def main(argv: list[str] | None = None):
         nsys_bench_dir=nsys_bench_dir,
         output_dir=args.output_dir,
         debug=args.debug,
+        force_warmup=args.force_warmup,
+        no_warmup=args.no_warmup,
     )
     runner.run(case_ids)
 

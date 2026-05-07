@@ -35,10 +35,14 @@ class BenchmarkRunner:
         nsys_bench_dir: str | Path = "nsys-bench",
         output_dir: str | Path = ".sysight/bench-runs",
         debug: bool = False,
+        force_warmup: bool = False,
+        no_warmup: bool = False,
     ):
         self._nsys_bench_dir = Path(nsys_bench_dir).resolve()
         self._output_dir = Path(output_dir).resolve()
         self._debug = debug
+        self._force_warmup = force_warmup
+        self._no_warmup = no_warmup
         self._registry = None
         self._knowledge = None
         self._configs = {}
@@ -136,37 +140,35 @@ class BenchmarkRunner:
         provider = create_provider(analyze_cfg)
         debug_log: list[dict] = []
 
-        # Create warmup provider (cheapest available)
-        warmup_cfg = self._configs.get("warmup")
-        warmup_provider = create_provider(warmup_cfg) if warmup_cfg else provider
-
         t0 = time.monotonic()
         result = CaseResult(case_id=case_id, status="ok", total=truth.get("total_points", 0))
 
-        # -- WARMUP --
-        print(f"  [warmup] scanning repo...")
-        try:
-            from sysight.pipeline.warmup import run_warmup
-            wr = run_warmup(repo_root, self._registry, warmup_provider, self._knowledge)
-            result.warmup = {
-                "entry_point": wr.repo_setup.entry_point,
-                "test_commands": wr.repo_setup.test_commands,
-                "build_commands": wr.repo_setup.build_commands,
-                "source": wr.repo_setup.source,
-                "errors": wr.errors,
-            }
-            print(f"  [warmup] entry={wr.repo_setup.entry_point}, source={wr.repo_setup.source}")
-        except Exception as e:
-            result.errors.append(f"warmup: {e}")
-            print(f"  [warmup] FAILED: {e}")
+        # -- WARMUP (cached by default; --force-warmup re-runs; --no-warmup skips entirely) --
+        if self._no_warmup:
+            print(f"  [warmup] skipped (--no-warmup)")
+        else:
+            print(f"  [warmup] scanning repo...")
+            try:
+                from sysight.pipeline.warmup import run_warmup
+                wr = run_warmup(repo_root, self._registry, self._knowledge, force=self._force_warmup)
+                result.warmup = {
+                    "entry_point": wr.repo_setup.entry_point,
+                    "test_commands": wr.repo_setup.test_commands,
+                    "build_commands": wr.repo_setup.build_commands,
+                    "source": wr.repo_setup.source,
+                    "errors": wr.errors,
+                }
+                print(f"  [warmup] entry={wr.repo_setup.entry_point}, source={wr.repo_setup.source}")
+            except Exception as e:
+                result.errors.append(f"warmup: {e}")
+                print(f"  [warmup] FAILED: {e}")
 
-        # -- ANALYZE --
+        # -- ANALYZE (always logged to debug.log; --debug controls terminal output) --
         print(f"  [analyze] running LLM investigation...")
-        actual_provider = provider
+        from sysight.benchmark.debug import DebugProvider
+        actual_provider = DebugProvider(provider, debug_log, verbose=self._debug, log_file=str(case_out / "debug.log"))
         if self._debug:
-            from sysight.benchmark.debug import DebugProvider
-            actual_provider = DebugProvider(provider, debug_log, log_file=str(case_out / "debug.log"))
-            print(f"  [analyze] debug mode ON — logging all LLM I/O")
+            print(f"  [analyze] debug mode ON — printing LLM I/O to terminal")
 
         try:
             from sysight.pipeline.analyze import run_analyze
@@ -266,81 +268,6 @@ class BenchmarkRunner:
 
         # debug.log is written turn-by-turn by DebugProvider; no batch write needed
 
-    def _format_debug_log(self, result: CaseResult) -> str:
-        """Format the debug log as readable text including full LLM I/O."""
-        lines = []
-
-        def append_block(text: str, indent: str = "    ") -> None:
-            for line in str(text).split("\n"):
-                lines.append(f"{indent}{line}")
-
-        lines.append("=" * 72)
-        lines.append(f"  CASE: {result.case_id}")
-        lines.append(f"  STATUS: {result.status}  |  SCORE: {result.score}/{result.total}")
-        lines.append("=" * 72)
-
-        for entry in result.debug_log:
-            turn = entry["turn"]
-            req = entry["request"]
-            resp = entry["response"]
-
-            lines.append(f"\n{'─'*60}")
-            lines.append(f"  Turn {turn}")
-            lines.append(f"{'─'*60}")
-
-            # --- Request ---
-            lines.append(f"\n[REQUEST]")
-            lines.append(f"  tools ({len(req.get('tools', []))}): {', '.join(req.get('tools', []))}")
-            if req.get("context_stats"):
-                lines.append("  context_stats:")
-                append_block(json.dumps(req["context_stats"], ensure_ascii=False, indent=2), indent="    ")
-
-            sp = req.get("system_prompt", "")
-            if sp:
-                lines.append(f"  system_prompt ({len(sp)} chars):")
-                append_block(sp)
-
-            msgs = req.get("messages", [])
-            lines.append(f"  messages ({len(msgs)}):")
-            for i, m in enumerate(msgs):
-                role = m.get("role", "?")
-                content = str(m.get("content", ""))
-                lines.append(f"    [{i}] role={role}  ({len(content)} chars)")
-                append_block(content, indent="      ")
-
-            # --- Response ---
-            lines.append(f"\n[RESPONSE]")
-            lines.append(f"  finish_reason: {resp.get('finish_reason')}")
-            if resp.get("usage"):
-                u = resp["usage"]
-                lines.append(f"  usage: prompt_tokens={u.get('prompt_tokens')}, output_tokens={u.get('output_tokens')}")
-            if resp.get("error"):
-                lines.append("  provider_error:")
-                append_block(json.dumps(resp["error"], ensure_ascii=False, indent=2), indent="    ")
-
-            tool_calls = resp.get("tool_calls", [])
-            if tool_calls:
-                lines.append(f"  tool_calls ({len(tool_calls)}):")
-                for tc in tool_calls:
-                    args_str = json.dumps(tc.get("arguments", {}), ensure_ascii=False)
-                    lines.append(f"    → {tc.get('name')}({args_str})")
-
-            content = resp.get("content", "")
-            if content and not tool_calls:
-                lines.append(f"  content ({len(content)} chars):")
-                append_block(content)
-
-            extra = resp.get("extra", {})
-            if extra:
-                for k, v in extra.items():
-                    val_str = str(v)
-                    lines.append(f"  extra.{k} ({len(val_str)} chars):")
-                    append_block(val_str)
-
-            lines.append("")
-
-        return "\n".join(lines)
-
     @staticmethod
     def _fmt_time(seconds: float) -> str:
         m, s = divmod(int(seconds), 60)
@@ -362,7 +289,7 @@ class BenchmarkRunner:
         return stats
 
     def _build_summary_lines(
-        self, results: list[CaseResult], timestamp: str, *, terminal: bool
+        self, results: list[CaseResult], timestamp: str
     ) -> list[str]:
         lines: list[str] = []
         sep = "=" * 72
@@ -413,16 +340,12 @@ class BenchmarkRunner:
         if total_backoff > 0:
             pct = 100 * total_backoff / max(1, total_elapsed)
             lines.append(f"  Backoff wait: {self._fmt_time(total_backoff)} ({pct:.1f}% of total wall time)")
-        if not terminal:
-            lines.append("")
-            lines.append(sep)
-        else:
-            lines.append(sep)
+        lines.append(sep)
         return lines
 
     def _write_summary(self, results: list[CaseResult], run_dir: Path, timestamp: str):
         """Write summary.txt."""
-        lines = self._build_summary_lines(results, timestamp, terminal=False)
+        lines = self._build_summary_lines(results, timestamp)
         (run_dir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"\nOutput written to: {run_dir}")
 
@@ -437,5 +360,5 @@ class BenchmarkRunner:
 
     def _print_summary(self, results: list[CaseResult], timestamp: str):
         """Print summary to terminal."""
-        for line in self._build_summary_lines(results, timestamp, terminal=True):
+        for line in self._build_summary_lines(results, timestamp):
             print(line)

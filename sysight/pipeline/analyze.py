@@ -5,6 +5,9 @@
 3. LLM investigates with read-only nsys_sql/scanner/memory tools.
 4. Validate (deterministic): schema + path + dedup.
 5. Record run metadata and findings.
+6. Write output files to .sysight/analysis-runs/<run_id>/:
+   - debug.log  (turn-by-turn LLM I/O, always written)
+   - analyze_raw.json  (findings + context_stats, always written)
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from sysight.types.findings import LocalizedFinding, LocalizedFindingSet
 @dataclass
 class AnalyzeResult:
     run_id: str = ""
+    run_dir: Path | None = None          # .sysight/analysis-runs/<run_id>/
     finding_set: LocalizedFindingSet = field(default_factory=lambda: LocalizedFindingSet(run_id=""))
     errors: list[str] = field(default_factory=list)
     tool_calls: list[dict] = field(default_factory=list)
@@ -35,41 +39,55 @@ def run_analyze(
     provider,
     knowledge=None,
     run_id: str = "",
+    verbose: bool = False,
 ) -> AnalyzeResult:
-    """Analyze a profile and produce a LocalizedFindingSet."""
+    """Analyze a profile and produce a LocalizedFindingSet.
+
+    Always writes debug.log and analyze_raw.json to
+    .sysight/analysis-runs/<run_id>/.  Pass verbose=True to also echo
+    the LLM interaction to the terminal (stderr).
+    """
+    import hashlib
+    import json
+    import sys
     errors: list[str] = []
     root = Path(repo).resolve()
     sqlite_path = Path(profile).resolve()
     ns = knowledge.workspace_namespace(repo_root=str(root)) if knowledge else "default"
 
     if not run_id:
-        from datetime import datetime
-        run_id = f"run-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}"
+        # Stable short hash from profile path + repo path
+        digest = hashlib.sha1(
+            f"{sqlite_path}|{root}".encode()
+        ).hexdigest()[:8]
+        run_id = f"run-{digest}"
 
-    # 1. Build compact deterministic context. This is intentionally global
-    # profile information only: no pre-selected suspicious source candidates.
-    policy = _make_analyze_policy()
+    # Create output directory
+    run_dir = Path.cwd() / ".sysight" / "analysis-runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    global_brief, evidence_pack = _build_global_brief(sqlite_path, root, ns)
-    memory_refs = _build_memory_refs(root, knowledge, ns)
-    evidence_pack["memory_refs"] = memory_refs
-
-    # 2. Build prompt
-    from sysight.agent.prompts.loader import PromptLoader
-    loader = PromptLoader()
-    system_prompt = loader.build_system_prompt("analyze")
-    user_prompt = _build_analyze_user_prompt(
-        global_brief=global_brief,
-        memory_refs=memory_refs,
+    # 1. Build prompt bundle (shared with build_analyze_first_turn)
+    bundle = _build_analyze_bundle(
         sqlite_path=sqlite_path,
-        repo_root=root,
-        namespace=ns,
+        root=root,
+        ns=ns,
+        registry=registry,
+        knowledge=knowledge,
     )
+    evidence_pack = bundle["evidence_pack"]
+    system_prompt = bundle["system_prompt"]
+    user_prompt = bundle["user_prompt"]
+
+    # 2. Wrap provider with DebugProvider (always logs to file; verbose → stderr)
+    from sysight.benchmark.debug import DebugProvider
+    debug_log: list[dict] = []
+    log_file = str(run_dir / "debug.log")
+    wrapped = DebugProvider(provider, debug_log, verbose=verbose, log_file=log_file)
 
     # 3. Run AgentLoop
     from sysight.agent.loop import AgentLoop, AgentTask
-
-    loop = AgentLoop(provider, registry, policy)
+    policy = _make_analyze_policy()
+    loop = AgentLoop(wrapped, registry, policy)
     task = AgentTask(
         run_id=run_id, task_id=f"{run_id}-analyze",
         task_type="analyze",
@@ -79,15 +97,47 @@ def run_analyze(
 
     result = loop.run(task)
 
-    # 5. Parse output
+    # 4. Parse output
     finding_set = LocalizedFindingSet(run_id=run_id)
     if result.output:
         finding_set = _parse_finding_set(result.output, run_id)
 
-    # 6. Validate findings
+    # 5. Validate findings
     accepted, rejected = _validate_findings(finding_set.findings, root)
     finding_set.findings = accepted
     finding_set.rejected = rejected
+
+    # 6. Write analyze_raw.json
+    analyze_raw = {
+        "run_id": run_id,
+        "summary": finding_set.summary,
+        "findings": [
+            {
+                "finding_id": f.finding_id,
+                "category": f.category,
+                "title": f.title,
+                "priority": f.priority,
+                "file_path": f.file_path,
+                "function": f.function,
+                "line": f.line,
+                "confidence": f.confidence,
+                "evidence_refs": f.evidence_refs,
+                "description": f.description,
+                "suggestion": f.suggestion,
+                "status": f.status,
+                "reject_reason": f.reject_reason,
+            }
+            for f in (accepted + rejected)
+        ],
+        "rejected_count": len(rejected),
+        "errors": [],  # filled after ledger
+        "tool_calls": result.tool_calls,
+        "context_stats": result.context_stats,
+        "provider_error": result.provider_error,
+        "evidence_pack": evidence_pack,
+        "elapsed_ms": result.elapsed_ms,
+        "backoff_ms": result.backoff_ms,
+    }
 
     # 7. Record to ledger
     if knowledge:
@@ -110,9 +160,28 @@ def run_analyze(
             errors.append(f"ledger write failed: {e}")
 
     errors.extend(result.errors)
+    analyze_raw["errors"] = errors
+
+    (run_dir / "analyze_raw.json").write_text(
+        json.dumps(analyze_raw, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+    # ── Always print the output location so users can find logs ──
+    sep = "=" * 60
+    print(f"\n{sep}", file=sys.stderr)
+    print(f"  ANALYZE COMPLETE  run_id={run_id}", file=sys.stderr)
+    print(f"  Output dir : {run_dir}", file=sys.stderr)
+    print(f"  debug.log  : {run_dir / 'debug.log'}", file=sys.stderr)
+    print(f"  results    : {run_dir / 'analyze_raw.json'}", file=sys.stderr)
+    print(f"{sep}\n", file=sys.stderr)
+
     return AnalyzeResult(
-        run_id=run_id, finding_set=finding_set,
-        errors=errors, tool_calls=result.tool_calls,
+        run_id=run_id,
+        run_dir=run_dir,
+        finding_set=finding_set,
+        errors=errors,
+        tool_calls=result.tool_calls,
         context_stats=result.context_stats,
         provider_error=result.provider_error,
         evidence_pack=evidence_pack,
@@ -131,12 +200,48 @@ def build_analyze_first_turn(
     root = Path(repo).resolve()
     sqlite_path = Path(profile).resolve()
     ns = knowledge.workspace_namespace(repo_root=str(root)) if knowledge else "default"
+
+    bundle = _build_analyze_bundle(
+        sqlite_path=sqlite_path,
+        root=root,
+        ns=ns,
+        registry=registry,
+        knowledge=knowledge,
+    )
+    tools = registry.as_openai_tools(_make_analyze_policy()) if registry else []
+    return {
+        "system_prompt": bundle["system_prompt"],
+        "messages": [{"role": "user", "content": bundle["user_prompt"]}],
+        "tools": tools,
+        "evidence_pack": bundle["evidence_pack"],
+        "full_prompt": (
+            "[SYSTEM]\n"
+            f"{bundle['system_prompt']}\n\n"
+            "[USER]\n"
+            f"{bundle['user_prompt']}"
+        ),
+    }
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _build_analyze_bundle(
+    *,
+    sqlite_path: Path,
+    root: Path,
+    ns: str,
+    registry=None,
+    knowledge=None,
+) -> dict:
+    """Build the prompt bundle (system + user + evidence_pack) shared by
+    run_analyze and build_analyze_first_turn."""
     global_brief, evidence_pack = _build_global_brief(sqlite_path, root, ns)
     memory_refs = _build_memory_refs(root, knowledge, ns)
     evidence_pack["memory_refs"] = memory_refs
 
     from sysight.agent.prompts.loader import PromptLoader
-    system_prompt = PromptLoader().build_system_prompt("analyze")
+    loader = PromptLoader()
+    system_prompt = loader.build_system_prompt("analyze")
     user_prompt = _build_analyze_user_prompt(
         global_brief=global_brief,
         memory_refs=memory_refs,
@@ -144,18 +249,10 @@ def build_analyze_first_turn(
         repo_root=root,
         namespace=ns,
     )
-    tools = registry.as_openai_tools(_make_analyze_policy()) if registry else []
     return {
         "system_prompt": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
-        "tools": tools,
+        "user_prompt": user_prompt,
         "evidence_pack": evidence_pack,
-        "full_prompt": (
-            "[SYSTEM]\n"
-            f"{system_prompt}\n\n"
-            "[USER]\n"
-            f"{user_prompt}"
-        ),
     }
 
 
@@ -278,7 +375,7 @@ def _build_global_brief(
 
     lines.extend([
         "",
-        "## 瓶颈分布（wall/union 时间维度，近似）",
+        "## 时间分布（wall/union 时间维度，近似）",
         "| 类别 | 时长 | Wall % |",
         "|------|------:|-------:|",
         f"| gpu_idle | {_fmt_ms(gpu_idle_ns)} | {_fmt_pct(gpu_idle_ns, trace_ns)} |",
@@ -709,22 +806,13 @@ def _build_analyze_user_prompt(
                     workspace_path = p
                 break
 
-    parts = [
-        "以下是 profile 统计报告（已由 Sysight analyzer 生成）：",
-        "────────────────────────────────────────────────────────────────",
-        "  预注入 Profile 数据（已覆盖主要维度，无新疑问时无需重调 CLI）",
-        "────────────────────────────────────────────────────────────────",
-        global_brief,
-    ]
+    parts = [global_brief]
     if workspace_path:
         parts.append(f"workspace_path: {workspace_path}")
 
     parts.extend([
         _memory_refs_block(memory_refs, namespace),
-        "Task:",
-        "- 根据上面的 profile 总览和 system prompt 的调查指引，定位所有被证据支持的源码级性能问题。",
-        "- 必要时按需读取源码；需要查历史记录时按需使用 memory。",
-        "- 最终只输出符合 schema 的 JSON findings。",
+        "按 SOP 挖掘所有可优化点，只输出 JSON findings。",
     ])
 
     return "\n".join(part for part in parts if part)
@@ -877,4 +965,3 @@ def _validate_findings(
         accepted.append(f)
 
     return accepted, rejected
-
