@@ -65,6 +65,44 @@ class RunLedger:
                     scope TEXT, status TEXT DEFAULT 'new', title TEXT,
                     content_hash TEXT, created_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS wiki_chunks (
+                    id TEXT PRIMARY KEY,
+                    page_path TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    section_title TEXT,
+                    content TEXT NOT NULL,
+                    token_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(page_path, chunk_index)
+                );
+                CREATE TABLE IF NOT EXISTS wiki_links (
+                    id TEXT PRIMARY KEY,
+                    source_path TEXT NOT NULL,
+                    target_path TEXT NOT NULL,
+                    link_type TEXT NOT NULL CHECK (link_type IN ('links_to', 'cites')),
+                    stale_since TEXT,
+                    UNIQUE(source_path, target_path, link_type)
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
+                    content,
+                    section_title,
+                    content='wiki_chunks',
+                    content_rowid='rowid'
+                );
+                CREATE TRIGGER IF NOT EXISTS wiki_chunks_ai AFTER INSERT ON wiki_chunks BEGIN
+                    INSERT INTO wiki_fts(rowid, content, section_title)
+                    VALUES (new.rowid, new.content, new.section_title);
+                END;
+                CREATE TRIGGER IF NOT EXISTS wiki_chunks_ad AFTER DELETE ON wiki_chunks BEGIN
+                    INSERT INTO wiki_fts(wiki_fts, rowid, content, section_title)
+                    VALUES ('delete', old.rowid, old.content, old.section_title);
+                END;
+                CREATE TRIGGER IF NOT EXISTS wiki_chunks_au AFTER UPDATE ON wiki_chunks BEGIN
+                    INSERT INTO wiki_fts(wiki_fts, rowid, content, section_title)
+                    VALUES ('delete', old.rowid, old.content, old.section_title);
+                    INSERT INTO wiki_fts(rowid, content, section_title)
+                    VALUES (new.rowid, new.content, new.section_title);
+                END;
             """)
             conn.commit()
 

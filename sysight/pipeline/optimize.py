@@ -124,8 +124,8 @@ def run_optimize(
             try:
                 parsed = AgentLoop._extract_json(result.raw_content)
                 patches_data = parsed.get("patches", [])
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(f"patch parse error for {finding.finding_id}: {e}")
 
         if not patches_data:
             patch_result = PatchResult(

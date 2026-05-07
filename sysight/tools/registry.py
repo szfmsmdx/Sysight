@@ -31,6 +31,7 @@ class ToolPolicy:
     max_calls_per_task: int = 50
     max_wall_seconds: int = 600
     path_containment: dict[str, str] = field(default_factory=dict)
+    max_reads_per_file: int = 0   # 0 = disabled; >0 limits scanner_read per unique (repo, path)
 
 
 @dataclass
@@ -70,6 +71,22 @@ class ToolRegistry:
         self._call_counts[name] = self._call_counts.get(name, 0) + 1
         if self._call_counts[name] > tool.max_calls_per_task:
             return ToolResult(tool_name=name, status="policy_denied", error="Max calls exceeded")
+
+        # Per-unique-file read limit for scanner_read
+        if policy.max_reads_per_file > 0 and name == "scanner_read":
+            repo = args.get("repo", "")
+            path = args.get("path", "")
+            if repo and path:
+                key = f"_file:{repo}:{path}"
+                file_count = self._call_counts.get(key, 0) + 1
+                self._call_counts[key] = file_count
+                if file_count > policy.max_reads_per_file:
+                    return ToolResult(
+                        tool_name=name, status="policy_denied",
+                        error=f"File '{path}' has been read {file_count} times already "
+                              f"(limit: {policy.max_reads_per_file}). Use information from "
+                              f"previous turns or produce final output.",
+                    )
 
         t0 = time.monotonic()
         try:
@@ -128,6 +145,6 @@ OPTIMIZE_POLICY = ToolPolicy(
 )
 
 LEARN_POLICY = ToolPolicy(
-    allowed_tools={"memory_search", "memory_read"},
-    read_only=True,
+    allowed_tools={"memory_search", "memory_read", "memory_write", "memory_append", "memory_replace"},
+    read_only=False,
 )

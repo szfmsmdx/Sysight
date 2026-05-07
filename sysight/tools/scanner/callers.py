@@ -157,3 +157,11 @@ CALLERS_TOOL = ToolDef(
     fn=find_callsites,
     read_only=True,
 )
+
+CALLSITES_TOOL = ToolDef(
+    name="scanner_callsites",
+    description="Find all call-sites of a symbol across the repo (alias of scanner_callers)",
+    parameters=CALLERS_TOOL.parameters,
+    fn=find_callsites,
+    read_only=True,
+)

@@ -13,6 +13,7 @@ def register_nsys_sql_tools(registry) -> None:
     from sysight.tools.nsys_sql.overlap import OVERLAP_TOOL
     from sysight.tools.nsys_sql.gaps import GAPS_TOOL
     from sysight.tools.nsys_sql.launch import LAUNCH_TOOL
+    from sysight.tools.nsys_sql.nvtx import NVTX_TOOL
 
     registry.register(KERNELS_TOOL)
     registry.register(SYNC_TOOL)
@@ -21,3 +22,4 @@ def register_nsys_sql_tools(registry) -> None:
     registry.register(OVERLAP_TOOL)
     registry.register(GAPS_TOOL)
     registry.register(LAUNCH_TOOL)
+    registry.register(NVTX_TOOL)

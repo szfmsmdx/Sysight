@@ -16,7 +16,7 @@ class TestScannerToolsRegistration(unittest.TestCase):
     def test_all_tools_registered(self):
         expected = {
             "scanner_files", "scanner_search", "scanner_read",
-            "scanner_callers", "scanner_symbols", "scanner_symbol_callers",
+            "scanner_callers", "scanner_callsites", "scanner_symbols", "scanner_symbol_callers",
             "scanner_callees", "scanner_trace", "scanner_variants",
         }
         registered = {t.name for t in self.reg.list_read_only()}
@@ -30,7 +30,7 @@ class TestScannerToolsRegistration(unittest.TestCase):
     def test_policy_allows_scanner_wildcard(self):
         policy = ToolPolicy(allowed_tools={"scanner_*"}, read_only=True)
         tools = self.reg.list_for_policy(policy)
-        self.assertEqual(len(tools), 9)
+        self.assertEqual(len(tools), 10)
 
 
 class TestScannerFiles(unittest.TestCase):

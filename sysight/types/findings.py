@@ -36,22 +36,10 @@ class LocalizedFinding:
 
 
 @dataclass
-class MemoryUpdate:
-    """A suggested update to workspace or experience wiki."""
-    path: str                            # e.g. "workspaces/<ns>/overview.md"
-    content: str
-    action: Literal["append", "replace", "upsert"] = "append"
-    category: str | None = None          # for signal pages: C1-C7
-    scope: Literal["workspace", "global", "benchmark"] = "workspace"
-    reason: str = ""
-
-
-@dataclass
 class LocalizedFindingSet:
     """The output of the ANALYZE stage."""
     run_id: str
     summary: str = ""
     findings: list[LocalizedFinding] = field(default_factory=list)
     rejected: list[LocalizedFinding] = field(default_factory=list)
-    memory_updates: list[MemoryUpdate] = field(default_factory=list)
     parse_error: str = ""

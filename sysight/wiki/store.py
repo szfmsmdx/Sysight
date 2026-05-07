@@ -10,6 +10,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sysight.wiki.index import FTSIndex
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -33,8 +37,9 @@ _CATEGORY_SIGNAL_MAP: dict[str, str] = {
 class WikiRepository:
     """CRUD operations on the Sysight wiki store. Parent-only writes."""
 
-    def __init__(self, root: str | Path | None = None):
+    def __init__(self, root: str | Path | None = None, index: FTSIndex | None = None):
         self._root = Path(root).resolve() if root else (Path.cwd() / ".sysight" / "memory").resolve()
+        self._index = index
 
     @property
     def root(self) -> Path:
@@ -59,6 +64,30 @@ class WikiRepository:
             self._update_index()
         if category and category in _CATEGORY_SIGNAL_MAP:
             self._update_signal(category, path, title)
+        if self._index:
+            self._sync_index(path, content)
+        return target
+
+    def append_page(self, path: str, content: str) -> Path:
+        """Append raw markdown to a wiki page, creating it if needed."""
+        target = self._resolve_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "\n" if target.exists() and target.stat().st_size else ""
+        with target.open("a", encoding="utf-8") as f:
+            f.write(prefix + content.rstrip() + "\n")
+        self._update_index()
+        return target
+
+    def replace_in_page(self, path: str, old: str, new: str, count: int = 1) -> Path:
+        """Replace text inside a wiki page."""
+        target = self._resolve_path(path)
+        if not target.exists():
+            raise FileNotFoundError(path)
+        text = target.read_text(encoding="utf-8")
+        if old not in text:
+            raise ValueError("old text not found")
+        target.write_text(text.replace(old, new, count if count > 0 else -1), encoding="utf-8")
+        self._update_index()
         return target
 
     def append_worklog(self, namespace: str, entry: str) -> Path:
@@ -95,11 +124,42 @@ class WikiRepository:
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
+    def _sync_index(self, path: str, content: str) -> None:
+        """Update SQLite FTS index and reference links for a page."""
+        from contextlib import closing
+        from sysight.wiki.references import parse_references, propagate_staleness
+
+        assert self._index is not None
+        self._index.chunk_page(path, content)
+
+        links, citations = parse_references(content)
+        with closing(self._index._connect()) as conn:
+            conn.execute("DELETE FROM wiki_links WHERE source_path = ?", (path,))
+            for target in links:
+                conn.execute(
+                    "INSERT OR IGNORE INTO wiki_links (id, source_path, target_path, link_type) "
+                    "VALUES (?, ?, ?, 'links_to')",
+                    (f"{path}->{target}:links_to", path, target),
+                )
+            for target in citations:
+                conn.execute(
+                    "INSERT OR IGNORE INTO wiki_links (id, source_path, target_path, link_type) "
+                    "VALUES (?, ?, ?, 'cites')",
+                    (f"{path}->{target}:cites", path, target),
+                )
+            conn.commit()
+
+        with closing(self._index._connect()) as conn:
+            propagate_staleness(conn, path)
+
     def _resolve_path(self, path: str) -> Path:
-        path = _ALIAS_TO_FILE.get(path, path)
-        if not path.startswith("wiki/"):
-            path = "wiki/" + path
-        target = (self._root / path).resolve()
+        alias = _ALIAS_TO_FILE.get(path)
+        if alias:
+            target = (self._root / alias).resolve()
+        else:
+            if not path.startswith("wiki/"):
+                path = "wiki/" + path
+            target = (self._root / path).resolve()
         if not str(target).startswith(str(self._root)):
             raise ValueError(f"Path {path!r} escapes memory root")
         return target

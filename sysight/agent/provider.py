@@ -33,6 +33,8 @@ class LLMConfig:
     base_url: str | None = None           # None = provider default
     temperature: float = 0
     max_tokens: int | None = None    # None = no limit / use API default
+    reasoning_effort: str | None = None
+    thinking: dict | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> LLMConfig:
@@ -43,6 +45,8 @@ class LLMConfig:
             base_url=d.get("base_url"),
             temperature=d.get("temperature", 0),
             max_tokens=d.get("max_tokens", 4096),
+            reasoning_effort=d.get("reasoning_effort"),
+            thinking=d.get("thinking"),
         )
 
     def resolve_api_key(self) -> str:
@@ -59,6 +63,8 @@ class LLMRequest:
     messages: list[dict] = field(default_factory=list)
     tools: list[dict] | None = None
     response_schema: dict | None = None
+    debug_messages: list[dict] | None = None
+    context_stats: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -77,6 +83,33 @@ class UsageInfo:
 
 
 @dataclass
+class LLMErrorInfo:
+    """Structured provider error details for debugging and benchmark reports."""
+    provider: str = ""
+    status_code: int | None = None
+    code: str = ""
+    message: str = ""
+    type: str = ""
+    param: str | None = None
+    retryable: bool = False
+    request_id: str = ""
+    raw_redacted: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "provider": self.provider,
+            "status_code": self.status_code,
+            "code": self.code,
+            "message": self.message,
+            "type": self.type,
+            "param": self.param,
+            "retryable": self.retryable,
+            "request_id": self.request_id,
+            "raw_redacted": self.raw_redacted,
+        }
+
+
+@dataclass
 class LLMResponse:
     """A single completion response."""
     content: str = ""
@@ -84,6 +117,7 @@ class LLMResponse:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     usage: UsageInfo | None = None
     finish_reason: str = ""
+    error: LLMErrorInfo | None = None
     extra: dict = field(default_factory=dict)  # provider-specific fields (e.g. reasoning_content)
 
 

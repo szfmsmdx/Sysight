@@ -37,6 +37,8 @@ def main(argv: list[str] | None = None):
     p = sub.add_parser("analyze", help="Analyze an Nsight Systems profile")
     p.add_argument("profile", help="Path to .sqlite profile")
     p.add_argument("--repo", required=True, help="Path to repo root")
+    p.add_argument("--dump-prompt", help="Write the first-turn analyze prompt bundle to this file or directory")
+    p.add_argument("--no-run", action="store_true", help="Only build/dump the first-turn prompt; do not call the LLM")
 
     # optimize
     p = sub.add_parser("optimize", help="Optimize findings from an analysis")
@@ -56,6 +58,7 @@ def main(argv: list[str] | None = None):
     p = sub.add_parser("tool", help="Execute a single tool directly")
     p.add_argument("category", help="Tool category: scanner, nsys_sql, memory")
     p.add_argument("name", help="Tool name")
+    p.add_argument("--write", action="store_true", help="Allow non-read-only tools such as memory_write")
     p.add_argument("args", nargs="*", help="Tool arguments as key=value pairs")
 
     args = parser.parse_args(argv)
@@ -89,7 +92,10 @@ def _setup():
     registry = ToolRegistry()
     register_all_tools(registry)
 
-    configs = load_config()
+    try:
+        configs = load_config()
+    except FileNotFoundError:
+        configs = {}
 
     def provider_factory(stage: str):
         cfg = configs.get(stage)
@@ -104,23 +110,29 @@ def _setup():
 def _cmd_warmup(args):
     registry, provider_factory, knowledge = _setup()
     provider = provider_factory("warmup")
-    if not provider:
-        print("Error: no warmup provider configured", file=sys.stderr)
-        sys.exit(1)
 
     from sysight.pipeline.warmup import run_warmup
     result = run_warmup(args.repo, registry, provider, knowledge)
-    print(json.dumps({
-        "repo": result.repo,
-        "entry_point": result.repo_setup.entry_point,
-        "metric_grep": result.repo_setup.metric_grep,
-        "source": result.repo_setup.source,
-        "errors": result.errors,
-    }, indent=2, ensure_ascii=False))
+    print(json.dumps(result.summary, indent=2, ensure_ascii=False))
 
 
 def _cmd_analyze(args):
     registry, provider_factory, knowledge = _setup()
+    if args.dump_prompt or args.no_run:
+        from sysight.pipeline.analyze import build_analyze_first_turn
+        bundle = build_analyze_first_turn(args.profile, args.repo, registry, knowledge)
+        if args.dump_prompt:
+            _write_prompt_dump(args.dump_prompt, bundle)
+        if args.no_run:
+            print(json.dumps({
+                "status": "prompt_built",
+                "dump_prompt": args.dump_prompt,
+                "system_chars": len(bundle["system_prompt"]),
+                "user_chars": len(bundle["messages"][0]["content"]),
+                "tools": len(bundle.get("tools") or []),
+            }, indent=2, ensure_ascii=False))
+            return
+
     provider = provider_factory("analyze")
     if not provider:
         print("Error: no analyze provider configured", file=sys.stderr)
@@ -152,6 +164,23 @@ def _cmd_analyze(args):
         "elapsed_ms": result.elapsed_ms,
     }
     print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+def _write_prompt_dump(target: str, bundle: dict) -> None:
+    path = Path(target)
+    if path.suffix:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(bundle, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        return
+
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "system_prompt.txt").write_text(bundle["system_prompt"], encoding="utf-8")
+    (path / "user_prompt.txt").write_text(bundle["messages"][0]["content"], encoding="utf-8")
+    (path / "full_prompt.txt").write_text(bundle["full_prompt"], encoding="utf-8")
+    (path / "first_turn.json").write_text(
+        json.dumps(bundle, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
 
 
 def _cmd_optimize(args):
@@ -233,12 +262,16 @@ def _cmd_tool(args):
     for a in args.args:
         if "=" in a:
             k, v = a.split("=", 1)
+            if v == "-":
+                v = sys.stdin.read()
+            elif v.startswith("@"):
+                v = Path(v[1:]).read_text(encoding="utf-8")
             tool_args[k] = v
         else:
             tool_args[a] = True
 
     from sysight.tools.registry import ToolPolicy
-    policy = ToolPolicy(allowed_tools={f"{args.category}_*"}, read_only=True)
+    policy = ToolPolicy(allowed_tools={f"{args.category}_*"}, read_only=not args.write)
     result = registry.execute(tool_name, tool_args, policy)
 
     if result.status == "ok" and result.data is not None:

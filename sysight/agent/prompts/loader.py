@@ -25,40 +25,28 @@ class PromptLoader:
     ) -> str:
         """Assemble system prompt from fragments.
 
-        task_type: "analyze" | "optimize" | "learn"
-
-        Production prompt includes:
-          - common_role (always)
-          - evidence_sop (analyze) or optimizer_sop (optimize)
-          - output_schema (localized or patch)
-          - safety_read_only (analyze only)
-
-        Production prompt excludes:
-          - benchmark_hints (unless include_benchmark_hints=True)
+        task_type: "analyze" → analyze_system.md (role + SOP + schema)
+                   "optimize" → optimizer_sop + output_schema_patch
+                   "learn"     → learn_system.md (wiki knowledge extraction)
         """
-        fragments: list[str] = []
-
-        # Common role — always included
-        fragments.append(self._load("common_role"))
-
-        # Task-specific SOP
         if task_type == "analyze":
-            fragments.append(self._load("evidence_sop"))
-            fragments.append(self._load("output_schema_localized"))
-            fragments.append(self._load("safety_read_only"))
-        elif task_type == "optimize":
-            fragments.append(self._load("optimizer_sop"))
-            fragments.append(self._load("output_schema_patch"))
+            content = self._load("analyze_system")
         elif task_type == "learn":
-            fragments.append(self._load("evidence_sop"))  # for reflection on findings
+            content = self._load("learn_system")
+        elif task_type == "optimize":
+            content = "\n\n".join([
+                self._load("optimizer_sop"),
+                self._load("output_schema_patch"),
+            ])
+        else:
+            content = ""
 
-        # Benchmark hints — only when explicitly enabled
         if include_benchmark_hints:
             hints = self._load("benchmark_hints")
             if hints:
-                fragments.append(hints)
+                content = content + "\n\n" + hints if content else hints
 
-        return "\n\n".join(f.strip() for f in fragments if f.strip())
+        return content.strip()
 
     def build_user_prompt(
         self,
@@ -73,13 +61,13 @@ class PromptLoader:
         parts: list[str] = []
 
         if task_type == "analyze":
-            parts.append("请分析以下 Nsight Systems profile 的性能瓶颈。")
+            parts.append("以下是 profile 统计报告（已由 Sysight analyzer 生成）：")
             if profile_summary:
-                parts.append(f"## Profile Summary\n\n{profile_summary}")
+                parts.append(profile_summary)
             if pre_injected_sql:
-                parts.append(f"## Pre-Injected SQL Results\n\n{pre_injected_sql}")
+                parts.append(f"\n────────────────────────────────────────────────────────────────\n  预注入 Profile 数据（已覆盖主要维度，无新疑问时无需重调 CLI）\n────────────────────────────────────────────────────────────────\n\n{pre_injected_sql}")
             if memory_brief:
-                parts.append(f"## Memory Context\n\n{memory_brief}")
+                parts.append(f"\n## Memory Context\n\n{memory_brief}")
             parts.append("请输出 LocalizedFindingSet JSON。")
 
         elif task_type == "optimize":
@@ -91,9 +79,11 @@ class PromptLoader:
             parts.append("请输出 PatchCandidate JSON 数组。")
 
         elif task_type == "learn":
-            parts.append("请根据以下 session 结果生成经验总结。")
+            parts.append("请根据以下分析结果更新 wiki 知识。")
             if findings_json:
-                parts.append(f"## Session Results\n\n{findings_json}")
+                parts.append(f"## 分析结果\n\n{findings_json}")
+            if memory_brief:
+                parts.append(f"## 当前 Memory 线索\n\n{memory_brief}")
 
         return "\n\n".join(parts)
 

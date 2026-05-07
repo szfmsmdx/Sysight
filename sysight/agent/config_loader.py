@@ -105,6 +105,8 @@ def load_config(path: str | Path | None = None) -> dict[str, LLMConfig]:
                 base_url=d.get("base_url"),
                 temperature=d.get("temperature", 0),
                 max_tokens=d.get("max_tokens", 4096),
+                reasoning_effort=d.get("reasoning_effort"),
+                thinking=d.get("thinking"),
             )
 
     return configs

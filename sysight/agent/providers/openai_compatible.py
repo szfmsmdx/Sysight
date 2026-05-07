@@ -11,11 +11,13 @@ Configure via LLMConfig:
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 
 from sysight.agent.provider import (
     LLMConfig,
+    LLMErrorInfo,
     LLMRequest,
     LLMResponse,
     ToolCallRequest,
@@ -57,8 +59,16 @@ class OpenAICompatibleProvider:
         body: dict = {
             "model": self._config.model,
             "messages": self._build_messages(request),
-            "temperature": self._config.temperature,
         }
+        thinking = self._config.thinking
+        if thinking is not None:
+            body["thinking"] = thinking
+        if not _thinking_enabled(thinking):
+            body["temperature"] = self._config.temperature
+
+        reasoning_effort = self._config.reasoning_effort
+        if reasoning_effort:
+            body["reasoning_effort"] = reasoning_effort
 
         if self._config.max_tokens and self._config.max_tokens > 0:
             body["max_tokens"] = self._config.max_tokens
@@ -90,15 +100,47 @@ class OpenAICompatibleProvider:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")
+            finally:
+                e.close()
+            error = _build_error_info(
+                provider=self.name,
+                status_code=e.code,
+                body=error_body,
+                request_id=e.headers.get("x-request-id", "") if e.headers else "",
+            )
             return LLMResponse(
                 content="",
                 finish_reason="error",
+                error=error,
+                extra={"http_error": f"{e.code}: {_redact_error(error_body)[:1000]}"},
             )
         except (urllib.error.URLError, OSError) as e:
+            error = LLMErrorInfo(
+                provider=self.name,
+                message=_redact_error(str(e))[:1000],
+                type=e.__class__.__name__,
+                retryable=True,
+            )
             return LLMResponse(
                 content="",
                 finish_reason="error",
+                error=error,
+                extra={"http_error": _redact_error(str(e))[:1000]},
+            )
+        except Exception as e:
+            error = LLMErrorInfo(
+                provider=self.name,
+                message=_redact_error(str(e))[:1000],
+                type=e.__class__.__name__,
+                retryable=True,
+            )
+            return LLMResponse(
+                content="",
+                finish_reason="error",
+                error=error,
+                extra={"http_error": f"{e.__class__.__name__}: {_redact_error(str(e))[:1000]}"},
             )
 
         return self._parse_response(data)
@@ -154,3 +196,57 @@ class OpenAICompatibleProvider:
             finish_reason=finish_reason,
             extra=extra,
         )
+
+
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)([^\"'\s,}]+)")
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|token|secret|password|passwd|credential)\b"
+    r"\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,}]+)"
+)
+
+
+def _redact_error(text: str) -> str:
+    text = _BEARER_RE.sub(r"\1<REDACTED>", text)
+    return _SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=<REDACTED>", text)
+
+
+def _thinking_enabled(thinking: object) -> bool:
+    return isinstance(thinking, dict) and str(thinking.get("type", "")).lower() == "enabled"
+
+
+def _build_error_info(
+    *,
+    provider: str,
+    status_code: int,
+    body: str,
+    request_id: str = "",
+) -> LLMErrorInfo:
+    redacted = _redact_error(body)[:4000]
+    parsed = _parse_error_payload(body)
+    return LLMErrorInfo(
+        provider=provider,
+        status_code=status_code,
+        code=str(parsed.get("code") or ""),
+        message=_redact_error(str(parsed.get("message") or redacted[:1000]))[:1000],
+        type=str(parsed.get("type") or "HTTPError"),
+        param=parsed.get("param"),
+        retryable=_is_retryable_status(status_code),
+        request_id=request_id,
+        raw_redacted=redacted,
+    )
+
+
+def _parse_error_payload(body: str) -> dict:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return err
+    return {}
+
+
+def _is_retryable_status(status_code: int | None) -> bool:
+    return status_code in {408, 409, 429, 500, 502, 503, 504}

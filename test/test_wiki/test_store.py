@@ -30,6 +30,14 @@ class TestWikiRepository(unittest.TestCase):
     def test_read_nonexistent(self):
         self.assertIsNone(self.repo.read_page("nonexistent.md"))
 
+    def test_read_root_memory_aliases(self):
+        (self.root / "workspace.md").parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "workspace.md").write_text("# Workspace\n", encoding="utf-8")
+        (self.root / "experience.md").write_text("# Experience\n", encoding="utf-8")
+
+        self.assertIn("# Workspace", self.repo.read_page("workspace"))
+        self.assertIn("# Experience", self.repo.read_page("experience"))
+
     def test_write_page_creates_parent_dirs(self):
         self.repo.write_page("wiki/deep/nested/page.md", "content", title="Deep")
         self.assertTrue((self.root / "wiki" / "deep" / "nested" / "page.md").exists())

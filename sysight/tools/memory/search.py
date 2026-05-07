@@ -1,11 +1,9 @@
-"""memory_search — Search the knowledge wiki via FTS.
-
-TODO: Stage 3 — wire up to knowledge/index.py FTS index.
-"""
+"""memory_search — Search the knowledge wiki via FTS."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from sysight.tools.registry import ToolDef
 
@@ -15,6 +13,7 @@ class MemorySearchMatch:
     path: str
     title: str = ""
     snippet: str = ""
+    section_title: str = ""
     score: float = 0.0
 
 
@@ -25,9 +24,37 @@ class MemorySearchResult:
     matches: list[MemorySearchMatch] = field(default_factory=list)
 
 
+_index: object | None = None
+
+
+def _get_index() -> object:
+    global _index
+    if _index is None:
+        from sysight.wiki.index import FTSIndex
+        db_path = Path.cwd() / ".sysight" / "runs" / "runs.sqlite"
+        wiki_dir = Path.cwd() / ".sysight" / "memory" / "wiki"
+        _index = FTSIndex(db_path, wiki_dir)
+    return _index
+
+
 def search(query: str, namespace: str | None = None, limit: int = 10) -> MemorySearchResult:
     """Search the knowledge wiki for relevant pages."""
-    raise NotImplementedError("TODO: Stage 3 — wire to knowledge FTS")
+    from sysight.wiki.index import FTSIndex
+    index: FTSIndex = _get_index()  # type: ignore[assignment]
+    results = index.search(query, namespace=namespace, limit=limit)
+    return MemorySearchResult(
+        query=query,
+        total=len(results),
+        matches=[
+            MemorySearchMatch(
+                path=r.path,
+                snippet=r.snippet,
+                section_title=r.section_title,
+                score=r.score,
+            )
+            for r in results
+        ],
+    )
 
 
 SEARCH_TOOL = ToolDef(

@@ -5,15 +5,21 @@ import unittest
 from pathlib import Path
 
 from sysight.wiki.index import FTSIndex
+from sysight.wiki.ledger import RunLedger
 
 
 class TestFTSIndex(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / "runs.sqlite"
         self.wiki_dir = Path(self.tmp.name) / "wiki"
         self.wiki_dir.mkdir(parents=True)
         (self.wiki_dir / "experiences").mkdir()
         (self.wiki_dir / "workspaces" / "ns1").mkdir(parents=True)
+
+        # Init schema
+        ledger = RunLedger(self.db_path)
+        ledger.init()
 
         # Write test pages
         (self.wiki_dir / "workspaces" / "ns1" / "overview.md").write_text(
@@ -28,7 +34,8 @@ class TestFTSIndex(unittest.TestCase):
             "---\ntitle: NCCL Fusion\ncategory: C6\n---\n"
             "## Pattern\nMany small all-reduce operations\n"
         )
-        self.index = FTSIndex(self.wiki_dir)
+        self.index = FTSIndex(self.db_path, self.wiki_dir)
+        self.index.rebuild()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -36,13 +43,13 @@ class TestFTSIndex(unittest.TestCase):
     def test_search_finds_experience(self):
         results = self.index.search("D2H")
         self.assertGreaterEqual(len(results), 1)
-        self.assertIn("D2H", results[0].title)
+        self.assertIn("D2H", results[0].snippet)
 
     def test_search_finds_multiple(self):
-        # D2H appears in both the title and body of d2h-sync.md
+        # "D2H" appears in both the Trigger section header context
         results = self.index.search("D2H")
         self.assertEqual(len(results), 1)
-        self.assertIn("D2H", results[0].title)
+        self.assertEqual(results[0].section_title, "Trigger")
 
     def test_search_no_match(self):
         results = self.index.search("nonexistent_xyz")
@@ -51,14 +58,14 @@ class TestFTSIndex(unittest.TestCase):
     def test_search_with_namespace(self):
         results = self.index.search("train", namespace="ns1")
         self.assertGreaterEqual(len(results), 1)
-        self.assertIn("Overview", results[0].title)
+        self.assertIn("overview", results[0].path)
 
     def test_search_scores_are_sorted(self):
         (self.wiki_dir / "experiences" / "gpu.md").write_text(
             "---\ntitle: GPU Tips\n---\nGPU GPU GPU GPU GPU\n"
         )
-        # Create a new index that picks up the new file
-        index2 = FTSIndex(self.wiki_dir)
+        index2 = FTSIndex(self.db_path, self.wiki_dir)
+        index2.rebuild()
         results = index2.search("GPU")
         self.assertGreaterEqual(len(results), 1)
         if len(results) >= 2:

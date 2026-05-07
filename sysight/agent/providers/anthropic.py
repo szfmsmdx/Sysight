@@ -7,11 +7,13 @@ Docs: https://docs.anthropic.com/en/api/messages
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 
 from sysight.agent.provider import (
     LLMConfig,
+    LLMErrorInfo,
     LLMRequest,
     LLMResponse,
     ToolCallRequest,
@@ -29,6 +31,7 @@ class AnthropicProvider:
         self._config = config
         self._api_key = config.resolve_api_key()
         self._base_url = config.base_url or self._DEFAULT_BASE_URL
+        self._cache_initialized = False
 
     @property
     def name(self) -> str:
@@ -38,12 +41,18 @@ class AnthropicProvider:
     def model(self) -> str:
         return self._config.model
 
+    def reset_cache(self) -> None:
+        """Reset prompt cache state for a new independent session."""
+        self._cache_initialized = False
+
     def complete(self, request: LLMRequest) -> LLMResponse:
         """Send a message request to the Anthropic Messages API."""
         url = self._base_url.rstrip("/") + "/messages"
 
         # max_tokens is REQUIRED by Anthropic API
         max_tokens = self._config.max_tokens if self._config.max_tokens else 4096
+
+        is_first_request = not self._cache_initialized
 
         body: dict = {
             "model": self._config.model,
@@ -52,10 +61,19 @@ class AnthropicProvider:
         }
 
         if request.system_prompt:
-            body["system"] = request.system_prompt
+            if is_first_request:
+                body["system"] = [{
+                    "type": "text",
+                    "text": request.system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                body["system"] = request.system_prompt
 
         if request.tools:
             body["tools"] = self._convert_tools(request.tools)
+
+        self._cache_initialized = True
 
         headers = {
             "Content-Type": "application/json",
@@ -73,12 +91,39 @@ class AnthropicProvider:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")
+            finally:
+                e.close()
+            error = _build_error_info(
+                provider=self.name,
+                status_code=e.code,
+                body=error_body,
+                request_id=e.headers.get("request-id", "") if e.headers else "",
+            )
             return LLMResponse(content="", finish_reason="error",
-                               extra={"http_error": f"{e.code}: {error_body[:300]}"})
+                               error=error,
+                               extra={"http_error": f"{e.code}: {_redact_error(error_body)[:1000]}"})
         except (urllib.error.URLError, OSError) as e:
+            error = LLMErrorInfo(
+                provider=self.name,
+                message=_redact_error(str(e))[:1000],
+                type=e.__class__.__name__,
+                retryable=True,
+            )
             return LLMResponse(content="", finish_reason="error",
-                               extra={"http_error": str(e)[:300]})
+                               error=error,
+                               extra={"http_error": _redact_error(str(e))[:1000]})
+        except Exception as e:
+            error = LLMErrorInfo(
+                provider=self.name,
+                message=_redact_error(str(e))[:1000],
+                type=e.__class__.__name__,
+                retryable=True,
+            )
+            return LLMResponse(content="", finish_reason="error",
+                               error=error,
+                               extra={"http_error": f"{e.__class__.__name__}: {_redact_error(str(e))[:1000]}"})
 
         return self._parse_response(data)
 
@@ -186,3 +231,53 @@ class AnthropicProvider:
             finish_reason=finish_reason,
             extra={"raw_content_blocks": content_blocks},
         )
+
+
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)([^\"'\s,}]+)")
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|token|secret|password|passwd|credential)\b"
+    r"\s*[:=]\s*(\"[^\"]*\"|'[^']*'|[^\s,}]+)"
+)
+
+
+def _redact_error(text: str) -> str:
+    text = _BEARER_RE.sub(r"\1<REDACTED>", text)
+    return _SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=<REDACTED>", text)
+
+
+def _build_error_info(
+    *,
+    provider: str,
+    status_code: int,
+    body: str,
+    request_id: str = "",
+) -> LLMErrorInfo:
+    redacted = _redact_error(body)[:4000]
+    parsed = _parse_error_payload(body)
+    return LLMErrorInfo(
+        provider=provider,
+        status_code=status_code,
+        code=str(parsed.get("code") or ""),
+        message=_redact_error(str(parsed.get("message") or redacted[:1000]))[:1000],
+        type=str(parsed.get("type") or "HTTPError"),
+        param=parsed.get("param"),
+        retryable=_is_retryable_status(status_code),
+        request_id=request_id,
+        raw_redacted=redacted,
+    )
+
+
+def _parse_error_payload(body: str) -> dict:
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            return err
+    return {}
+
+
+def _is_retryable_status(status_code: int | None) -> bool:
+    return status_code in {408, 409, 429, 500, 502, 503, 504}
