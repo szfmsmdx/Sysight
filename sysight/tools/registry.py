@@ -134,6 +134,13 @@ class ToolRegistry:
 
 
 # Pre-built policies for each pipeline phase
+WARMUP_POLICY = ToolPolicy(
+    allowed_tools={"scanner_*", "shell_exec", "memory_search", "memory_read"},
+    read_only=False,
+    max_calls_per_task=30,
+    max_wall_seconds=300,
+)
+
 ANALYZE_POLICY = ToolPolicy(
     allowed_tools={"scanner_*", "nsys_sql_*", "memory_search", "memory_read", "classify"},
     read_only=True,

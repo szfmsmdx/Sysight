@@ -93,14 +93,32 @@ class WarmupFacts:
     constraints: list[str] = field(default_factory=list)
 
 
+def _warmup_cache_path(root: Path) -> Path:
+    """Cache path for a repo's warmup result (in Sysight's own .sysight dir)."""
+    import hashlib
+    repo_hash = hashlib.sha1(str(root.resolve()).encode(), usedforsecurity=False).hexdigest()[:12]
+    cache_dir = Path.cwd() / ".sysight" / "warmup-caches"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{repo_hash}.json"
+
+
 def run_warmup(
     repo: str,
     registry,
-    provider,
     knowledge=None,
+    *,
+    force: bool = False,
 ) -> WarmupResult:
-    """Explore a repo and produce developer-facing warmup facts."""
-    del registry, provider  # warmup is deterministic in this iteration.
+    """Explore a repo and produce developer-facing warmup facts.
+
+    Phase 1 (deterministic): inventory, facts, import tracing.
+    Phase 2 (targeted instrumentation) has been moved to the INSTRUMENT stage,
+    which runs AFTER analyze and uses findings to drive NVTX tagging.
+
+    Results are cached to ``.sysight/warmup-caches/<hash>.json`` so that
+    subsequent calls can skip warmup entirely.  Pass ``force=True`` to
+    re-run even if a valid cache exists.
+    """
 
     root = Path(repo).resolve()
     errors: list[str] = []
@@ -111,9 +129,32 @@ def run_warmup(
         errors.append(f"repo 不是目录: {root}")
         return WarmupResult(repo=str(root), repo_setup=repo_setup, errors=errors)
 
+    # ── Cache check ──
+    cache_path = _warmup_cache_path(root)
+    if not force:
+        cached = RepoSetup.load_cache(cache_path)
+        if cached and cached.is_fresh():
+            print(f"  [warmup] cache hit: {cache_path} (verified at {cached.verified_at})")
+            return WarmupResult(
+                repo=str(root),
+                repo_setup=cached,
+                errors=[],
+                warnings=["loaded from warmup cache"],
+                overview_path="",
+                summary={"source": "warmup_cache", "cached_at": cached.verified_at},
+            )
+
+    # ── Phase 1: Deterministic ──
     inventory = _build_inventory(root)
     facts = _collect_facts(root, inventory, warnings)
     _populate_repo_setup(root, repo_setup, facts, warnings, errors)
+
+    # ── Persist cache ──
+    try:
+        repo_setup.save_cache(cache_path)
+        print(f"  [warmup] cache saved: {cache_path}")
+    except Exception as e:
+        warnings.append(f"warmup cache save failed: {e}")
 
     overview_path = ""
     if knowledge:
@@ -907,6 +948,7 @@ def _populate_repo_setup(root: Path, repo_setup: RepoSetup, facts: WarmupFacts,
     repo_setup.build_commands = _build_commands(root)
     repo_setup.test_commands = _test_commands(root)
     repo_setup.constraints = facts.constraints[:]
+    repo_setup.profile_sqlite = facts.profile_sqlite  # from Phase 1; Phase 2 may override
 
     if facts.workload in {"training", "distributed training"}:
         repo_setup.metric_grep = r"iter/s|step/s|throughput|loss"
@@ -1004,7 +1046,7 @@ def _build_summary(root: Path, inventory: Inventory, facts: WarmupFacts, repo_se
         "profile_command": facts.profile_command,
         "active_config": facts.active_config,
         "active_variants": facts.active_variants,
-        "profile_sqlite": facts.profile_sqlite,
+        "profile_sqlite": repo_setup.profile_sqlite,
         "hot_path_count": len(facts.hot_path_files),
         "ignored_counts": dict(sorted(inventory.ignored_counts.items())),
         "warnings": warnings,

@@ -74,7 +74,7 @@ run:
         self._write("profiles/case_1.sqlite", "")
         self._write("external/pkg/site-packages/dep/tests/test_dep.py", "import pytest\n")
 
-        result = run_warmup(str(self.root), None, None, self.memory)
+        result = run_warmup(str(self.root), None, self.memory)
 
         self.assertEqual(result.repo_setup.source, "warmup_verified")
         self.assertEqual(result.repo_setup.entry_point, "python run.py --config configs/config_v2.yaml")
@@ -117,7 +117,7 @@ cd trainer.runfiles/autocar
         self._write("trainer.runfiles/autocar/common/python/train/config/config.yaml", "train:\n  batch_size_per_gpu: 184\n  use_compile: true\n")
         self._write("trainer.runfiles/python311_x86_64_deps_tensorboard/site-packages/tensorboard/__init__.py", "")
 
-        result = run_warmup(str(self.root), None, None, self.memory)
+        result = run_warmup(str(self.root), None, self.memory)
 
         self.assertEqual(result.repo_setup.source, "warmup_verified")
         self.assertEqual(result.repo_setup.entry_point, "bash start.sh")
@@ -136,7 +136,7 @@ cd trainer.runfiles/autocar
     def test_generic_run_py_fallback(self):
         self._write("run.py", "if __name__ == '__main__':\n    print('hi')\n")
 
-        result = run_warmup(str(self.root), None, None, self.memory)
+        result = run_warmup(str(self.root), None, self.memory)
 
         self.assertEqual(result.repo_setup.entry_point, "python run.py")
         self.assertEqual(result.repo_setup.source, "warmup_verified")
@@ -146,7 +146,7 @@ cd trainer.runfiles/autocar
         self._write("run.py", "if __name__ == '__main__':\n    pass\n")
         self._write("scripts/start.sh", "python run.py --config configs/missing.yaml\n")
 
-        result = run_warmup(str(self.root), None, None, self.memory)
+        result = run_warmup(str(self.root), None, self.memory)
 
         self.assertEqual(result.repo_setup.source, "warmup_partial")
         self.assertIn("active config 无法验证", result.warnings)
