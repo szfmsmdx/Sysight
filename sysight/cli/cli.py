@@ -52,6 +52,7 @@ def main(argv: list[str] | None = None):
     p = sub.add_parser("optimize", help="Optimize findings from an analysis")
     p.add_argument("run_id", help="Analyze run_id (or path to analyze_raw.json)")
     p.add_argument("--repo", required=True, help="Path to repo root")
+    p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal (always logged to optimize_debug.log)")
 
     # learn
     p = sub.add_parser("learn", help="Post-session learning")
@@ -139,7 +140,7 @@ def _cmd_warmup(args):
         for e in errs:
             print(f"  ✗ {e}")
 
-    print(f"\n  Cache: .sysight/warmup-caches/<hash>.json")
+    print(f"\n  Cache: {result.summary.get('cache_path', '')}")
     print(f"  Overview: {result.summary.get('overview_path', '')}")
 
 
@@ -208,6 +209,7 @@ def _load_findings(run_id_or_path: str):
                 title=f.get("title", ""),
                 priority=f.get("priority", "medium"),
                 confidence=f.get("confidence", "unresolved"),
+                metric=f.get("metric", ""),
                 file_path=f.get("file_path"),
                 function=f.get("function"),
                 line=f.get("line"),
@@ -233,40 +235,35 @@ def _cmd_instrument(args):
     run_dir = raw_path.parent  # .sysight/analysis-runs/<run_id>/
 
     from sysight.pipeline.instrument import run_instrument
-    from sysight.pipeline.warmup import _warmup_cache_path
-    from sysight.types.repo_setup import RepoSetup
-    cache_path = _warmup_cache_path(Path(args.repo))
-    repo_setup = RepoSetup.load_cache(cache_path)
     result = run_instrument(
         findings, args.repo, registry, provider, knowledge,
-        repo_setup=repo_setup,
         verbose=getattr(args, 'debug', False),
         run_dir=run_dir,
     )
 
     s = result.summary
-    print(f"\n{'='*60}")
-    print(f"  Instrument 完成")
-    print(f"{'='*60}")
-    print(f"  入口:         {s.get('entry_point', '?')}")
-    print(f"  smoke:        {'✓ 通过' if s.get('smoke_test_passed') else '? 未验证'}")
-    print(f"  NVTX 已有:    {'是' if s.get('has_nvtx') else '否'}")
-    print(f"  建议打标:     {s.get('suggested_tags', 0)} 处")
+    warns = result.warnings
+    errs  = result.errors
 
-    hai = s.get('human_action_items', [])
-    if hai:
-        print(f"\n  ⚠ 需要人工操作 ({len(hai)} 项):")
-        for item in hai:
-            print(f"    • {item}")
+    merge_warns = [w for w in warns if w.startswith("__merge__:")]
+    skip_warns  = [w for w in warns if w.startswith("__skip__:")]
+    other_warns = [w for w in warns if not w.startswith(("__merge__:", "__skip__:"))]
 
-    warns = s.get('warnings', [])
-    errs = s.get('errors', [])
-    if warns or errs:
-        print()
-        for w in warns:
-            print(f"  ⚠ {w}")
+    # 从合并链中提取最终合并后的 timer 数量（去重 merged label）
+    final_timers = s.get("timer_count", 0) - len(merge_warns)
+
+    print(f"\n  ✅  埋点完成  |  {final_timers} 个计时器  |  {len(result.modified_files)} 个文件")
+
+    if merge_warns:
+        print(f"  📦  {len(merge_warns)} 处重叠范围已自动合并")
+    if skip_warns:
+        print(f"  ⏭   {len(skip_warns)} 处已跳过（重复埋点）")
+    if other_warns:
+        for w in other_warns:
+            print(f"  ⚠   {w}")
+    if errs:
         for e in errs:
-            print(f"  ✗ {e}")
+            print(f"  ✗   {e}")
 
 
 def _write_prompt_dump(target: str, bundle: dict) -> None:
@@ -294,14 +291,22 @@ def _cmd_optimize(args):
         sys.exit(1)
 
     findings = _load_findings(args.run_id)
+    raw_path = _resolve_analyze_raw(args.run_id)
+    run_dir = raw_path.parent  # .sysight/analysis-runs/<run_id>/
 
     from sysight.pipeline.optimize import run_optimize
-    result = run_optimize(findings, args.repo, registry, provider, knowledge)
+    result = run_optimize(
+        findings, args.repo, registry, provider, knowledge,
+        verbose=getattr(args, 'debug', False),
+        run_dir=run_dir,
+    )
     print(json.dumps({
         "run_id": result.run_id,
         "patches": [
             {"patch_id": p.patch_id, "finding_id": p.finding_id,
-             "status": p.status, "reason": p.reason}
+             "status": p.status, "reason": p.reason,
+             "metric_before": p.metric_before, "metric_after": p.metric_after,
+             "delta_pct": p.delta_pct}
             for p in result.patches
         ],
         "errors": result.errors,

@@ -1,17 +1,13 @@
 """ANALYZE stage — per-profile, 1 AgentLoop → LocalizedFindingSet.
 
-1. Build a compact deterministic global brief from the Nsight SQLite profile.
-2. Give memory/wiki addresses, not inlined memory bodies.
-3. LLM investigates with read-only nsys_sql/scanner/memory tools.
-4. Validate (deterministic): schema + path + dedup.
-5. Record run metadata and findings.
-6. Write output files to .sysight/analysis-runs/<run_id>/:
-   - debug.log  (turn-by-turn LLM I/O, always written)
-   - analyze_raw.json  (findings + context_stats, always written)
+Outputs to .sysight/analysis-runs/<run_id>/:
+  debug.log          — turn-by-turn LLM I/O
+  analyze_raw.json   — findings + context_stats
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -122,6 +118,7 @@ def run_analyze(
                 "line": f.line,
                 "confidence": f.confidence,
                 "evidence_refs": f.evidence_refs,
+                "metric": f.metric,
                 "description": f.description,
                 "suggestion": f.suggestion,
                 "status": f.status,
@@ -130,7 +127,7 @@ def run_analyze(
             for f in (accepted + rejected)
         ],
         "rejected_count": len(rejected),
-        "errors": [],  # filled after ledger
+        "errors": errors,  # populated below
         "tool_calls": result.tool_calls,
         "context_stats": result.context_stats,
         "provider_error": result.provider_error,
@@ -160,7 +157,6 @@ def run_analyze(
             errors.append(f"ledger write failed: {e}")
 
     errors.extend(result.errors)
-    analyze_raw["errors"] = errors
 
     (run_dir / "analyze_raw.json").write_text(
         json.dumps(analyze_raw, indent=2, ensure_ascii=False, default=str),
@@ -651,17 +647,6 @@ def _read_event_inventory(sqlite_path: Path) -> dict:
     """Read event counts and table availability from a profile."""
     import sqlite3
 
-    result: dict = {
-        "available_tables": [],
-        "kernel_count": 0,
-        "runtime_count": 0,
-        "memcpy_count": 0,
-        "sync_count": 0,
-        "nvtx_count": 0,
-        "stream_count": 0,
-        "kernel_process_count": 0,
-        "runtime_thread_count": 0,
-    }
     table_map = {
         "kernel_count": "CUPTI_ACTIVITY_KIND_KERNEL",
         "runtime_count": "CUPTI_ACTIVITY_KIND_RUNTIME",
@@ -669,6 +654,9 @@ def _read_event_inventory(sqlite_path: Path) -> dict:
         "sync_count": "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION",
         "nvtx_count": "NVTX_EVENTS",
     }
+    result: dict = {k: 0 for k in table_map}
+    result.update({"available_tables": [], "stream_count": 0,
+                   "kernel_process_count": 0, "runtime_thread_count": 0})
     try:
         conn = sqlite3.connect(str(sqlite_path))
         tables = _sqlite_tables(conn)
@@ -695,7 +683,6 @@ def _read_event_inventory(sqlite_path: Path) -> dict:
 
 def _read_iteration_summary(sqlite_path: Path) -> dict:
     """Summarize NVTX ranges that look like training/inference iterations."""
-    import re
     import sqlite3
     from statistics import median
 
@@ -746,46 +733,44 @@ def _build_memory_refs(repo_root: Path, knowledge, namespace: str) -> list[dict]
     if not knowledge:
         return []
 
-    memory_root = getattr(knowledge, "root", Path.cwd() / ".sysight" / "memory")
+    memory_root = Path(getattr(knowledge, "root", Path.cwd() / ".sysight" / "memory"))
+    wiki = memory_root / "wiki"
     refs = [
         {
             "label": "warmup_overview",
             "tool": "memory_read",
             "path": f"workspaces/{namespace}/overview.md",
-            "filesystem": str(Path(memory_root) / "wiki" / "workspaces" / namespace / "overview.md"),
+            "filesystem": str(wiki / "workspaces" / namespace / "overview.md"),
             "when": "需要入口命令、active config、profile artifact、代码地图时读取。",
         },
         {
             "label": "experience_context",
             "tool": "memory_read",
             "path": "experience",
-            "filesystem": str(Path(memory_root) / "experience.md"),
+            "filesystem": str(memory_root / "experience.md"),
             "when": "需要历史性能经验、常见反模式或可复用判断规则时读取。",
         },
         {
             "label": "wiki_index",
             "tool": "memory_read",
             "path": "INDEX.md",
-            "filesystem": str(Path(memory_root) / "wiki" / "INDEX.md"),
+            "filesystem": str(wiki / "INDEX.md"),
             "when": "不确定有哪些 wiki 页面时读取。",
         },
         {
             "label": "targeted_memory_search",
             "tool": "memory_search",
             "path": "",
-            "filesystem": str(Path(memory_root) / "wiki"),
+            "filesystem": str(wiki),
             "when": "按 kernel/NVTX/配置键/性能机制关键词搜索相关经验；可带 namespace 限定。",
         },
     ]
     for ref in refs:
         path = ref.get("path")
-        if path:
-            try:
-                ref["exists"] = bool(knowledge.read_page(path))
-            except Exception:
-                ref["exists"] = False
-        else:
-            ref["exists"] = Path(ref["filesystem"]).exists()
+        try:
+            ref["exists"] = bool(knowledge.read_page(path)) if path else Path(ref["filesystem"]).exists()
+        except Exception:
+            ref["exists"] = False
     return refs
 
 
@@ -861,13 +846,14 @@ def _fmt_bytes(num: int | float) -> str:
 
 
 def _fmt_bandwidth(num: int | float) -> str:
+    """Format bytes/s into human-readable bandwidth string."""
     value = float(num or 0)
     if value <= 0:
         return "unknown"
     for unit in ("B/s", "KB/s", "MB/s", "GB/s", "TB/s"):
-        if value < 1000 or unit == "TB/s":
+        if value < 1_000 or unit == "TB/s":
             return f"{value:.2f}{unit}"
-        value /= 1000
+        value /= 1_000
     return f"{value:.2f}TB/s"
 
 
@@ -910,6 +896,7 @@ def _parse_finding_set(data: dict, run_id: str) -> LocalizedFindingSet:
             priority=f.get("priority", "medium"),
             confidence=confidence,
             evidence_refs=evidence_refs,
+            metric=f.get("metric", ""),
             file_path=file_path,
             function=function,
             line=line,

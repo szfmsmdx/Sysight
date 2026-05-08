@@ -32,10 +32,11 @@ _ASSIGNMENT_RE = re.compile(
 )
 _ENTRY_FILES = {"run.py", "main.py", "train.py", "__main__.py"}
 _PYTHON_COMMAND_RE = re.compile(r"(^|[/\"'])(python[0-9.]*|torchrun)$")
-_SKIP_DIR_NAMES = {
+_PRUNE_IMMEDIATELY = {
     ".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_modules",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".nox",
     ".eggs", "dist", "build", ".ipynb_checkpoints",
+    "external", "third_party", "site-packages",
 }
 
 
@@ -94,12 +95,19 @@ class WarmupFacts:
 
 
 def _warmup_cache_path(root: Path) -> Path:
-    """Cache path for a repo's warmup result (in Sysight's own .sysight dir)."""
+    """Cache path for a repo's warmup result (in Sysight's own .sysight dir).
+
+    File name format: ``<dirname>-<hash6>.json``
+    e.g. ``case_1-cc1ed1dc.json`` — human-readable prefix + short hash suffix
+    to avoid collisions when two repos share the same directory name.
+    """
     import hashlib
-    repo_hash = hashlib.sha1(str(root.resolve()).encode(), usedforsecurity=False).hexdigest()[:12]
+    resolved = root.resolve()
+    dir_name = re.sub(r"[^A-Za-z0-9_.-]", "_", resolved.name)[:32]
+    short_hash = hashlib.sha1(str(resolved).encode(), usedforsecurity=False).hexdigest()[:8]
     cache_dir = Path.cwd() / ".sysight" / "warmup-caches"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"{repo_hash}.json"
+    return cache_dir / f"{dir_name}-{short_hash}.json"
 
 
 def run_warmup(
@@ -172,7 +180,8 @@ def run_warmup(
             errors.append(f"wiki write failed: {e}")
             repo_setup.source = "warmup_partial"
 
-    summary = _build_summary(root, inventory, facts, repo_setup, warnings, errors, overview_path)
+    summary = _build_summary(root, inventory, facts, repo_setup, warnings, errors, overview_path,
+                             cache_path=str(cache_path))
     return WarmupResult(
         repo=str(root),
         repo_setup=repo_setup,
@@ -204,6 +213,7 @@ def _build_inventory(root: Path) -> Inventory:
                 reason = _skip_dir_reason(rel_str, item.name)
                 if reason:
                     _record_ignored(inventory, reason, rel_str)
+                    # Do NOT push onto stack — prune the entire subtree
                     continue
                 stack.append(item)
                 continue
@@ -236,23 +246,12 @@ def _build_inventory(root: Path) -> Inventory:
 
 def _skip_dir_reason(rel_str: str, name: str) -> str:
     lower = name.lower()
-    parts = rel_str.split("/")
-
-    if name in _SKIP_DIR_NAMES:
+    if name in _PRUNE_IMMEDIATELY:
         return name
-    if lower in {"external", "third_party"}:
-        return lower
-    if lower == "site-packages":
-        return "site-packages"
     if lower.endswith((".dist-info", ".egg-info")):
         return "package-metadata"
-    if len(parts) >= 2 and parts[-2].endswith(".runfiles"):
-        if re.match(r"python.*_deps", lower):
-            return "runfiles-deps"
-
     if re.match(r"python.*_deps", lower):
-        return "python-deps"
-
+        return "runfiles-deps"
     return ""
 
 
@@ -404,16 +403,17 @@ def _parse_cd(line: str) -> str | None:
 def _join_rel(base: str, target: str) -> str:
     if target.startswith("$") or target.startswith("/"):
         return base
-    joined = Path(base) / target if base else Path(target)
+    # Normalise by letting Path collapse . and .. components
+    joined = (Path(base) / target if base else Path(target)).as_posix()
+    # Remove leading ./ and collapse manually (Path doesn't resolve .. without a real FS)
     parts: list[str] = []
-    for part in joined.as_posix().split("/"):
+    for part in joined.split("/"):
         if part in ("", "."):
             continue
-        if part == "..":
-            if parts:
-                parts.pop()
-            continue
-        parts.append(part)
+        if part == ".." and parts:
+            parts.pop()
+        elif part != "..":
+            parts.append(part)
     return "/".join(parts)
 
 
@@ -814,13 +814,7 @@ def _trace_import_tree(root: Path, py_files: list[str],
         if entry in py_file_set:
             hot.extend(trace_file(entry))
 
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for path in hot:
-        if path not in seen:
-            seen.add(path)
-            deduped.append(path)
-    return deduped, tree
+    return list(dict.fromkeys(hot)), tree
 
 
 def _infer_import_roots(py_files: list[str], entry_files: list[str]) -> list[str]:
@@ -1036,10 +1030,12 @@ def _entry_command_verified(root: Path, command: str) -> bool:
 # Output
 
 def _build_summary(root: Path, inventory: Inventory, facts: WarmupFacts, repo_setup: RepoSetup,
-                   warnings: list[str], errors: list[str], overview_path: str) -> dict:
+                   warnings: list[str], errors: list[str], overview_path: str,
+                   cache_path: str = "") -> dict:
     return {
         "repo": str(root),
         "source": repo_setup.source,
+        "cache_path": cache_path,
         "overview_path": overview_path,
         "entry_point": repo_setup.entry_point,
         "minimal_run": repo_setup.minimal_run,
@@ -1056,142 +1052,205 @@ def _build_summary(root: Path, inventory: Inventory, facts: WarmupFacts, repo_se
 
 def _build_overview(root: Path, inventory: Inventory, facts: WarmupFacts,
                     repo_setup: RepoSetup, warnings: list[str], errors: list[str]) -> str:
-    lines: list[str] = ["# Workspace Overview", ""]
+    """Build a high-density overview for LLM context.
 
-    lines.append("## 项目概览")
-    lines.append(f"- 工作负载: {_display_workload(facts.workload)}")
-    if facts.primary_source:
-        lines.append(f"- 入口证据: {facts.primary_source}")
+    Design principles (based on SWE-agent / repositories-wiki patterns):
+    - Every line carries information the analyzer LLM can act on.
+    - No prose, no decorative headers — structured key: value only.
+    - Noise (ignored dirs, inactive configs) collapsed to a single summary line.
+    - Import tree limited to top 3 entry chains, max depth 4, max 40 lines.
+    - Hot-path files grouped by *role* (entry / trainer / data / model / util),
+      not by directory — roles are what the performance analyst cares about.
+    """
+    lines: list[str] = ["# Repo Context", ""]
+
+    # ── Section 1: Identity ──
+    lines.append("## Identity")
+    lines.append(f"workload: {facts.workload}")
     if facts.case_info.get("id"):
-        lines.append(f"- Case ID: `{facts.case_info['id']}`")
-    lines.append(f"- 已扫描应用 Python 文件: {len(inventory.app_py_files)}")
+        lines.append(f"case_id: {facts.case_info['id']}")
+    lines.append(f"status: {repo_setup.source}")
+    if repo_setup.verified_at:
+        lines.append(f"verified_at: {repo_setup.verified_at}")
     lines.append("")
 
-    lines.append("## 如何运行 / 采集 Profile")
+    # ── Section 2: Execution ──
+    lines.append("## Execution")
     if facts.primary_command:
-        lines.append(f"- 主入口: `{_redact(facts.primary_command)}`")
-    if repo_setup.minimal_run:
-        lines.append(f"- 最小 Python 命令: `{_redact(' '.join(repo_setup.minimal_run))}`")
+        lines.append(f"run_cmd: `{_redact(facts.primary_command)}`")
     if facts.profile_command:
-        lines.append(f"- Profile 采集: `{_redact(facts.profile_command)}`")
-    if facts.primary_script:
-        lines.append(f"- 启动脚本: `{facts.primary_script}`")
-    if facts.constraints:
-        for constraint in facts.constraints:
-            lines.append(f"- 约束: {constraint}")
-    lines.append("")
-
-    lines.append("## 当前配置")
-    if facts.active_config:
-        suffix = "已验证" if facts.active_config_exists else "未找到"
-        lines.append(f"- 配置文件: `{facts.active_config}` ({suffix}, {facts.active_config_source})")
-    if facts.active_variants:
-        for key, value in sorted(facts.active_variants.items()):
-            lines.append(f"- 当前变体 {key}: `{value}`")
+        lines.append(f"profile_cmd: `{_redact(facts.profile_command)}`")
     if facts.profile_sqlite:
-        lines.append(f"- Profile sqlite: `{facts.profile_sqlite}`")
+        lines.append(f"profile_sqlite: `{facts.profile_sqlite}`")
     if facts.case_info.get("profile_nsys_rep"):
-        lines.append(f"- Nsight report: `{facts.case_info['profile_nsys_rep']}`")
-    if facts.job_info:
-        lines.append(f"- 作业配置: `{facts.job_info.get('path', '')}`")
+        lines.append(f"profile_nsys_rep: `{facts.case_info['profile_nsys_rep']}`")
+    if facts.constraints:
+        lines.append("constraints: " + "; ".join(facts.constraints))
+    lines.append("")
+
+    # ── Section 3: Active Config & Perf Knobs ──
+    if facts.active_config or facts.perf_knobs:
+        lines.append("## Config")
+        if facts.active_config:
+            tag = "ok" if facts.active_config_exists else "missing"
+            lines.append(f"active_config: `{facts.active_config}` [{tag}]")
+        if facts.active_variants:
+            for key, value in sorted(facts.active_variants.items()):
+                lines.append(f"variant_{key}: `{value}`")
         if facts.job_info.get("app_name"):
-            lines.append(f"- 作业名: `{facts.job_info['app_name']}`")
-    if facts.perf_knobs:
-        lines.append("- 性能相关参数:")
-        for knob in facts.perf_knobs[:12]:
-            lines.append(f"  - `{knob}`")
+            lines.append(f"job_name: `{facts.job_info['app_name']}`")
+        if facts.perf_knobs:
+            lines.append("perf_knobs:")
+            for knob in facts.perf_knobs[:16]:
+                lines.append(f"  {knob}")
+        if facts.inactive_configs:
+            if len(facts.inactive_configs) <= 4:
+                names = ", ".join(f"`{c}`" for c in facts.inactive_configs)
+                lines.append(f"inactive_config_variants: {names}")
+            else:
+                lines.append(f"inactive_config_variants: {len(facts.inactive_configs)} (same dir, not active)")
+        lines.append("")
+
+    # ── Section 4: Code Map — role-based, not directory-based ──
+    lines.append("## Code Map")
+    lines.append(f"entry_point: `{'`, `'.join(facts.entry_files[:4]) if facts.entry_files else 'unknown'}`")
+    lines.append(f"hot_path_total: {len(facts.hot_path_files)} files")
     lines.append("")
 
-    lines.append("## 代码地图")
-    if facts.app_roots:
-        lines.append("- 应用根目录: " + ", ".join(f"`{r}`" for r in facts.app_roots[:12]))
-    if facts.entry_files:
-        lines.append("- 入口文件: " + ", ".join(f"`{p}`" for p in facts.entry_files[:8]))
-    lines.append(f"- 热路径文件数: {len(facts.hot_path_files)}")
-    for directory, files in _group_files(facts.hot_path_files).items():
-        lines.append(f"- `{directory}/`: " + ", ".join(files[:10]))
+    role_groups = _classify_hot_path_by_role(facts.hot_path_files)
+    for role, role_files in role_groups.items():
+        # Show at most 8 files per role; truncate with count if more
+        shown = role_files[:8]
+        tail = f" … +{len(role_files) - 8}" if len(role_files) > 8 else ""
+        lines.append(f"{role}: " + ", ".join(f"`{p}`" for p in shown) + tail)
+
+    cold_count = len([p for p in inventory.app_py_files if p not in set(facts.hot_path_files)])
+    if cold_count:
+        lines.append(f"off_hot_path: {cold_count} files (not reachable from entry)")
     lines.append("")
 
-    if facts.import_tree:
-        lines.append("## 导入树")
+    # ── Section 5: Import Chain (compact, entry → key deps) ──
+    if facts.import_tree and facts.entry_files:
+        lines.append("## Import Chain")
+        lines.append("(entry → direct imports → key transitive, max depth 4)")
         lines.append("```")
-        lines.extend(_render_import_tree(facts.hot_path_files, facts.import_tree, limit_roots=3))
+        lines.extend(_render_import_tree_compact(
+            facts.hot_path_files, facts.import_tree,
+            entry_files=facts.entry_files,
+            max_depth=4, max_lines=40,
+        ))
         lines.append("```")
         lines.append("")
 
-    lines.append("## 跳过 / 噪声")
-    if inventory.ignored_counts:
-        for reason, count in sorted(inventory.ignored_counts.items()):
-            examples = ", ".join(inventory.ignored_examples.get(reason, [])[:3])
-            lines.append(f"- 跳过 {count} 个 `{reason}` 目录" + (f": {examples}" if examples else ""))
-    if facts.inactive_configs:
-        lines.append(f"- 未启用配置 ({len(facts.inactive_configs)}):")
-        for config in facts.inactive_configs[:20]:
-            lines.append(f"  - `{config}`")
-        if len(facts.inactive_configs) > 20:
-            lines.append(f"  - ... 还有 {len(facts.inactive_configs) - 20} 个")
-    cold_files = [p for p in inventory.app_py_files if p not in set(facts.hot_path_files)]
-    if cold_files:
-        lines.append(f"- 未在热路径中的其他应用 Python 文件: {len(cold_files)}")
-    lines.append("")
+    # ── Section 6: Noise summary (collapsed) ──
+    noise_parts: list[str] = []
+    for reason, count in sorted(inventory.ignored_counts.items()):
+        noise_parts.append(f"{count}×{reason}")
+    if noise_parts:
+        lines.append(f"## Noise (pruned)")
+        lines.append("skipped_dirs: " + ", ".join(noise_parts))
 
-    lines.append("## Warmup 可信度")
-    lines.append(f"- 来源状态: `{repo_setup.source}`")
-    if repo_setup.verified_at:
-        lines.append(f"- 验证时间: `{repo_setup.verified_at}`")
-    for warning in warnings:
-        lines.append(f"- 警告: {warning}")
-    for error in errors:
-        lines.append(f"- 错误: {error}")
+    if warnings:
+        lines.append("warnings: " + "; ".join(warnings[:5]))
+    if errors:
+        lines.append("errors: " + "; ".join(errors[:3]))
 
     return "\n".join(lines)
 
 
-def _display_workload(workload: str) -> str:
-    labels = {
-        "distributed training": "分布式训练",
-        "training": "训练",
-        "evaluation/benchmark": "评估 / Benchmark",
-        "profiled workload": "已采集 profile 的工作负载",
-        "python project": "Python 项目",
-    }
-    return labels.get(workload, workload)
+# ── Role classification ──
+
+# Keywords that signal a file belongs to a particular performance-relevant role.
+_ROLE_PATTERNS: list[tuple[str, list[str]]] = [
+    ("entry",    ["trainer.py", "main.py", "run.py", "train.py", "__main__.py"]),
+    ("trainer",  ["trainer", "training", "pipeline", "loop", "base_trainer"]),
+    ("dataloader", ["dataloader", "data_loader", "dataset", "remote_worker",
+                    "prefetch", "collate", "sampler"]),
+    ("model",    ["model", "module", "backbone", "head", "neck", "encoder",
+                  "decoder", "attention", "block", "layer"]),
+    ("optimizer", ["optimizer", "scheduler", "lr_", "loss", "criterion"]),
+    ("profiler", ["profiler", "monitor", "meter", "profil"]),
+    ("util",     ["util", "utils", "helper", "common", "distributed", "memory",
+                  "config", "logger", "io"]),
+]
 
 
-def _group_files(files: list[str]) -> dict[str, list[str]]:
-    grouped: dict[str, list[str]] = {}
-    for path in files[:80]:
-        p = Path(path)
-        directory = p.parent.as_posix() if p.parent.as_posix() != "." else "."
-        grouped.setdefault(directory, []).append(p.name)
-    return dict(sorted(grouped.items()))
+def _classify_hot_path_by_role(hot_path_files: list[str]) -> dict[str, list[str]]:
+    """Group hot-path files by performance-relevant role.
+
+    Files are matched against role keyword patterns (filename + path).
+    Unmatched files go into 'other'. Each file appears only in its first match.
+    """
+    groups: dict[str, list[str]] = {role: [] for role, _ in _ROLE_PATTERNS}
+    groups["other"] = []
+
+    for path in hot_path_files:
+        name = Path(path).name.lower()
+        lower_path = path.lower()
+        matched = False
+        for role, keywords in _ROLE_PATTERNS:
+            if any(kw in name or kw in lower_path for kw in keywords):
+                groups[role].append(path)
+                matched = True
+                break
+        if not matched:
+            groups["other"].append(path)
+
+    # Drop empty roles and preserve insertion order
+    return {role: files for role, files in groups.items() if files}
 
 
-def _render_import_tree(hot_path_files: list[str], import_tree: dict[str, list[str]],
-                        limit_roots: int) -> list[str]:
-    all_imported = {child for children in import_tree.values() for child in children}
-    roots = [path for path in hot_path_files if path not in all_imported]
-    if not roots:
-        roots = hot_path_files[:1]
+def _render_import_tree_compact(
+    hot_path_files: list[str],
+    import_tree: dict[str, list[str]],
+    *,
+    entry_files: list[str],
+    max_depth: int = 4,
+    max_lines: int = 40,
+) -> list[str]:
+    """Compact import tree: entry files first, max_depth levels, max_lines total.
 
+    Shows only intra-repo imports (files in hot_path_files set).
+    Third-party / stdlib imports are silently dropped.
+    """
+    hot_set = set(hot_path_files)
     lines: list[str] = []
-    seen_edges: set[tuple[str, str]] = set()
+    seen_paths: set[str] = set()  # avoid re-expanding shared deps
 
-    def walk(path: str, indent: int = 0) -> None:
-        if len(lines) >= 80:
+    def walk(path: str, depth: int, indent: str, connector: str) -> None:
+        if len(lines) >= max_lines or depth > max_depth:
             return
-        lines.append("  " * indent + path)
-        for child in import_tree.get(path, [])[:12]:
-            edge = (path, child)
-            if edge in seen_edges:
-                continue
-            seen_edges.add(edge)
-            walk(child, indent + 1)
+        label = Path(path).name
+        if depth == 0:
+            lines.append(f"{label}  [{path}]")
+        else:
+            lines.append(f"{indent}{connector}{label}")
+        if path in seen_paths:
+            return
+        seen_paths.add(path)
+        children = [c for c in import_tree.get(path, []) if c in hot_set]
+        capped = children[:8]
+        for i, child in enumerate(capped):
+            is_last = (i == len(capped) - 1)
+            child_connector = "└─ " if is_last else "├─ "
+            child_indent = indent + ("   " if depth == 0 else ("   " if is_last else "│  "))
+            walk(child, depth + 1, child_indent, child_connector)
 
-    for root in roots[:limit_roots]:
-        walk(root)
-    if len(roots) > limit_roots:
-        lines.append(f"... {len(roots) - limit_roots} more roots")
+    # Start from entry files only, up to 3 roots
+    roots = [e for e in entry_files if e in hot_set][:3]
+    if not roots:
+        # fallback: topological roots
+        all_imported = {c for children in import_tree.values() for c in children}
+        roots = [p for p in hot_path_files if p not in all_imported][:3]
+
+    for root in roots:
+        walk(root, 0, "", "")
+        if lines and lines[-1] != "":
+            lines.append("")
+
+    if len(lines) >= max_lines:
+        lines.append(f"... (truncated at {max_lines} lines)")
+
     return lines
 
 
