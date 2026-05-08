@@ -1,0 +1,17 @@
+# Config v1 — active config for case_3
+model:
+  vocab_size: 8192
+  d_model: 512
+  n_heads: 8
+  n_layers: 4
+  d_ff: 2048
+  max_seq_len: 2048
+
+inference:
+  max_new_tokens: 128
+  temperature: 1.0
+  batch_size: 4
+
+benchmark:
+  num_requests: 50
+  prompt_len: 32

@@ -1,0 +1,15 @@
+id: case_5
+entrypoint: run.py
+seed: 20260505
+description: "Mixed precision training with gradient accumulation and scaling issues"
+requires:
+  gpu: true
+  min_gpus: 1
+  nsys: true
+profile:
+  nsys_rep: profiles/case_5.nsys-rep
+  sqlite: profiles/case_5.sqlite
+run:
+  command: python run.py --config configs/config_v4.yaml
+  active_config: configs/config_v4.yaml
+  active_model_variant: v4

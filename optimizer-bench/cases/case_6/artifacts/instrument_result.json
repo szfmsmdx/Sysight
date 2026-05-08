@@ -1,0 +1,56 @@
+{
+  "run_id": "case_6",
+  "timers": [
+    {
+      "finding_id": "C5:1c2r3o4s",
+      "timer_label": "F01_cross_attn_cache",
+      "file": "src/models/multimodal.py",
+      "wrap_start": 75,
+      "wrap_end": 100,
+      "reason": "C5: cross-attention K,V recomputation"
+    },
+    {
+      "finding_id": "C3:2s3e4q5u",
+      "timer_label": "F02_parallel_encoders",
+      "file": "src/models/multimodal.py",
+      "wrap_start": 105,
+      "wrap_end": 125,
+      "reason": "C3: sequential encoders"
+    },
+    {
+      "finding_id": "C2:3i4n5f6e",
+      "timer_label": "F03_inference_mode",
+      "file": "src/trainers/multimodal_loop.py",
+      "wrap_start": 60,
+      "wrap_end": 85,
+      "reason": "C2: no_grad → inference_mode"
+    },
+    {
+      "finding_id": "C5:4r5e6d7u",
+      "timer_label": "F04_redundant_eval",
+      "file": "src/trainers/multimodal_loop.py",
+      "wrap_start": 60,
+      "wrap_end": 85,
+      "reason": "C5: redundant logit computation"
+    },
+    {
+      "finding_id": "C2:5f6a7k8e",
+      "timer_label": "F05_gpu_metrics",
+      "file": "src/utils/eval_metrics.py",
+      "wrap_start": 15,
+      "wrap_end": 30,
+      "reason": "C2: GPU metrics (FAKE — already on GPU)"
+    }
+  ],
+  "modified_files": [
+    "src/models/multimodal.py",
+    "src/trainers/multimodal_loop.py",
+    "src/utils/eval_metrics.py"
+  ],
+  "errors": [],
+  "warnings": [],
+  "summary": {
+    "total_timers": 5,
+    "modified_files": 3
+  }
+}

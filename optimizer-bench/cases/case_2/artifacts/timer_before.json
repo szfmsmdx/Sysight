@@ -1,0 +1,7 @@
+{
+  "F01_ddp_no_sync": 18.45,
+  "F02_all_gather_vs_reduce": 5.67,
+  "F03_barrier_epoch": 0.12,
+  "F04_tf32": 22.34,
+  "F05_grad_clip": 18.45
+}

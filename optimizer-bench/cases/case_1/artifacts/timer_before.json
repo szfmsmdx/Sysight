@@ -1,0 +1,7 @@
+{
+  "F01_attention_mask": 2.34,
+  "F02_train_step_sync": 12.56,
+  "F03_validate_no_grad": 8.91,
+  "F05_positional_encoding": 1.87,
+  "F06_checkpoint_save": 3.42
+}

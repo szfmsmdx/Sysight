@@ -1,0 +1,16 @@
+id: case_2
+entrypoint: run.py
+seed: 20260502
+description: "Distributed DataParallel training with communication bottlenecks and gradient management issues"
+requires:
+  gpu: true
+  min_gpus: 2
+  distributed_fallback: true
+  nsys: true
+profile:
+  nsys_rep: profiles/case_2.nsys-rep
+  sqlite: profiles/case_2.sqlite
+run:
+  command: python run.py --config configs/config_v3.yaml
+  active_config: configs/config_v3.yaml
+  active_model_variant: v2

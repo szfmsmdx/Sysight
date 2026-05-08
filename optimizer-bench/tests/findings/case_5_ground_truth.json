@@ -1,0 +1,20 @@
+{
+  "case_id": "case_5",
+  "max_score": 100,
+  "real_finding_ids": [
+    "C4:1a2m3p4n",
+    "C5:2g3r4a5d",
+    "C5:3s4t5e6p",
+    "C5:4z5e6r7o"
+  ],
+  "fake_finding_ids": [
+    "C2:5f6a7k8e"
+  ],
+  "expected_patch_lines": {
+    "C4:1a2m3p4n": 12,
+    "C5:2g3r4a5d": 4,
+    "C5:3s4t5e6p": 6,
+    "C5:4z5e6r7o": 4
+  },
+  "description": "Case 5 tests mixed precision and gradient accumulation. 4 real findings (AMP autocast, loss division, step timing, zero_grad timing) + 1 fake finding (channels_last — ViT patch embeddings don't benefit from NHWC)."
+}

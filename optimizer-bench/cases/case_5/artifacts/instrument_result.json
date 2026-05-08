@@ -1,0 +1,55 @@
+{
+  "run_id": "case_5",
+  "timers": [
+    {
+      "finding_id": "C4:1a2m3p4n",
+      "timer_label": "F01_amp_autocast",
+      "file": "src/trainers/mixed_precision_loop.py",
+      "wrap_start": 40,
+      "wrap_end": 65,
+      "reason": "C4: AMP not used"
+    },
+    {
+      "finding_id": "C5:2g3r4a5d",
+      "timer_label": "F02_loss_division",
+      "file": "src/trainers/mixed_precision_loop.py",
+      "wrap_start": 48,
+      "wrap_end": 55,
+      "reason": "C5: loss division precision"
+    },
+    {
+      "finding_id": "C5:3s4t5e6p",
+      "timer_label": "F03_step_timing",
+      "file": "src/trainers/mixed_precision_loop.py",
+      "wrap_start": 40,
+      "wrap_end": 65,
+      "reason": "C5: step() every micro-batch"
+    },
+    {
+      "finding_id": "C5:4z5e6r7o",
+      "timer_label": "F04_zero_grad_timing",
+      "file": "src/trainers/mixed_precision_loop.py",
+      "wrap_start": 40,
+      "wrap_end": 65,
+      "reason": "C5: zero_grad() timing"
+    },
+    {
+      "finding_id": "C2:5f6a7k8e",
+      "timer_label": "F05_channels_last",
+      "file": "src/models/vit.py",
+      "wrap_start": 20,
+      "wrap_end": 35,
+      "reason": "C2: channels_last (FAKE — ViT doesn't benefit)"
+    }
+  ],
+  "modified_files": [
+    "src/trainers/mixed_precision_loop.py",
+    "src/models/vit.py"
+  ],
+  "errors": [],
+  "warnings": [],
+  "summary": {
+    "total_timers": 5,
+    "modified_files": 2
+  }
+}

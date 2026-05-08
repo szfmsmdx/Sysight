@@ -1,0 +1,56 @@
+{
+  "run_id": "case_2",
+  "timers": [
+    {
+      "finding_id": "C1:1a2b3c4d",
+      "timer_label": "F01_ddp_no_sync",
+      "file": "src/trainers/ddp_loop.py",
+      "wrap_start": 38,
+      "wrap_end": 62,
+      "reason": "C1: DDP sync on every micro-batch"
+    },
+    {
+      "finding_id": "C1:2b3c4d5e",
+      "timer_label": "F02_all_gather_vs_reduce",
+      "file": "src/distributed/comm.py",
+      "wrap_start": 10,
+      "wrap_end": 25,
+      "reason": "C1: all_gather instead of all_reduce"
+    },
+    {
+      "finding_id": "C3:3c4d5e6f",
+      "timer_label": "F03_barrier_epoch",
+      "file": "src/trainers/ddp_loop.py",
+      "wrap_start": 38,
+      "wrap_end": 62,
+      "reason": "C3: unnecessary barrier"
+    },
+    {
+      "finding_id": "C4:4d5e6f7g",
+      "timer_label": "F04_tf32",
+      "file": "src/runtime/launcher.py",
+      "wrap_start": 15,
+      "wrap_end": 55,
+      "reason": "C4: TF32 not enabled"
+    },
+    {
+      "finding_id": "C2:5e6f7g8h",
+      "timer_label": "F05_grad_clip",
+      "file": "src/trainers/ddp_loop.py",
+      "wrap_start": 38,
+      "wrap_end": 62,
+      "reason": "C2: gradient clipping (FAKE — not a real perf issue)"
+    }
+  ],
+  "modified_files": [
+    "src/trainers/ddp_loop.py",
+    "src/distributed/comm.py",
+    "src/runtime/launcher.py"
+  ],
+  "errors": [],
+  "warnings": [],
+  "summary": {
+    "total_timers": 5,
+    "modified_files": 3
+  }
+}

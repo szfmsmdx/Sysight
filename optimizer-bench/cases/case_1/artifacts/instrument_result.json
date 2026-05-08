@@ -1,0 +1,65 @@
+{
+  "run_id": "case_1",
+  "timers": [
+    {
+      "finding_id": "C5:3f8a1b2c",
+      "timer_label": "F01_attention_mask",
+      "file": "src/models/attention.py",
+      "wrap_start": 30,
+      "wrap_end": 52,
+      "reason": "C5: causal mask recomputation in attention forward"
+    },
+    {
+      "finding_id": "C3:a1b2c3d4",
+      "timer_label": "F02_train_step_sync",
+      "file": "src/trainers/loop.py",
+      "wrap_start": 30,
+      "wrap_end": 55,
+      "reason": "C3: loss.item() sync in training step"
+    },
+    {
+      "finding_id": "C5:e4f5a6b7",
+      "timer_label": "F03_validate_no_grad",
+      "file": "src/trainers/loop.py",
+      "wrap_start": 57,
+      "wrap_end": 75,
+      "reason": "C5: missing no_grad in validation"
+    },
+    {
+      "finding_id": "C2:c8d9e0f1",
+      "timer_label": "F03_validate_no_grad",
+      "file": "src/trainers/loop.py",
+      "wrap_start": 57,
+      "wrap_end": 75,
+      "reason": "C2: should use inference_mode"
+    },
+    {
+      "finding_id": "C5:2a3b4c5d",
+      "timer_label": "F05_positional_encoding",
+      "file": "src/models/embedding.py",
+      "wrap_start": 20,
+      "wrap_end": 38,
+      "reason": "C5: positional encoding recomputation"
+    },
+    {
+      "finding_id": "C4:f6a7b8c9",
+      "timer_label": "F06_checkpoint_save",
+      "file": "src/utils/checkpoint.py",
+      "wrap_start": 28,
+      "wrap_end": 45,
+      "reason": "C4: checkpoint save (FAKE — already async)"
+    }
+  ],
+  "modified_files": [
+    "src/models/attention.py",
+    "src/trainers/loop.py",
+    "src/models/embedding.py",
+    "src/utils/checkpoint.py"
+  ],
+  "errors": [],
+  "warnings": [],
+  "summary": {
+    "total_timers": 6,
+    "modified_files": 4
+  }
+}

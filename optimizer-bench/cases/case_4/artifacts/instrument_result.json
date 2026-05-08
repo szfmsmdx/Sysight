@@ -1,0 +1,66 @@
+{
+  "run_id": "case_4",
+  "timers": [
+    {
+      "finding_id": "C5:1d2a3t4a",
+      "timer_label": "F01_cpu_augmentation",
+      "file": "src/data/pipeline.py",
+      "wrap_start": 25,
+      "wrap_end": 55,
+      "reason": "C5: CPU-side augmentation"
+    },
+    {
+      "finding_id": "C5:2n3o4r5m",
+      "timer_label": "F02_batch_normalize",
+      "file": "src/data/pipeline.py",
+      "wrap_start": 48,
+      "wrap_end": 55,
+      "reason": "C5: per-sample normalize"
+    },
+    {
+      "finding_id": "C3:3p4i5n6m",
+      "timer_label": "F03_pin_memory",
+      "file": "src/data/loader.py",
+      "wrap_start": 10,
+      "wrap_end": 25,
+      "reason": "C3: pin_memory not enabled"
+    },
+    {
+      "finding_id": "C3:4c5h6e7c",
+      "timer_label": "F04_checkpoint_sync",
+      "file": "src/utils/checkpoint.py",
+      "wrap_start": 20,
+      "wrap_end": 35,
+      "reason": "C3: synchronous checkpoint save"
+    },
+    {
+      "finding_id": "C3:5n6o7n8b",
+      "timer_label": "F05_non_blocking",
+      "file": "src/trainers/loop.py",
+      "wrap_start": 35,
+      "wrap_end": 42,
+      "reason": "C3: non_blocking missing"
+    },
+    {
+      "finding_id": "C2:6f7a8k9e",
+      "timer_label": "F06_channels_last",
+      "file": "src/models/resnet.py",
+      "wrap_start": 50,
+      "wrap_end": 65,
+      "reason": "C2: channels_last (FAKE — negligible benefit for ResNet50)"
+    }
+  ],
+  "modified_files": [
+    "src/data/pipeline.py",
+    "src/data/loader.py",
+    "src/utils/checkpoint.py",
+    "src/trainers/loop.py",
+    "src/models/resnet.py"
+  ],
+  "errors": [],
+  "warnings": [],
+  "summary": {
+    "total_timers": 6,
+    "modified_files": 5
+  }
+}

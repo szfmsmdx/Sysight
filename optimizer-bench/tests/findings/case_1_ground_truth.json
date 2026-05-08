@@ -1,0 +1,22 @@
+{
+  "case_id": "case_1",
+  "max_score": 100,
+  "real_finding_ids": [
+    "C5:3f8a1b2c",
+    "C3:a1b2c3d4",
+    "C5:e4f5a6b7",
+    "C2:c8d9e0f1",
+    "C5:2a3b4c5d"
+  ],
+  "fake_finding_ids": [
+    "C4:f6a7b8c9"
+  ],
+  "expected_patch_lines": {
+    "C5:3f8a1b2c": 15,
+    "C3:a1b2c3d4": 8,
+    "C5:e4f5a6b7": 5,
+    "C2:c8d9e0f1": 3,
+    "C5:2a3b4c5d": 20
+  },
+  "description": "Case 1 tests basic patch generation for 5 real findings across 3 files, plus 1 fake finding (F06) that claims checkpoint save is synchronous when it's already async. Optimizer should fix F01-F05 and reject F06."
+}

@@ -1,0 +1,8 @@
+{
+  "F01_cpu_augmentation": 8.92,
+  "F02_batch_normalize": 2.34,
+  "F03_pin_memory": 5.67,
+  "F04_checkpoint_sync": 6.78,
+  "F05_non_blocking": 3.45,
+  "F06_channels_last": 12.34
+}

@@ -1,0 +1,15 @@
+id: case_6
+entrypoint: run.py
+seed: 20260506
+description: "Multi-modal training with cross-attention and evaluation pipeline bottlenecks"
+requires:
+  gpu: true
+  min_gpus: 1
+  nsys: true
+profile:
+  nsys_rep: profiles/case_6.nsys-rep
+  sqlite: profiles/case_6.sqlite
+run:
+  command: python run.py --config configs/config_v5.yaml
+  active_config: configs/config_v5.yaml
+  active_model_variant: v5

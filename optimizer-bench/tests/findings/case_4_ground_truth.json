@@ -1,0 +1,22 @@
+{
+  "case_id": "case_4",
+  "max_score": 100,
+  "real_finding_ids": [
+    "C5:1d2a3t4a",
+    "C5:2n3o4r5m",
+    "C3:3p4i5n6m",
+    "C3:4c5h6e7c",
+    "C3:5n6o7n8b"
+  ],
+  "fake_finding_ids": [
+    "C2:6f7a8k9e"
+  ],
+  "expected_patch_lines": {
+    "C5:1d2a3t4a": 20,
+    "C5:2n3o4r5m": 10,
+    "C3:3p4i5n6m": 3,
+    "C3:4c5h6e7c": 15,
+    "C3:5n6o7n8b": 4
+  },
+  "description": "Case 4 tests data pipeline and I/O optimization. 5 real findings (CPU augmentation, batch normalize, pin_memory, async checkpoint, non_blocking) + 1 fake finding (channels_last — negligible benefit for ResNet50)."
+}

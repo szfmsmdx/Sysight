@@ -1,0 +1,83 @@
+{
+  "run_id": "case_2",
+  "summary": "DDP training pipeline has 4 real performance issues and 1 fake finding for optimizer judgment.",
+  "findings": [
+    {
+      "finding_id": "C1:1a2b3c4d",
+      "category": "C1",
+      "title": "DDP gradient sync on every micro-batch during accumulation",
+      "priority": "high",
+      "confidence": "confirmed",
+      "evidence_refs": ["nsys: all_reduce NCCL kernel every micro-batch"],
+      "metric": "~3× more all-reduce calls than necessary",
+      "file_path": "src/trainers/ddp_loop.py",
+      "function": "train_epoch",
+      "line": 52,
+      "description": "DDPTrainingLoop.train_epoch() performs gradient accumulation but never uses no_sync() context manager. DDP synchronizes gradients after every micro-batch loss.backward(), wasting communication bandwidth.",
+      "suggestion": "Wrap micro-batches in model.no_sync() context, only sync on the last accumulation step.",
+      "status": "accepted"
+    },
+    {
+      "finding_id": "C1:2b3c4d5e",
+      "category": "C1",
+      "title": "all_gather instead of all_reduce for prediction sync",
+      "priority": "high",
+      "confidence": "confirmed",
+      "evidence_refs": ["nsys: all_gather with N× data volume visible"],
+      "metric": "N× more data transferred than all_reduce",
+      "file_path": "src/distributed/comm.py",
+      "function": "sync_predictions",
+      "line": 15,
+      "description": "sync_predictions() uses all_gather to collect all predictions then computes local mean. This sends N copies of the data. all_reduce with SUM + division would send only 1× data.",
+      "suggestion": "Replace all_gather + local mean with all_reduce(SUM) / world_size.",
+      "status": "accepted"
+    },
+    {
+      "finding_id": "C3:3c4d5e6f",
+      "category": "C3",
+      "title": "Unnecessary barrier() at start of each epoch",
+      "priority": "medium",
+      "confidence": "confirmed",
+      "evidence_refs": ["nsys: barrier stall at epoch boundaries"],
+      "metric": "~2-5ms stall per epoch",
+      "file_path": "src/trainers/ddp_loop.py",
+      "function": "train_epoch",
+      "line": 44,
+      "description": "DDPTrainingLoop.train_epoch() calls dist.barrier() at the start of each epoch. DistributedSampler.set_epoch() already handles epoch synchronization implicitly.",
+      "suggestion": "Remove the dist.barrier() call at epoch start.",
+      "status": "accepted"
+    },
+    {
+      "finding_id": "C4:4d5e6f7g",
+      "category": "C4",
+      "title": "TF32 not enabled for Ampere+ GPUs",
+      "priority": "medium",
+      "confidence": "confirmed",
+      "evidence_refs": ["nsys: FP32 matmul kernels instead of TF32"],
+      "metric": "~1.5-2× matmul throughput loss",
+      "file_path": "src/runtime/launcher.py",
+      "function": "launch_ddp_training",
+      "line": 35,
+      "description": "TF32 tensor cores are not enabled. On Ampere+ GPUs (A100, A10, RTX 3090+), enabling TF32 provides ~1.5-2× speedup for matmul operations with negligible accuracy loss.",
+      "suggestion": "Add torch.backends.cuda.matmul.allow_tf32 = True and torch.backends.cudnn.allow_tf32 = True at the top of launch_ddp_training.",
+      "status": "accepted"
+    },
+    {
+      "finding_id": "C2:5e6f7g8h",
+      "category": "C2",
+      "title": "Gradient clipping should be applied before optimizer step",
+      "priority": "low",
+      "confidence": "unresolved",
+      "evidence_refs": ["nsys: no grad norm computation visible"],
+      "metric": "potential training instability",
+      "file_path": "src/trainers/ddp_loop.py",
+      "function": "train_epoch",
+      "line": 56,
+      "description": "The training loop doesn't apply gradient clipping before optimizer.step(). For large models or high learning rates, this can cause gradient explosion.",
+      "suggestion": "Add torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) before optimizer.step().",
+      "status": "accepted"
+    }
+  ],
+  "rejected": [],
+  "parse_error": ""
+}

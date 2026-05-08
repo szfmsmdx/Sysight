@@ -1,0 +1,14 @@
+# Config v2 — active config for case_4
+model:
+  num_classes: 100
+
+training:
+  batch_size: 64
+  epochs: 10
+  lr: 1.0e-3
+  log_interval: 50
+
+data:
+  num_samples: 5000
+  image_size: 224
+  num_workers: 8
