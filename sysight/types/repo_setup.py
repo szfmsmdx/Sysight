@@ -10,12 +10,7 @@ from typing import Literal
 
 @dataclass
 class RepoSetup:
-    """Per-repo configuration discovered during WARMUP.
-
-    Phase 1 (deterministic) populates: entry_point, minimal_run, constraints, etc.
-    Phase 2 (LLM-guided) populates: smoke_test, metrics, test_scale, instrumentation, etc.
-    """
-    # --- Phase 1: Deterministic ---
+    """Per-repo configuration discovered during WARMUP (deterministic only)."""
     entry_point: str = ""
     minimal_run: list[str] = field(default_factory=list)
     test_commands: list[list[str]] = field(default_factory=list)
@@ -24,58 +19,10 @@ class RepoSetup:
     constraints: list[str] = field(default_factory=list)
     source: Literal["warmup_verified", "warmup_partial", "manual", "benchmark_case"] = "manual"
     verified_at: str = ""
-
-    # --- Phase 2: LLM-Guided Discovery ---
-
-    # Environment
-    python_version: str = ""
-    python_bin: str = "python"
-    gpu_available: bool = False
-    nsys_available: bool = False
-    key_packages: dict[str, str] = field(default_factory=dict)
-
-    # Smoke test
-    smoke_test_passed: bool = False
-    smoke_test_command: str = ""
-    smoke_test_exit_code: int = -1
-    smoke_test_stdout_tail: str = ""
-    smoke_test_stderr_tail: str = ""
-    smoke_test_elapsed_ms: float = 0
-    smoke_test_notes: str = ""
-
-    # Metrics
     metric_name: str = ""
     metric_grep: str = ""
-    metric_baseline: float | None = None
     metric_lower_is_better: bool = False
-    all_metrics: list[dict] = field(default_factory=list)
-
-    # Test-scale configuration
-    test_scale_applicable: bool = False
-    test_scale_config_file: str = ""
-    test_scale_params: list[dict] = field(default_factory=list)
-    test_scale_command: str = ""
-    test_scale_notes: str = ""
-
-    # Instrumentation
-    needs_instrumentation: bool = False
-    has_nvtx: bool = False
-    has_custom_timer: bool = False
-    existing_nvtx_tags: list[str] = field(default_factory=list)
-    suggested_instrumentation: list[dict] = field(default_factory=list)
-
-    # Profile validation
     profile_sqlite: str = ""
-    profile_sqlite_valid: bool = False
-    profile_nsys_rep: str = ""
-    profile_nsys_rep_valid: bool = False
-    profile_notes: str = ""
-
-    # Summary
-    warmup_summary: str = ""
-    warmup_llm_errors: list[str] = field(default_factory=list)
-    human_action_items: list[str] = field(default_factory=list)
-    warmup_raw_output: dict = field(default_factory=dict)  # raw LLM JSON, for inspection
 
     # ── Serialization / caching ──
 
@@ -126,9 +73,7 @@ class RepoSetup:
             "minimal_run": self.minimal_run,
             "metric_name": self.metric_name,
             "metric_grep": self.metric_grep,
-            "metric_baseline": self.metric_baseline,
             "metric_lower_is_better": self.metric_lower_is_better,
-            "test_scale_command": self.test_scale_command,
             "test_commands": self.test_commands,
             "build_commands": self.build_commands,
             "env_vars": self.env_vars,

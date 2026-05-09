@@ -50,9 +50,6 @@ _MARKER_END   = "# ── SYSIGHT_TIMER_END:{label} ──"
 def run_instrument(
     findings: LocalizedFindingSet,
     repo: str,
-    registry=None,
-    provider=None,
-    knowledge=None,
     *,
     verbose: bool = False,
     run_dir: Path | None = None,
@@ -224,15 +221,18 @@ def _find_enclosing_for(tree: ast.AST, line: int) -> ast.For | ast.AsyncFor | No
 def _find_stmt_at_line(tree: ast.AST, line: int) -> ast.stmt | None:
     """Return the smallest non-compound statement whose range contains *line*.
 
-    Compound nodes (For/If/With/…) are used only as fallback.
+    Compound nodes (For/If/With/…) are used only as fallback when no
+    non-compound statement matches.
     """
     _COMPOUND = (
         ast.For, ast.AsyncFor, ast.If, ast.While, ast.With,
         ast.AsyncWith, ast.FunctionDef, ast.AsyncFunctionDef,
         ast.ClassDef, ast.Try,
     )
-    best: ast.stmt | None = None
-    best_size = float("inf")
+    best_non_compound: ast.stmt | None = None
+    best_non_compound_size = float("inf")
+    best_compound: ast.stmt | None = None
+    best_compound_size = float("inf")
     for node in ast.walk(tree):
         if not isinstance(node, ast.stmt):
             continue
@@ -241,12 +241,12 @@ def _find_stmt_at_line(tree: ast.AST, line: int) -> ast.stmt | None:
             continue
         size = end - node.lineno
         if isinstance(node, _COMPOUND):
-            if best is None:
-                best, best_size = node, size
+            if size < best_compound_size:
+                best_compound, best_compound_size = node, size
         else:
-            if size < best_size:
-                best, best_size = node, size
-    return best
+            if size < best_non_compound_size:
+                best_non_compound, best_non_compound_size = node, size
+    return best_non_compound if best_non_compound is not None else best_compound
 
 
 # ── C1 (DataLoader) span helpers ────────────────────────────────────────────
@@ -350,9 +350,6 @@ def _insert_timers(root: Path, specs: list[TimerSpec], warnings: list[str]) -> l
 
     for file_rel, file_timer_specs in file_specs.items():
         file_path = root / file_rel
-        if not file_path.exists():
-            warnings.append(f"file not found: {file_rel}")
-            continue
         try:
             original = file_path.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
@@ -481,8 +478,7 @@ def _apply_timer_insertions(
 
         # Detect base indentation from the first wrapped line
         raw_first = lines[start - 1]
-        stripped_first = raw_first.lstrip()
-        indent = raw_first[:len(raw_first) - len(stripped_first)] if stripped_first else "    "
+        indent = raw_first[:len(raw_first) - len(raw_first.lstrip())] if raw_first.strip() else "    "
         inner = indent + "    "
 
         new_lines = [

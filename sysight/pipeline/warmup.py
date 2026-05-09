@@ -112,7 +112,6 @@ def _warmup_cache_path(root: Path) -> Path:
 
 def run_warmup(
     repo: str,
-    registry,
     knowledge=None,
     *,
     force: bool = False,
@@ -448,9 +447,9 @@ def _looks_like_runtime_command(command: str) -> bool:
     if not parts:
         return False
     head = parts[0].strip("\"'")
-    if _PYTHON_COMMAND_RE.search(head):
+    if _looks_like_python_executable(head):
         return True
-    if head in {"nsys", "torchrun", "bash", "sh", "$PYTHON_BIN", "${PYTHON_BIN}"}:
+    if head in {"nsys", "torchrun", "bash", "sh"}:
         return True
     return " nsys profile " in f" {command} " or "torch.distributed.launch" in command
 
@@ -463,18 +462,8 @@ def _select_commands(inventory: Inventory, facts: WarmupFacts, warnings: list[st
     elif facts.job_info.get("worker_script"):
         facts.primary_command = _redact(facts.job_info["worker_script"])
         facts.primary_source = f"{facts.job_info.get('path', '.hope')} worker.script"
-    elif "start.sh" in inventory.script_files:
-        facts.primary_command = "bash start.sh"
-        facts.primary_source = "start.sh"
-    elif "scripts/start.sh" in inventory.script_files:
-        facts.primary_command = "bash scripts/start.sh"
-        facts.primary_source = "scripts/start.sh"
     else:
-        script_command = _first_script_command(facts.script_commands)
-        if script_command:
-            facts.primary_command = script_command.command
-            facts.primary_source = f"{script_command.script}:{script_command.line}"
-            facts.primary_script = script_command.script
+        _select_command_from_scripts(inventory, facts)
 
     if not facts.primary_script:
         facts.primary_script = _script_from_command(facts.primary_command)
@@ -488,6 +477,19 @@ def _select_commands(inventory: Inventory, facts: WarmupFacts, warnings: list[st
     facts.profile_command = _select_profile_command(facts.script_commands)
     if not facts.primary_command:
         warnings.append("未发现入口命令")
+
+
+def _select_command_from_scripts(inventory: Inventory, facts: WarmupFacts) -> None:
+    for script_name in ("start.sh", "scripts/start.sh"):
+        if script_name in inventory.script_files:
+            facts.primary_command = f"bash {script_name}"
+            facts.primary_source = script_name
+            return
+    script_command = _first_script_command(facts.script_commands)
+    if script_command:
+        facts.primary_command = script_command.command
+        facts.primary_source = f"{script_command.script}:{script_command.line}"
+        facts.primary_script = script_command.script
 
 
 def _first_script_command(commands: list[ScriptCommand]) -> ScriptCommand | None:
@@ -530,9 +532,6 @@ def _fallback_python_entry(py_files: list[str]) -> str:
             return name
     for path in py_files:
         if path.endswith("/__main__.py"):
-            return path
-    for path in py_files:
-        if Path(path).name in _ENTRY_FILES:
             return path
     return py_files[0] if py_files else ""
 
@@ -748,73 +747,84 @@ def _trace_import_tree(root: Path, py_files: list[str],
     visited: set[str] = set()
     tree: dict[str, list[str]] = {}
 
-    def resolve_import(module_path: str, current_file: str, level: int = 0) -> str | None:
-        current_dir = "/".join(current_file.split("/")[:-1])
-        if level > 0:
-            parts = current_dir.split("/") if current_dir else []
-            if level > len(parts) + 1:
-                return None
-            base = parts[:max(0, len(parts) - level + 1)]
-            module_rel = module_path.replace(".", "/") if module_path else ""
-            full = "/".join([*base, module_rel]).strip("/")
-            return _match_module_path(full, py_file_set)
-
-        module_rel = module_path.replace(".", "/")
-        for prefix in import_roots:
-            full = f"{prefix}/{module_rel}".strip("/")
-            match = _match_module_path(full, py_file_set)
-            if match:
-                return match
-        return None
-
-    def trace_file(file_path: str, depth: int = 0) -> list[str]:
-        if file_path in visited or depth > 20:
-            return []
-        visited.add(file_path)
-
-        try:
-            source = (root / file_path).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return []
-
-        try:
-            node = ast.parse(source)
-        except SyntaxError:
-            tree[file_path] = []
-            return [file_path]
-
-        imports: list[str] = []
-        for stmt in ast.walk(node):
-            if isinstance(stmt, ast.Import):
-                for alias in stmt.names:
-                    resolved = resolve_import(alias.name, file_path)
-                    if resolved and resolved not in imports:
-                        imports.append(resolved)
-            elif isinstance(stmt, ast.ImportFrom):
-                module = stmt.module or ""
-                resolved = resolve_import(module, file_path, stmt.level or 0)
-                if resolved and resolved not in imports:
-                    imports.append(resolved)
-                for alias in stmt.names:
-                    if alias.name == "*":
-                        continue
-                    submodule = f"{module}.{alias.name}" if module else alias.name
-                    sub_resolved = resolve_import(submodule, file_path, stmt.level or 0)
-                    if sub_resolved and sub_resolved not in imports:
-                        imports.append(sub_resolved)
-
-        tree[file_path] = imports
-        result = [file_path]
-        for imp in imports:
-            result.extend(trace_file(imp, depth + 1))
-        return result
-
     hot: list[str] = []
     for entry in entry_files:
         if entry in py_file_set:
-            hot.extend(trace_file(entry))
+            hot.extend(_trace_file(root, entry, py_file_set, import_roots, visited, tree))
 
     return list(dict.fromkeys(hot)), tree
+
+
+def _resolve_import(
+    module_path: str, current_file: str, level: int,
+    py_file_set: set[str], import_roots: list[str],
+) -> str | None:
+    current_dir = "/".join(current_file.split("/")[:-1])
+    if level > 0:
+        parts = current_dir.split("/") if current_dir else []
+        if level > len(parts) + 1:
+            return None
+        base = parts[:max(0, len(parts) - level + 1)]
+        module_rel = module_path.replace(".", "/") if module_path else ""
+        full = "/".join([*base, module_rel]).strip("/")
+        return _match_module_path(full, py_file_set)
+
+    module_rel = module_path.replace(".", "/")
+    for prefix in import_roots:
+        full = f"{prefix}/{module_rel}".strip("/")
+        match = _match_module_path(full, py_file_set)
+        if match:
+            return match
+    return None
+
+
+def _trace_file(
+    root: Path, file_path: str,
+    py_file_set: set[str], import_roots: list[str],
+    visited: set[str], tree: dict[str, list[str]],
+    depth: int = 0,
+) -> list[str]:
+    if file_path in visited or depth > 20:
+        return []
+    visited.add(file_path)
+
+    try:
+        source = (root / file_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    try:
+        node = ast.parse(source)
+    except SyntaxError:
+        tree[file_path] = []
+        return [file_path]
+
+    imports: list[str] = []
+    for stmt in ast.walk(node):
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                resolved = _resolve_import(alias.name, file_path, 0, py_file_set, import_roots)
+                if resolved and resolved not in imports:
+                    imports.append(resolved)
+        elif isinstance(stmt, ast.ImportFrom):
+            module = stmt.module or ""
+            level = stmt.level or 0
+            resolved = _resolve_import(module, file_path, level, py_file_set, import_roots)
+            if resolved and resolved not in imports:
+                imports.append(resolved)
+            for alias in stmt.names:
+                if alias.name == "*":
+                    continue
+                submodule = f"{module}.{alias.name}" if module else alias.name
+                sub_resolved = _resolve_import(submodule, file_path, level, py_file_set, import_roots)
+                if sub_resolved and sub_resolved not in imports:
+                    imports.append(sub_resolved)
+
+    tree[file_path] = imports
+    result = [file_path]
+    for imp in imports:
+        result.extend(_trace_file(root, imp, py_file_set, import_roots, visited, tree, depth + 1))
+    return result
 
 
 def _infer_import_roots(py_files: list[str], entry_files: list[str]) -> list[str]:
@@ -1062,24 +1072,36 @@ def _build_overview(root: Path, inventory: Inventory, facts: WarmupFacts,
     - Hot-path files grouped by *role* (entry / trainer / data / model / util),
       not by directory — roles are what the performance analyst cares about.
     """
-    lines: list[str] = ["# Repo Context", ""]
+    sections: list[str] = [
+        "# Repo Context",
+        "",
+        _build_identity_section(facts, repo_setup),
+        _build_execution_section(facts),
+        _build_config_section(facts),
+        _build_code_map_section(facts, inventory),
+        _build_import_chain_section(facts),
+        _build_noise_section(inventory, warnings, errors),
+    ]
+    return "\n".join(s for s in sections if s)
 
-    # ── Section 1: Identity ──
-    lines.append("## Identity")
-    lines.append(f"workload: {facts.workload}")
+
+def _build_identity_section(facts: WarmupFacts, repo_setup: RepoSetup) -> str:
+    lines = ["## Identity", f"workload: {facts.workload}"]
     if facts.case_info.get("id"):
         lines.append(f"case_id: {facts.case_info['id']}")
     lines.append(f"status: {repo_setup.source}")
     if repo_setup.verified_at:
         lines.append(f"verified_at: {repo_setup.verified_at}")
     lines.append("")
+    return "\n".join(lines)
 
-    # ── Section 2: Execution ──
-    lines.append("## Execution")
+
+def _build_execution_section(facts: WarmupFacts) -> str:
+    lines = ["## Execution"]
     if facts.primary_command:
-        lines.append(f"run_cmd: `{_redact(facts.primary_command)}`")
+        lines.append(f"run_cmd: `{facts.primary_command}`")
     if facts.profile_command:
-        lines.append(f"profile_cmd: `{_redact(facts.profile_command)}`")
+        lines.append(f"profile_cmd: `{facts.profile_command}`")
     if facts.profile_sqlite:
         lines.append(f"profile_sqlite: `{facts.profile_sqlite}`")
     if facts.case_info.get("profile_nsys_rep"):
@@ -1087,39 +1109,44 @@ def _build_overview(root: Path, inventory: Inventory, facts: WarmupFacts,
     if facts.constraints:
         lines.append("constraints: " + "; ".join(facts.constraints))
     lines.append("")
+    return "\n".join(lines)
 
-    # ── Section 3: Active Config & Perf Knobs ──
-    if facts.active_config or facts.perf_knobs:
-        lines.append("## Config")
-        if facts.active_config:
-            tag = "ok" if facts.active_config_exists else "missing"
-            lines.append(f"active_config: `{facts.active_config}` [{tag}]")
-        if facts.active_variants:
-            for key, value in sorted(facts.active_variants.items()):
-                lines.append(f"variant_{key}: `{value}`")
-        if facts.job_info.get("app_name"):
-            lines.append(f"job_name: `{facts.job_info['app_name']}`")
-        if facts.perf_knobs:
-            lines.append("perf_knobs:")
-            for knob in facts.perf_knobs[:16]:
-                lines.append(f"  {knob}")
-        if facts.inactive_configs:
-            if len(facts.inactive_configs) <= 4:
-                names = ", ".join(f"`{c}`" for c in facts.inactive_configs)
-                lines.append(f"inactive_config_variants: {names}")
-            else:
-                lines.append(f"inactive_config_variants: {len(facts.inactive_configs)} (same dir, not active)")
-        lines.append("")
 
-    # ── Section 4: Code Map — role-based, not directory-based ──
-    lines.append("## Code Map")
-    lines.append(f"entry_point: `{'`, `'.join(facts.entry_files[:4]) if facts.entry_files else 'unknown'}`")
-    lines.append(f"hot_path_total: {len(facts.hot_path_files)} files")
+def _build_config_section(facts: WarmupFacts) -> str:
+    if not facts.active_config and not facts.perf_knobs:
+        return ""
+    lines = ["## Config"]
+    if facts.active_config:
+        tag = "ok" if facts.active_config_exists else "missing"
+        lines.append(f"active_config: `{facts.active_config}` [{tag}]")
+    if facts.active_variants:
+        for key, value in sorted(facts.active_variants.items()):
+            lines.append(f"variant_{key}: `{value}`")
+    if facts.job_info.get("app_name"):
+        lines.append(f"job_name: `{facts.job_info['app_name']}`")
+    if facts.perf_knobs:
+        lines.append("perf_knobs:")
+        for knob in facts.perf_knobs[:16]:
+            lines.append(f"  {knob}")
+    if facts.inactive_configs:
+        if len(facts.inactive_configs) <= 4:
+            names = ", ".join(f"`{c}`" for c in facts.inactive_configs)
+            lines.append(f"inactive_config_variants: {names}")
+        else:
+            lines.append(f"inactive_config_variants: {len(facts.inactive_configs)} (same dir, not active)")
     lines.append("")
+    return "\n".join(lines)
 
+
+def _build_code_map_section(facts: WarmupFacts, inventory: Inventory) -> str:
+    lines = [
+        "## Code Map",
+        f"entry_point: `{'`, `'.join(facts.entry_files[:4]) if facts.entry_files else 'unknown'}`",
+        f"hot_path_total: {len(facts.hot_path_files)} files",
+        "",
+    ]
     role_groups = _classify_hot_path_by_role(facts.hot_path_files)
     for role, role_files in role_groups.items():
-        # Show at most 8 files per role; truncate with count if more
         shown = role_files[:8]
         tail = f" … +{len(role_files) - 8}" if len(role_files) > 8 else ""
         lines.append(f"{role}: " + ", ".join(f"`{p}`" for p in shown) + tail)
@@ -1128,33 +1155,35 @@ def _build_overview(root: Path, inventory: Inventory, facts: WarmupFacts,
     if cold_count:
         lines.append(f"off_hot_path: {cold_count} files (not reachable from entry)")
     lines.append("")
+    return "\n".join(lines)
 
-    # ── Section 5: Import Chain (compact, entry → key deps) ──
-    if facts.import_tree and facts.entry_files:
-        lines.append("## Import Chain")
-        lines.append("(entry → direct imports → key transitive, max depth 4)")
-        lines.append("```")
-        lines.extend(_render_import_tree_compact(
-            facts.hot_path_files, facts.import_tree,
-            entry_files=facts.entry_files,
-            max_depth=4, max_lines=40,
-        ))
-        lines.append("```")
-        lines.append("")
 
-    # ── Section 6: Noise summary (collapsed) ──
-    noise_parts: list[str] = []
-    for reason, count in sorted(inventory.ignored_counts.items()):
-        noise_parts.append(f"{count}×{reason}")
+def _build_import_chain_section(facts: WarmupFacts) -> str:
+    if not facts.import_tree or not facts.entry_files:
+        return ""
+    lines = [
+        "## Import Chain",
+        "(entry → direct imports → key transitive, max depth 4)",
+        "```",
+    ]
+    lines.extend(_render_import_tree_compact(
+        facts.hot_path_files, facts.import_tree,
+        entry_files=facts.entry_files,
+        max_depth=4, max_lines=40,
+    ))
+    lines.extend(["```", ""])
+    return "\n".join(lines)
+
+
+def _build_noise_section(inventory: Inventory, warnings: list[str], errors: list[str]) -> str:
+    lines: list[str] = []
+    noise_parts = [f"{count}×{reason}" for reason, count in sorted(inventory.ignored_counts.items())]
     if noise_parts:
-        lines.append(f"## Noise (pruned)")
-        lines.append("skipped_dirs: " + ", ".join(noise_parts))
-
+        lines.extend(["## Noise (pruned)", "skipped_dirs: " + ", ".join(noise_parts)])
     if warnings:
         lines.append("warnings: " + "; ".join(warnings[:5]))
     if errors:
         lines.append("errors: " + "; ".join(errors[:3]))
-
     return "\n".join(lines)
 
 

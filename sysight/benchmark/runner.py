@@ -150,7 +150,7 @@ class BenchmarkRunner:
             print(f"  [warmup] scanning repo...")
             try:
                 from sysight.pipeline.warmup import run_warmup
-                wr = run_warmup(repo_root, self._registry, self._knowledge, force=self._force_warmup)
+                wr = run_warmup(repo_root, self._knowledge, force=self._force_warmup)
                 result.warmup = {
                     "entry_point": wr.repo_setup.entry_point,
                     "test_commands": wr.repo_setup.test_commands,

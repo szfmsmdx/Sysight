@@ -95,7 +95,7 @@ def load_config(path: str | Path | None = None) -> dict[str, LLMConfig]:
     raw = _parse_yaml_simple(path)
     configs: dict[str, LLMConfig] = {}
 
-    for stage in ("analyze", "optimize", "learn", "warmup"):
+    for stage in ("analyze", "optimize", "learn", "warmup", "instrument"):
         if stage in raw and isinstance(raw[stage], dict):
             d = raw[stage]
             configs[stage] = LLMConfig(
@@ -104,7 +104,7 @@ def load_config(path: str | Path | None = None) -> dict[str, LLMConfig]:
                 api_key=d.get("api_key", ""),
                 base_url=d.get("base_url"),
                 temperature=d.get("temperature", 0),
-                max_tokens=d.get("max_tokens", 4096),
+                max_tokens=d.get("max_tokens", 16384),
                 reasoning_effort=d.get("reasoning_effort"),
                 thinking=d.get("thinking"),
             )

@@ -31,6 +31,7 @@ class AgentTask:
     response_schema: dict | None = None
     max_turns: int = 30
     max_wall_seconds: int = 600
+    max_tokens: int | None = None             # per-task output token limit; None = use provider default
     context_policy: ContextPolicy | None = None
 
 
@@ -86,8 +87,8 @@ class AgentLoop:
         if not policy.model_name and hasattr(self._provider, 'model'):
             policy = ContextPolicy(
                 model_name=getattr(self._provider, 'model', ''),
-                soft_token_limit=policy.soft_token_limit,
                 compact_token_limit=policy.compact_token_limit,
+                snip_token_limit=policy.snip_token_limit,
                 hard_token_limit=policy.hard_token_limit,
                 full_tool_result_once=policy.full_tool_result_once,
                 compact_after_first_exposure=policy.compact_after_first_exposure,
@@ -146,6 +147,7 @@ class AgentLoop:
                 response_schema=None,  # Only enforce schema on final output
                 debug_messages=context.full_log_messages(),
                 context_stats=context_stats.to_dict(),
+                max_tokens=task.max_tokens,
             )
 
             response = None
@@ -253,6 +255,30 @@ class AgentLoop:
                         status=result.status, error=result.error, data=result.data)
             else:
                 # Final output — no tool calls
+                # Check if output was truncated (thinking exhausted token budget)
+                if response.finish_reason in ("max_tokens", "length"):
+                    errors.append(
+                        f"LLM output truncated (finish={response.finish_reason}, "
+                        f"output_tokens={response.usage.output_tokens if response.usage else '?'}). "
+                        f"Consider increasing max_tokens."
+                    )
+                    # If there's no content at all, this is a hard failure
+                    if not response.content.strip():
+                        return AgentResult(
+                            run_id=task.run_id, task_id=task.task_id,
+                            backend=self._provider.name, model=getattr(self._provider, 'model', ''),
+                            status="provider_error",
+                            tool_calls=tool_calls_log,
+                            usage={
+                                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                                "output_tokens": response.usage.output_tokens if response.usage else 0,
+                            },
+                            context_stats={"turns": context_stats_log, "last": context_stats_log[-1] if context_stats_log else {}},
+                            errors=errors, turns=turns,
+                            backoff_ms=backoff_total_s * 1000,
+                            elapsed_ms=(time.monotonic() - t0) * 1000,
+                        )
+
                 output = {}
                 raw = response.content
                 parse_error = None

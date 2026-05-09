@@ -70,8 +70,10 @@ class OpenAICompatibleProvider:
         if reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
 
-        if self._config.max_tokens and self._config.max_tokens > 0:
-            body["max_tokens"] = self._config.max_tokens
+        # Per-request override takes priority, then config
+        effective_max_tokens = request.max_tokens or self._config.max_tokens
+        if effective_max_tokens and effective_max_tokens > 0:
+            body["max_tokens"] = effective_max_tokens
 
         if request.tools:
             body["tools"] = request.tools

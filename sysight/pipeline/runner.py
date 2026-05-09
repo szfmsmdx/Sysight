@@ -1,7 +1,7 @@
-"""PipelineRunner — four-stage orchestration.
+"""PipelineRunner — five-stage orchestration.
 
 Template Method pattern — skeleton: pre → run → post → ledger.
-Stages: WARMUP → ANALYZE → LEARN → OPTIMIZE → LEARN.
+Stages: WARMUP → ANALYZE → INSTRUMENT → LEARN → OPTIMIZE → EXECUTE → LEARN.
 
 Usage:
   runner = PipelineRunner(registry, provider_factory, knowledge)
@@ -26,7 +26,7 @@ class PipelineResult:
 
 
 class PipelineRunner:
-    """Orchestrates WARMUP → ANALYZE → INSTRUMENT → LEARN → OPTIMIZE → LEARN."""
+    """Orchestrates WARMUP → ANALYZE → INSTRUMENT → LEARN → OPTIMIZE → EXECUTE → LEARN."""
 
     def __init__(self, registry, provider_factory, knowledge=None):
         self._registry = registry
@@ -81,11 +81,11 @@ class PipelineRunner:
         except Exception as e:
             errors.append(f"learn(after analyze): {e}")
 
-        # 2. OPTIMIZE
+        # 2. OPTIMIZE (plan only — no file changes)
         try:
             optimize_provider = self._provider_factory("optimize")
-            optimize_result = self.run_optimize(
-                analyze_result.finding_set, repo, optimize_provider
+            patches = self.run_optimize(
+                analyze_result.finding_set, repo, optimize_provider,
             )
             stages.append("optimize")
         except Exception as e:
@@ -96,11 +96,26 @@ class PipelineRunner:
                 errors=errors, stages_completed=stages,
             )
 
-        # 2.1 LEARN (from analyze findings + optimize patches)
+        # 3. EXECUTE (apply patches, smoke test, timer comparison)
+        execute_result = None
+        if patches:
+            try:
+                execute_result = self.run_execute(
+                    patches, repo,
+                    run_id=analyze_result.run_id,
+                    analyze_run_dir=analyze_result.run_dir,
+                )
+                stages.append("execute")
+            except Exception as e:
+                errors.append(f"execute: {e}")
+
+        # 3.1 LEARN (from analyze findings + execute patches)
         try:
             learn_provider = self._provider_factory("learn")
             findings_json = _serialize_findings(analyze_result.finding_set)
-            patches_json = _serialize_patches(optimize_result.patches)
+            patches_json = _serialize_patches(
+                execute_result.patches if execute_result else []
+            )
             self.run_learn(
                 analyze_result.run_id,
                 learn_provider,
@@ -110,18 +125,18 @@ class PipelineRunner:
             if "learn" not in stages:
                 stages.append("learn")
         except Exception as e:
-            errors.append(f"learn(after optimize): {e}")
+            errors.append(f"learn(after execute): {e}")
 
         return PipelineResult(
             run_id=analyze_result.run_id,
             findings=[f.__dict__ for f in analyze_result.finding_set.findings],
-            patches=[p.__dict__ for p in optimize_result.patches],
+            patches=[p.__dict__ for p in (execute_result.patches if execute_result else [])],
             errors=errors, stages_completed=stages,
         )
 
     def run_warmup(self, repo: str):
         from sysight.pipeline.warmup import run_warmup
-        return run_warmup(repo, self._registry, self._knowledge)
+        return run_warmup(repo, self._knowledge)
 
     def run_analyze(self, profile: str, repo: str, provider):
         from sysight.pipeline.analyze import run_analyze
@@ -129,18 +144,26 @@ class PipelineRunner:
 
     def run_instrument(self, findings, repo: str, provider, run_dir=None):
         from sysight.pipeline.instrument import run_instrument
-        from sysight.pipeline.warmup import _warmup_cache_path
-        from sysight.types.repo_setup import RepoSetup
-        cache_path = _warmup_cache_path(Path(repo))
-        repo_setup = RepoSetup.load_cache(cache_path)
         return run_instrument(
-            findings, repo, self._registry, provider, self._knowledge,
-            repo_setup=repo_setup, run_dir=run_dir,
+            findings, repo,
+            run_dir=run_dir,
         )
 
     def run_optimize(self, findings, repo: str, provider):
         from sysight.pipeline.optimize import run_optimize
-        return run_optimize(findings, repo, self._registry, provider, self._knowledge)
+        return run_optimize(
+            findings, repo, self._registry, provider,
+        )
+
+    def run_execute(self, patches, repo: str, *,
+                    run_id: str = "",
+                    analyze_run_dir=None):
+        from sysight.pipeline.execute import run_execute
+        return run_execute(
+            patches, repo,
+            run_id=run_id,
+            analyze_run_dir=analyze_run_dir,
+        )
 
     def run_learn(self, run_id: str, provider=None,
                   findings_json: str = "", patches_json: str = ""):
@@ -157,7 +180,8 @@ def _serialize_findings(finding_set) -> str:
         "summary": finding_set.summary,
         "findings": [
             {k: getattr(f, k) for k in ("finding_id", "category", "title", "priority",
-                                         "file_path", "function", "line", "description", "suggestion")}
+                                         "file_path", "function", "line", "metric",
+                                         "description", "suggestion")}
             for f in finding_set.findings
         ],
     }, indent=2, ensure_ascii=False)
@@ -165,7 +189,7 @@ def _serialize_findings(finding_set) -> str:
 
 def _serialize_patches(patches) -> str:
     return json.dumps([
-        {"patch_id": p.patch_id, "finding_id": p.finding_id,
+        {"patch_id": p.patch_id, "finding_ids": p.finding_ids,
          "status": p.status, "reason": getattr(p, "reason", ""),
          "diff": getattr(p, "diff", "")}
         for p in patches

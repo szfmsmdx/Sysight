@@ -44,7 +44,7 @@ class LLMConfig:
             api_key=d.get("api_key", ""),
             base_url=d.get("base_url"),
             temperature=d.get("temperature", 0),
-            max_tokens=d.get("max_tokens", 4096),
+            max_tokens=d.get("max_tokens", 16384),
             reasoning_effort=d.get("reasoning_effort"),
             thinking=d.get("thinking"),
         )
@@ -65,6 +65,7 @@ class LLMRequest:
     response_schema: dict | None = None
     debug_messages: list[dict] | None = None
     context_stats: dict = field(default_factory=dict)
+    max_tokens: int | None = None  # per-request override; None = use provider default
 
 
 @dataclass

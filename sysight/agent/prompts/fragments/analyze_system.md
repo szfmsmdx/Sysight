@@ -6,9 +6,11 @@
 
 ## 1. 形成假设
 
-阅读预注入的 profile 数据，对每个信号按 C1-C7 映射形成候选假设，再进入源码验证。每次调用 repo 工具前必须有明确假设——例如"怀疑 loss.item() 在每 step 热路径上导致 D2H sync"。
+阅读预注入的 profile 数据，对每个信号按 C1-C7 映射形成候选假设，再进入源码验证。每次调用 repo 工具前必须有明确假设。若 profile 或配置包含分布式信号（`world_size > 1`、NCCL ops、`gpu_comm` 非零、DDP/FSDP 相关 NVTX），须将分布式代码路径（DDP 配置、all_reduce、barrier）纳入 C6 假设，不因 profile 为单卡采集或 `is_initialized()` 为 false 而排除。
 
 若 User Prompt 中 `experience_context` 存在，**优先调用 `memory_read(experience)` 再形成假设**，利用历史反模式加速假设搜索；不要等到"遇到不确定再查"，应作为假设形成阶段的默认第一步。
+
+若 profile 拓扑为**单机单卡**，但 NVTX label 含 `ddp`/`rank`/`world` 等字样，应先验证源码是否真的调用 `init_process_group` 或多进程启动；若无，DDP 标签只是命名风格，C6 假设可快速排除，**不需要花多轮探查分布式代码路径**，应将 turns 优先用于 C2/C3/C4/C7 的覆盖。
 
 ## 2. 使用 memory 缩小范围
 
@@ -40,7 +42,7 @@ warmup 已生成 memory/overview，包含入口文件、调用关系、active va
 
 | 值 | 含义 | 排查重点 |
 |----|------|---------|
-| C1 | Host Scheduling | DataLoader worker=0、`torch.set_num_threads`、`pin_memory=False`、prefetch 缺失；配置值须追踪到**赋值/定义行**（变量、常量或 config 字段），而非仅报传参的调用行 |
+| C1 | Host Scheduling | DataLoader worker=0、`torch.set_num_threads`、`pin_memory=False`、prefetch 缺失；配置值的 finding 行须追踪到**最近的赋值/定义处**：若问题值由 YAML/JSON 配置文件直接指定（如 `num_workers: 0`），`file` 指向该配置文件、`line` 指向对应行；若配置文件无此字段（即使用 Python 代码中的 default），则追踪到源码中的赋值/定义行（变量、常量或 config 字段默认值行），而非将其传递给函数参数的调用行；例如 `worker_count = config.loader_workers` 是赋值行，`num_workers=worker_count` 是传参行，前者才是 finding 行 |
 | C2 | Kernel Launch Overhead | Python 循环/自回归逐 token/per-head 循环触发大量小 CUDA op；`line` 指向 `for` 关键字所在行 |
 | C3 | Synchronization | `.item()`、`.cpu()`、`.numpy()`、`.tolist()`、`cudaDeviceSynchronize()`；同步点和触发同步的通信应分别成条 |
 | C4 | Memory Copy | 热路径中**每一个** `.to(device)` / `.cuda()` / `.cpu()` 调用点均须独立输出 C4 finding，不得跳过；`.to(device)` 搬运是 C4，`pin_memory=False` 配置是 C1，二者不互斥；循环内重复搬运须各行单独输出 |
@@ -75,11 +77,12 @@ warmup 已生成 memory/overview，包含入口文件、调用关系、active va
       "title": "问题标题",
       "priority": "high|medium|low",
       "evidence": ["关键数字1", "关键数字2"],
+      "metric": "profile 中与该 finding 直接相关的量化指标（如耗时 ms、次数、字节数等），无则 null",
       "file": "repo 内相对路径，找不到则 null",
       "function": "函数名，找不到则 null",
       "line": 42,
       "description": "profile 侧证据 + 代码侧原因",
-      "suggestion": "改进建议"
+      "suggestion": "改进方向（简要，不含具体 patch 代码）"
     }
   ]
 }

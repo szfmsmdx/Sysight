@@ -50,7 +50,8 @@ class AnthropicProvider:
         url = self._base_url.rstrip("/") + "/messages"
 
         # max_tokens is REQUIRED by Anthropic API
-        max_tokens = self._config.max_tokens if self._config.max_tokens else 4096
+        # Per-request override takes priority, then config, then fallback 4096
+        max_tokens = request.max_tokens or self._config.max_tokens or 4096
 
         is_first_request = not self._cache_initialized
 

@@ -1,1 +1,1 @@
-"""Pipeline stage orchestration: warmup, analyze, optimize, learn."""
+"""Pipeline stage orchestration: warmup, analyze, instrument, optimize, execute, learn."""

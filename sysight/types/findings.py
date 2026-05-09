@@ -26,6 +26,7 @@ class LocalizedFinding:
     priority: Literal["high", "medium", "low"] = "medium"
     confidence: Literal["confirmed", "probable", "unresolved"] = "unresolved"
     evidence_refs: list[str] = field(default_factory=list)
+    metric: str = ""                      # Quantified indicator from profile (e.g. "12.5ms", "843 calls")
     file_path: str | None = None
     function: str | None = None
     line: int | None = None

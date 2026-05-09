@@ -1,34 +1,45 @@
 """Context management for multi-turn tool-calling agents.
 
-Progressive compaction pipeline (inspired by Claude Code / Codex / DeepSeek TUI):
+Progressive compaction pipeline (inspired by MiniCode / Claude Code / Codex):
 
-  Level 1 — Large-Result Persistence (zero model cost)
-    Tool results >50K chars → persist full output to disk, keep 2KB preview.
+  Level 0 — Microcompact  (MiniCode microcompact pattern)
+    At ≥50% utilization: clear old COMPACTABLE tool results (file lists, SQL
+    summaries, etc.) to a CLEAR_MARKER placeholder.  Only the most recent
+    KEEP_RECENT_TOOL_RESULTS results are retained.  Zero information loss for
+    non-compactable tools.
+
+  Level 1 — Large-Result Persistence  (zero model cost)
+    Tool results >20K tokens → persist full output to disk, keep short preview.
     Model can re-read via scanner_read if needed.
 
-  Level 2 — Time-Based Compaction (Codex "late compaction" strategy)
-    Two-tier: when estimated tokens exceed *compact_token_limit* (90% of
-    window), results older than *keep_recent_turns_full* → compact.
-    Below that threshold, results older than *keep_recent_turns_full* × 3
-    are still compacted to prevent unbounded growth in medium sessions.
+  Level 2 — Time-Based Compaction  (Codex "late compaction" strategy)
+    At ≥70% utilization: replace old tool results with template-generated
+    summaries.  Results younger than keep_recent_turns_full are kept full.
+
+  Level 2.5 — Snip  (MiniCode snipCompact pattern — deterministic, no LLM)
+    At ≥80% utilization: physically remove a contiguous "safe" middle interval
+    of messages.  Protected: system messages, recent N messages, and tool
+    calls that involve write/edit operations.  A snip_boundary marker is
+    inserted in place of the removed block.
 
   Level 3 — Token-Pressure Compaction
-    When estimated prompt tokens exceed *hard_token_limit* (95% of window)
-    → aggressively compact ALL old results and inject a recovery message
-    containing recently-read file contents + session progress summary.
+    At ≥95% utilization: aggressively compact ALL old tool results + inject a
+    recovery message (recently-read file contents + session progress).
 
-  Circuit Breaker (Claude Code pattern)
-    After N consecutive Level-3 compaction events, further compaction is
-    blocked to prevent infinite compaction loops.
+  Circuit Breaker  (MiniCode / Claude Code pattern)
+    If Level 3 triggers consecutively ≥ N times *without the token count
+    dropping below the compact threshold* (i.e. compaction is not helping),
+    further compaction is blocked and a warning is injected.  The counter
+    resets only when estimated_tokens < compact_limit * RESET_RATIO.
 
-Token estimation uses the anchor+delta method: server-reported prompt_tokens
-from the last API response serve as the anchor; only the delta (new messages
-added since then) is estimated client-side.  Typical error <5 %.
+Token estimation
+    Anchor+delta method: server-reported prompt_tokens from the last API
+    response serves as the anchor; delta is computed from the COMPACTED chars
+    (i.e. chars of the messages actually sent to the model, not full_chars) of
+    messages added since the anchor.  Typical error <5%.
 
-Model-aware thresholds (DeepSeek-TUI pattern)
-    soft/hard token limits are auto-scaled based on the model's context
-    window.  Models with 1M+ context (DeepSeek V4, Gemini 2.5) get much
-    higher thresholds than 128K models.
+Model-aware thresholds  (DeepSeek-TUI pattern)
+    All token limits auto-scale to the model's context window.
 """
 
 from __future__ import annotations
@@ -39,6 +50,7 @@ import hashlib
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -52,7 +64,7 @@ _CHARS_PER_TOKEN = 3.5  # conservative estimate for code-heavy content
 # Model → context window mapping (DeepSeek-TUI "model-aware thresholds" pattern)
 # Data sourced from official docs as of May 2026.
 _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    # OpenAI (GPT-5.5 released 2026-04-23, 1M API / 400K Codex)
+    # OpenAI
     "gpt-5.5": 1_000_000,
     "gpt-5.4": 1_000_000,
     "gpt-5.2": 400_000,
@@ -60,20 +72,20 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-5": 400_000,
     "o4": 200_000,
     "o4-mini": 200_000,
-    # Anthropic (Opus 4.7: 200K std / 1M beta; 4.6: 1M GA)
+    # Anthropic
     "claude-opus-4-7": 200_000,
     "claude-opus-4-6": 1_000_000,
     "claude-sonnet-4-6": 1_000_000,
     "claude-opus-4-5": 200_000,
     "claude-sonnet-4-5": 200_000,
     "claude-haiku-4-5": 200_000,
-    # DeepSeek (V4 Pro/Flash: 1M, released 2026-04-24)
+    # DeepSeek
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-v4": 1_000_000,
     "deepseek-v3.2": 128_000,
     "deepseek-r1": 128_000,
-    # Google (Gemini 3.1 Pro / 3 Flash: 1M; 3 Pro: 1M API / 10M Vertex)
+    # Google
     "gemini-3.1-pro": 1_048_576,
     "gemini-3-flash": 1_048_576,
     "gemini-3-pro": 1_048_576,
@@ -81,13 +93,43 @@ _MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gemini-2.5-flash": 1_048_576,
 }
 
-# Default: DeepSeek V4 Pro (1M context, cost-effective for agentic workloads)
 _DEFAULT_CONTEXT_WINDOW = 1_000_000
 
-# Percentage of context window used as token limits (Codex "late compaction")
-_COMPACT_THRESHOLD_RATIO = 0.90  # start time-based compaction at 90% of window
-_HARD_LIMIT_RATIO = 0.95         # aggressive pressure compaction at 95% of window
-_CIRCUIT_BREAKER_MAX = 3         # consecutive Level-3 events before blocking
+# Utilization thresholds (fraction of context window)
+_MICROCOMPACT_UTILIZATION = 0.50   # Level 0: clear compactable tool results
+_COMPACT_THRESHOLD_RATIO  = 0.70   # Level 2: time-based compaction
+_SNIP_THRESHOLD_RATIO     = 0.80   # Level 2.5: deterministic snip
+_HARD_LIMIT_RATIO         = 0.95   # Level 3: aggressive pressure
+
+# Snip parameters (MiniCode snipCompact)
+_SNIP_TARGET_USAGE           = 0.60   # target utilization after snip
+_SNIP_KEEP_RECENT_MESSAGES   = 12     # never snip the most recent N messages
+_SNIP_MIN_MESSAGES_TO_REMOVE = 4      # don't bother if we'd remove < 4 messages
+_SNIP_MIN_TOKENS_TO_FREE     = 2_000  # don't bother if savings < 2K tokens
+
+# Retention for microcompact
+_KEEP_RECENT_TOOL_RESULTS = 3   # always keep the last N compactable tool results full
+
+# Circuit breaker — reset only when well below compact threshold
+_CIRCUIT_BREAKER_MAX  = 3
+_CIRCUIT_BREAKER_RESET_RATIO = 0.80  # reset counter only when util < 80% of compact limit
+
+# Tools whose results can be cleared (content-insensitive for the model)
+_COMPACTABLE_TOOLS: frozenset[str] = frozenset({
+    "scanner_files",
+    "nsys_sql_list_tables",
+    "nsys_sql_schema",
+})
+
+# Special marker replacing cleared tool results (MiniCode CLEAR_MARKER pattern)
+_CLEAR_MARKER = "[tool result cleared — microcompact]"
+
+# Tool names that involve writes/edits — their rounds are protected from Snip
+_PROTECTED_TOOL_NAMES: frozenset[str] = frozenset({
+    "scanner_write",
+    "scanner_patch",
+    "scanner_edit",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -98,68 +140,54 @@ _CIRCUIT_BREAKER_MAX = 3         # consecutive Level-3 events before blocking
 class ContextPolicy:
     """Controls how the model-facing context is built.
 
-    If *model_name* is provided, soft/hard token limits are auto-scaled
-    based on the model's known context window (DeepSeek-TUI pattern).
-    You can still override by setting soft/hard_token_limit explicitly.
+    All token limits auto-scale from model_name when set to 0.
     """
 
-    # ---- Model-aware thresholds (DeepSeek-TUI pattern) ----
     model_name: str = ""
 
-    # ---- Token budget (auto-scaled if model_name is set) ----
-    soft_token_limit: int = 0       # 0 → auto-compute from model_name
-    compact_token_limit: int = 0    # 0 → auto-compute (90% of window); threshold for Level 2
-    hard_token_limit: int = 0       # 0 → auto-compute (95% of window); threshold for Level 3
+    # Token budget (0 → auto-compute)
+    compact_token_limit: int = 0    # Level 2 threshold
+    snip_token_limit: int = 0       # Level 2.5 threshold
+    hard_token_limit: int = 0       # Level 3 threshold
 
-    # ---- Time-based compaction (Level 2) ----
+    # Time-based compaction (Level 2)
     full_tool_result_once: bool = True
     compact_after_first_exposure: bool = True
-    keep_recent_turns_full: int = 3   # increased from 1
+    keep_recent_turns_full: int = 3
 
-    # ---- Large-file persistence (Level 1) ----
-    # Thresholds in tokens (not chars).  Internally converted via _CHARS_PER_TOKEN.
-    # Claude Code uses 50K chars (~14K tokens); V4 Pro aligned at 20K.
+    # Large-file persistence (Level 1)
     large_result_threshold_tokens: int = 20_000
     large_result_preview_tokens: int = 600
 
-    # ---- Recovery after aggressive compaction (Level 3) ----
+    # Recovery after Level 3
     restore_recent_files: bool = True
     restore_file_count: int = 5
-    # Claude Code: ≤5K tokens per recovered file
     restore_max_tokens_per_file: int = 5_000
 
-    # ---- Circuit breaker (Claude Code pattern) ----
+    # Circuit breaker
     circuit_breaker_max: int = _CIRCUIT_BREAKER_MAX
 
-    def effective_soft_limit(self) -> int:
-        """Return the effective soft token limit (auto-scaled if model_name set)."""
-        if self.soft_token_limit > 0:
-            return self.soft_token_limit
-        window = self._context_window()
-        return int(window * _COMPACT_THRESHOLD_RATIO)
-
     def effective_compact_limit(self) -> int:
-        """Return the threshold for time-based compaction (Level 2).
-
-        Below this limit, no compaction at all — keep full history.
-        """
         if self.compact_token_limit > 0:
             return self.compact_token_limit
-        window = self._context_window()
-        return int(window * _COMPACT_THRESHOLD_RATIO)
+        return int(self._context_window() * _COMPACT_THRESHOLD_RATIO)
+
+    def effective_snip_limit(self) -> int:
+        if self.snip_token_limit > 0:
+            return self.snip_token_limit
+        return int(self._context_window() * _SNIP_THRESHOLD_RATIO)
 
     def effective_hard_limit(self) -> int:
-        """Return the effective hard token limit (auto-scaled if model_name set)."""
         if self.hard_token_limit > 0:
             return self.hard_token_limit
-        window = self._context_window()
-        return int(window * _HARD_LIMIT_RATIO)
+        return int(self._context_window() * _HARD_LIMIT_RATIO)
+
+    def effective_microcompact_limit(self) -> int:
+        return int(self._context_window() * _MICROCOMPACT_UTILIZATION)
 
     def _context_window(self) -> int:
-        """Look up context window for model_name, with fuzzy matching."""
         if self.model_name in _MODEL_CONTEXT_WINDOWS:
             return _MODEL_CONTEXT_WINDOWS[self.model_name]
-        # Fuzzy: try case-insensitive substring match
         name_lower = self.model_name.lower()
         for key, window in _MODEL_CONTEXT_WINDOWS.items():
             if key in name_lower or name_lower in key:
@@ -175,7 +203,8 @@ class ContextPolicy:
 class _StoredMessage:
     message: dict
     turn: int
-    kind: str = "message"               # "message" | "tool"
+    kind: str = "message"               # "message" | "tool" | "snip_boundary"
+    tool_name: str = ""                  # populated for kind=="tool"
     compact_message: dict | None = None
     full_chars: int = 0
     compact_chars: int = 0
@@ -184,6 +213,10 @@ class _StoredMessage:
     # Large-file persistence
     is_persisted: bool = False
     persist_path: str = ""
+    # Microcompact: content already cleared
+    is_cleared: bool = False
+    # Snip: this slot is a boundary marker (replaces deleted messages)
+    is_snip_boundary: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +234,12 @@ class ContextStats:
     model_tokens: int = 0
     compacted_tokens: int = 0
     compacted_tool_results: int = 0
+    cleared_tool_results: int = 0       # microcompact
     persisted_results: int = 0
+    snipped_messages: int = 0           # Level 2.5
     estimated_tokens: int = 0
-    compaction_level: int = 0          # 0=none 1=large-persist 2=time 3=pressure
+    compaction_level: int = 0           # 0=none 1=persist 2=time 2.5→reported as 2 3=pressure
+    snip_applied: bool = False
     recovery_injected: bool = False
     circuit_breaker_active: bool = False
     prompt_tokens: int = 0
@@ -221,14 +257,15 @@ class ContextStats:
 class AgentContext:
     """Stores full messages and builds progressively compacted model views.
 
-    Usage in the agent loop::
+    Usage::
 
         ctx = AgentContext(user_prompt, policy, persist_dir=run_dir)
         for turn in range(max_turns):
             msgs, stats = ctx.build_model_messages(turn)
             response = provider.complete(...)
             ctx.update_token_usage(response.usage.prompt_tokens)
-            # ... append tool results ...
+            ctx.append_message({"role": "assistant", ...}, turn=turn)
+            ctx.append_tool_result(result_msg, turn=turn, tool_name=..., ...)
     """
 
     def __init__(
@@ -240,24 +277,30 @@ class AgentContext:
     ):
         self.policy = policy or ContextPolicy()
         self._messages: list[_StoredMessage] = []
+
+        # Token anchor (server-reported, used for delta estimation)
         self._anchor_tokens: int = 0
-        self._anchor_msg_count: int = 0
-        self._recently_read: list[dict] = []   # {path, repo, lines, turn}
+        # Chars of the message list *as sent to the model* at anchor time
+        self._anchor_sent_chars: int = 0
+
+        self._recently_read: list[dict] = []
         if persist_dir:
             self._persist_dir = Path(persist_dir)
         else:
-            # Default: .sysight/tool-results/ in cwd (same namespace as memory/analysis-runs)
             self._persist_dir = Path.cwd() / ".sysight" / "tool-results"
-        self._recovery_done: bool = False
-        self._circuit_breaker_warning_done: bool = False  # separate from recovery
 
-        # Circuit breaker state (Claude Code pattern)
+        self._recovery_done: bool = False
+        self._circuit_breaker_warning_done: bool = False
+
+        # Circuit breaker (MiniCode / Claude Code pattern)
+        # Counter increments only when pressure fires AND tokens did NOT drop
+        # below the compact_limit * RESET_RATIO between turns.
         self._consecutive_pressure_events: int = 0
         self._circuit_breaker_tripped: bool = False
 
         # Session progress tracking (Codex "ghost history" prevention)
-        self._session_files_read: list[str] = []      # ordered list of unique file paths
-        self._session_tools_called: dict[str, int] = {}  # tool_name → count
+        self._session_files_read: list[str] = []
+        self._session_tools_called: dict[str, int] = {}
         self._session_findings_count: int = 0
 
         self.append_message({"role": "user", "content": user_prompt}, turn=0)
@@ -315,8 +358,6 @@ class AgentContext:
 
         full_chars_val = _message_chars(full)
         compact_chars_val = _message_chars(compact)
-        # Don't store a compact version that isn't actually smaller.
-        # The JSON wrapper overhead can exceed savings for small results.
         if compact_chars_val >= full_chars_val:
             compact = None
             compact_chars_val = 0
@@ -325,6 +366,7 @@ class AgentContext:
             message=full,
             turn=turn,
             kind="tool",
+            tool_name=tool_name,
             compact_message=compact,
             full_chars=full_chars_val,
             compact_chars=compact_chars_val,
@@ -335,53 +377,92 @@ class AgentContext:
         ))
 
     def update_token_usage(self, prompt_tokens: int) -> None:
-        """Feed back server-reported prompt_tokens as the estimation anchor."""
+        """Feed back server-reported prompt_tokens as the estimation anchor.
+
+        We capture the compacted-chars of the current message list so that
+        future delta estimation uses the *sent* size, not the full size.
+        """
         self._anchor_tokens = prompt_tokens
-        self._anchor_msg_count = len(self._messages)
+        # Compute the chars that were actually sent at this anchor point
+        # (same logic as _sent_chars_for_messages but against all stored messages)
+        self._anchor_sent_chars = sum(
+            self._effective_chars(s) for s in self._messages
+        )
 
     def build_model_messages(self, request_turn: int) -> tuple[list[dict], ContextStats]:
         """Build the model-facing message list with progressive compaction."""
-        messages: list[dict] = []
         stats = ContextStats(request_turn=request_turn)
         stats.estimated_tokens = self._estimate_tokens()
 
-        hard_limit = self.policy.effective_hard_limit()
+        hard_limit    = self.policy.effective_hard_limit()
+        snip_limit    = self.policy.effective_snip_limit()
         compact_limit = self.policy.effective_compact_limit()
+        micro_limit   = self.policy.effective_microcompact_limit()
 
-        # Circuit breaker: if tripped, skip compaction entirely
+        # ---- Level 0: Microcompact ----------------------------------------
+        # Apply in-place on _messages before building the view (MiniCode pattern).
+        # Only runs when approaching the compact zone.
+        if stats.estimated_tokens > micro_limit:
+            self._apply_microcompact()
+
+        # ---- Determine compaction level ------------------------------------
         if self._circuit_breaker_tripped:
             use_pressure = False
             stats.circuit_breaker_active = True
         else:
-            use_pressure = (
-                hard_limit > 0
-                and stats.estimated_tokens > hard_limit
-            )
+            use_pressure = hard_limit > 0 and stats.estimated_tokens > hard_limit
 
-        # Time-based compaction (Level 2): only when context is filling up.
-        # Codex "late compaction" strategy — no premature information loss.
+        use_snip = (
+            not use_pressure
+            and snip_limit > 0
+            and stats.estimated_tokens > snip_limit
+        )
+
         use_time_compact = (
             not use_pressure
             and compact_limit > 0
             and stats.estimated_tokens > compact_limit
         )
 
-        # Update circuit breaker counter
+        # ---- Circuit breaker counter (MiniCode pattern) -------------------
+        # Increment only when genuinely in pressure; reset only when well clear.
         if use_pressure:
             self._consecutive_pressure_events += 1
             if self._consecutive_pressure_events >= self.policy.circuit_breaker_max:
                 self._circuit_breaker_tripped = True
                 stats.circuit_breaker_active = True
-                use_pressure = False  # stop compacting
-        else:
-            # Reset on non-pressure turn
+                use_pressure = False
+        elif stats.estimated_tokens < compact_limit * _CIRCUIT_BREAKER_RESET_RATIO:
+            # Only reset when clearly out of pressure zone
             self._consecutive_pressure_events = 0
 
+        # ---- Level 2.5: Snip (deterministic, no LLM) ----------------------
+        if use_snip:
+            snipped = self._apply_snip(request_turn)
+            if snipped:
+                stats.snip_applied = True
+                stats.snipped_messages = snipped
+
+        # ---- Build model message list -------------------------------------
+        messages: list[dict] = []
         for stored in self._messages:
-            full_chars = stored.full_chars
-            full_tokens = stored.full_tokens
-            stats.full_chars += full_chars
-            stats.full_tokens += full_tokens
+            stats.full_chars  += stored.full_chars
+            stats.full_tokens += stored.full_tokens
+
+            if stored.is_snip_boundary:
+                selected = copy.deepcopy(stored.message)
+                messages.append(selected)
+                stats.model_chars  += _message_chars(selected)
+                stats.model_tokens += _message_tokens(selected)
+                continue
+
+            if stored.is_cleared:
+                selected = copy.deepcopy(stored.message)
+                messages.append(selected)
+                stats.model_chars  += _message_chars(selected)
+                stats.model_tokens += _message_tokens(selected)
+                stats.cleared_tool_results += 1
+                continue
 
             use_compact = self._should_compact(
                 stored, request_turn, use_pressure, use_time_compact,
@@ -393,30 +474,34 @@ class AgentContext:
             )
             selected = copy.deepcopy(selected)
             messages.append(selected)
-            selected_chars = _message_chars(selected)
+            selected_chars  = _message_chars(selected)
             selected_tokens = _message_tokens(selected)
-            stats.model_chars += selected_chars
+            stats.model_chars  += selected_chars
             stats.model_tokens += selected_tokens
 
             if use_compact:
                 stats.compacted_tool_results += 1
-                stats.compacted_chars += max(0, full_chars - selected_chars)
-                stats.compacted_tokens += max(0, full_tokens - selected_tokens)
+                stats.compacted_chars  += max(0, stored.full_chars  - selected_chars)
+                stats.compacted_tokens += max(0, stored.full_tokens - selected_tokens)
             if stored.is_persisted:
                 stats.persisted_results += 1
 
         # Compaction level for observability
         if use_pressure:
             stats.compaction_level = 3
+        elif stats.snip_applied:
+            stats.compaction_level = 3   # snip is treated as aggressive
         elif stats.compacted_tool_results > 0:
             stats.compaction_level = 2
+        elif stats.cleared_tool_results > 0:
+            stats.compaction_level = 1
         elif stats.persisted_results > 0:
             stats.compaction_level = 1
 
-        # Session progress (Codex "ghost history" prevention)
+        # Session progress
         stats.session_progress = self._build_session_progress()
 
-        # Level 3 recovery: inject recently-read file contents + session progress
+        # Level 3 recovery injection
         if (
             use_pressure
             and self.policy.restore_recent_files
@@ -428,11 +513,10 @@ class AgentContext:
                 stats.recovery_injected = True
                 self._recovery_done = True
 
-        # Circuit breaker warning: if tripped, add a notice to the model
-        # (separate from recovery — both can coexist in the same turn)
+        # Circuit breaker warning
         if self._circuit_breaker_tripped and not self._circuit_breaker_warning_done:
             messages.append({"role": "user", "content": _CIRCUIT_BREAKER_WARNING})
-            self._circuit_breaker_warning_done = True  # only inject once
+            self._circuit_breaker_warning_done = True
 
         stats.model_messages = len(messages)
         return messages, stats
@@ -441,43 +525,190 @@ class AgentContext:
         return [copy.deepcopy(item.message) for item in self._messages]
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Microcompact (Level 0)  — MiniCode microcompact pattern
     # ------------------------------------------------------------------
 
-    def _track_read_file(self, data: Any, turn: int) -> None:
-        # Tool results may be dataclass instances (e.g. ReadResult), not plain dicts.
-        if dataclasses.is_dataclass(data):
-            data = dataclasses.asdict(data)
-        if not isinstance(data, dict):
-            return
-        path = data.get("path", "")
-        if not path:
-            return
-        repo = data.get("repo", "")
-        lines = data.get("lines") or []
-        # Keep only the most recent read per path
-        self._recently_read = [f for f in self._recently_read if f["path"] != path]
-        self._recently_read.append({
-            "path": path, "repo": repo, "lines": lines, "turn": turn,
-        })
-        # Trim
-        excess = len(self._recently_read) - self.policy.restore_file_count
-        if excess > 0:
-            self._recently_read = self._recently_read[excess:]
+    def _apply_microcompact(self) -> None:
+        """Clear old compactable tool results in-place (no LLM needed).
 
-        # Session progress: track unique file paths
-        if path not in self._session_files_read:
-            self._session_files_read.append(path)
+        Mirrors MiniCode's microcompact.ts:
+        - Collect indices of all COMPACTABLE tool results.
+        - Keep the most recent KEEP_RECENT_TOOL_RESULTS; clear the rest.
+        - Clearing = replace message content with _CLEAR_MARKER and set is_cleared.
+        """
+        compactable_indices = [
+            i for i, s in enumerate(self._messages)
+            if s.kind == "tool"
+            and s.tool_name in _COMPACTABLE_TOOLS
+            and not s.is_cleared
+        ]
+        if len(compactable_indices) <= _KEEP_RECENT_TOOL_RESULTS:
+            return
+
+        keep_from = len(compactable_indices) - _KEEP_RECENT_TOOL_RESULTS
+        to_clear = set(compactable_indices[:keep_from])
+
+        for i in to_clear:
+            stored = self._messages[i]
+            cleared_msg = copy.deepcopy(stored.message)
+            cleared_msg["content"] = _CLEAR_MARKER
+            stored.message = cleared_msg
+            # Also clear compact version so we don't accidentally send it
+            stored.compact_message = None
+            stored.compact_chars = 0
+            stored.compact_tokens = 0
+            stored.is_cleared = True
+
+    # ------------------------------------------------------------------
+    # Snip (Level 2.5)  — MiniCode snipCompact pattern
+    # ------------------------------------------------------------------
+
+    def _apply_snip(self, request_turn: int) -> int:
+        """Physically remove a contiguous safe middle interval.
+
+        Returns the number of messages removed (0 if nothing was snipped).
+
+        Protection rules (mirrors MiniCode's markProtectedGroups):
+        - system messages and snip_boundary markers are protected
+        - The first user message (index 0) is always protected
+        - The most recent _SNIP_KEEP_RECENT_MESSAGES messages are protected
+        - Any tool call group that involves a write/edit tool is protected
+
+        The "safe interval" is the longest contiguous unprotected span.
+        We remove messages from this interval until we've freed enough tokens.
+        """
+        msgs = self._messages
+        n = len(msgs)
+        if n < _SNIP_MIN_MESSAGES_TO_REMOVE + _SNIP_KEEP_RECENT_MESSAGES:
+            return 0
+
+        hard_limit  = self.policy.effective_hard_limit()
+        snip_limit  = self.policy.effective_snip_limit()
+        window      = self.policy._context_window()
+        target_tokens = int(window * _SNIP_TARGET_USAGE)
+
+        current_tokens = self._estimate_tokens()
+        desired_to_free = max(_SNIP_MIN_TOKENS_TO_FREE, current_tokens - target_tokens)
+
+        # Build protected mask
+        protected = [False] * n
+        # Always protect the first message
+        protected[0] = True
+        # Protect recent tail
+        recent_start = max(1, n - _SNIP_KEEP_RECENT_MESSAGES)
+        for i in range(recent_start, n):
+            protected[i] = True
+        # Protect system / boundary messages
+        for i, s in enumerate(msgs):
+            if s.kind in ("message",) and msgs[i].message.get("role") == "system":
+                protected[i] = True
+            if s.is_snip_boundary:
+                protected[i] = True
+        # Protect write/edit tool groups: find assistant messages containing
+        # tool calls to protected tools, and protect the entire surrounding round.
+        for i, s in enumerate(msgs):
+            if s.kind == "tool" and s.tool_name in _PROTECTED_TOOL_NAMES:
+                # Protect this result and scan back to find the assistant call
+                protected[i] = True
+                for j in range(i - 1, max(0, i - 5), -1):
+                    protected[j] = True
+                    if msgs[j].kind == "message" and msgs[j].message.get("role") == "assistant":
+                        break
+
+        # Find the best contiguous unprotected interval (longest by token count)
+        best_start, best_end, best_tokens = -1, -1, 0
+        cur_start = -1
+        cur_tokens = 0
+        for i in range(1, n):  # skip index 0 (always protected)
+            if not protected[i]:
+                if cur_start == -1:
+                    cur_start = i
+                cur_tokens += msgs[i].full_tokens
+            else:
+                if cur_start != -1 and cur_tokens > best_tokens:
+                    best_start, best_end, best_tokens = cur_start, i, cur_tokens
+                cur_start = -1
+                cur_tokens = 0
+        if cur_start != -1 and cur_tokens > best_tokens:
+            best_start, best_end, best_tokens = cur_start, n, cur_tokens
+
+        if best_start == -1:
+            return 0
+
+        # Trim the interval to free the desired token count
+        # Remove from the beginning of the interval (oldest messages first)
+        freed = 0
+        end_of_deletion = best_start
+        for i in range(best_start, best_end):
+            freed += msgs[i].full_tokens
+            end_of_deletion = i + 1
+            if freed >= desired_to_free:
+                break
+
+        removal_count = end_of_deletion - best_start
+        if removal_count < _SNIP_MIN_MESSAGES_TO_REMOVE:
+            return 0
+        if freed < _SNIP_MIN_TOKENS_TO_FREE:
+            return 0
+
+        # Build boundary marker message
+        boundary_content = (
+            f"[snip_boundary: {removal_count} messages removed, "
+            f"~{freed} tokens freed. "
+            f"Context before this point has been truncated to reduce context size.]"
+        )
+        boundary_msg = {"role": "user", "content": boundary_content}
+        boundary_stored = _StoredMessage(
+            message=boundary_msg,
+            turn=request_turn,
+            kind="snip_boundary",
+            is_snip_boundary=True,
+            full_chars=_message_chars(boundary_msg),
+            full_tokens=_message_tokens(boundary_msg),
+        )
+
+        # Replace the deleted slice with the boundary marker
+        self._messages = (
+            msgs[:best_start]
+            + [boundary_stored]
+            + msgs[end_of_deletion:]
+        )
+
+        # Invalidate anchor so next estimation uses full recalc
+        self._anchor_tokens = 0
+        self._anchor_sent_chars = 0
+
+        return removal_count
+
+    # ------------------------------------------------------------------
+    # Token estimation helpers
+    # ------------------------------------------------------------------
+
+    def _effective_chars(self, stored: _StoredMessage) -> int:
+        """Chars of this message as it would be sent (compact if available)."""
+        if stored.is_cleared:
+            return len(json.dumps(stored.message, ensure_ascii=False, default=str))
+        if stored.compact_message and stored.compact_chars > 0:
+            return stored.compact_chars
+        return stored.full_chars
 
     def _estimate_tokens(self) -> int:
-        """Anchor + delta estimation."""
+        """Anchor + delta estimation using *sent* chars (not full chars).
+
+        Fixes the original bug where delta was computed from full_chars even
+        when compact versions were being sent.
+        """
         if self._anchor_tokens == 0:
-            total_chars = sum(s.full_chars for s in self._messages)
+            total_chars = sum(self._effective_chars(s) for s in self._messages)
             return int(total_chars / _CHARS_PER_TOKEN)
-        new_chars = sum(
-            s.full_chars for s in self._messages[self._anchor_msg_count:]
-        )
-        return self._anchor_tokens + int(new_chars / _CHARS_PER_TOKEN)
+        # Delta: chars added since the anchor snapshot
+        current_sent_chars = sum(self._effective_chars(s) for s in self._messages)
+        delta_chars = max(0, current_sent_chars - self._anchor_sent_chars)
+        return self._anchor_tokens + int(delta_chars / _CHARS_PER_TOKEN)
+
+    # ------------------------------------------------------------------
+    # Compaction decision
+    # ------------------------------------------------------------------
 
     def _should_compact(
         self, stored: _StoredMessage, request_turn: int,
@@ -487,32 +718,39 @@ class AgentContext:
             return False
         if not self.policy.compact_after_first_exposure:
             return False
-        # Don't compact if the compact version isn't actually smaller.
-        # The JSON wrapper overhead can exceed savings for small results.
         if stored.compact_chars >= stored.full_chars:
             return False
-        # Level 3 — pressure: compact everything except current turn
         if pressure:
             return (request_turn - stored.turn) > 0
-        # Level 2 — time-based: when context is filling up (Codex strategy)
         if time_compact:
             if not self.policy.full_tool_result_once:
                 return True
             return (request_turn - stored.turn) > self.policy.keep_recent_turns_full
-        # Below compact_limit: still compact very old results to prevent
-        # unbounded context growth in medium-length sessions.  Use a 3× larger
-        # window so recent results stay full longer than under time_compact.
-        if not self.policy.full_tool_result_once:
-            return True
-        return (request_turn - stored.turn) > self.policy.keep_recent_turns_full * 3
+        return False  # below compact_limit → no time-based compaction
+
+    # ------------------------------------------------------------------
+    # Session tracking helpers
+    # ------------------------------------------------------------------
+
+    def _track_read_file(self, data: Any, turn: int) -> None:
+        if dataclasses.is_dataclass(data):
+            data = dataclasses.asdict(data)
+        if not isinstance(data, dict):
+            return
+        path = data.get("path", "")
+        if not path:
+            return
+        repo  = data.get("repo", "")
+        lines = data.get("lines") or []
+        self._recently_read = [f for f in self._recently_read if f["path"] != path]
+        self._recently_read.append({"path": path, "repo": repo, "lines": lines, "turn": turn})
+        excess = len(self._recently_read) - self.policy.restore_file_count
+        if excess > 0:
+            self._recently_read = self._recently_read[excess:]
+        if path not in self._session_files_read:
+            self._session_files_read.append(path)
 
     def _build_session_progress(self) -> dict:
-        """Build session progress summary for observability and recovery.
-
-        This follows the Codex "ghost history" prevention pattern:
-        even when individual tool results are compacted away, the model
-        retains a high-level view of what has been explored.
-        """
         return {
             "files_read": list(self._session_files_read),
             "tools_called": dict(self._session_tools_called),
@@ -520,18 +758,7 @@ class AgentContext:
         }
 
     def _build_recovery_content(self) -> str:
-        """Build a recovery message with recently-read file contents + session progress.
-
-        Combines:
-        1. Session progress overview (files explored, tools used)
-        2. Recently-read source code contents
-
-        This follows Claude Code's post-compaction recovery pattern and
-        Codex's "ghost history" prevention (verbatim context preservation).
-        """
         parts: list[str] = []
-
-        # Session progress overview (Codex "ghost history" prevention)
         progress = self._build_session_progress()
         parts.append("## 上下文恢复 — 调查进度概要")
         parts.append("")
@@ -553,25 +780,22 @@ class AgentContext:
             )
             parts.append("")
             for entry in reversed(self._recently_read):
-                path = entry["path"]
-                repo = entry.get("repo", "")
+                path  = entry["path"]
+                repo  = entry.get("repo", "")
                 lines = entry.get("lines") or []
                 header = f"#### {repo}/{path}" if repo else f"#### {path}"
                 parts.append(header)
                 parts.append("")
-                # Token budget: convert to char budget internally
                 char_budget = int(self.policy.restore_max_tokens_per_file * _CHARS_PER_TOKEN)
                 used = 0
                 shown = 0
                 for line in lines:
-                    if isinstance(line, dict):
-                        text = f"{line.get('line', '')}: {line.get('text', '')}"
-                    else:
-                        text = str(line)
+                    text = (
+                        f"{line.get('line', '')}: {line.get('text', '')}"
+                        if isinstance(line, dict) else str(line)
+                    )
                     if used + len(text) > char_budget:
-                        parts.append(
-                            f"... (省略 {len(lines) - shown} 行，共 {len(lines)} 行)"
-                        )
+                        parts.append(f"... (省略 {len(lines) - shown} 行，共 {len(lines)} 行)")
                         break
                     parts.append(text)
                     used += len(text) + 1
@@ -581,7 +805,7 @@ class AgentContext:
 
 
 # ---------------------------------------------------------------------------
-# Circuit breaker warning (Claude Code pattern)
+# Circuit breaker warning
 # ---------------------------------------------------------------------------
 
 _CIRCUIT_BREAKER_WARNING = (
@@ -610,10 +834,7 @@ def build_tool_result_summary(
     """Build a compact summary for a tool result.
 
     Returns (compact_content_json, is_persisted, persist_path).
-
-    Thresholds are in tokens; internally converted to chars via _CHARS_PER_TOKEN.
     """
-    # Level 1: persist oversized results to disk
     large_threshold_chars = int(large_threshold_tokens * _CHARS_PER_TOKEN)
     preview_chars = int(preview_tokens * _CHARS_PER_TOKEN)
     if persist_dir and len(full_content) > large_threshold_chars:
@@ -639,7 +860,6 @@ def build_tool_result_summary(
             persist_path,
         )
 
-    # Normal compact summary
     jsonable = to_jsonable(data)
     summary = _summarize_jsonable(tool_name, jsonable, full_content)
     payload = {
@@ -661,7 +881,6 @@ def build_tool_result_summary(
 
 
 def _persist_to_disk(content: str, base_dir: Path, tool_name: str) -> str:
-    """Write large tool output to disk, return the file path string."""
     base_dir.mkdir(parents=True, exist_ok=True)
     suffix = ".json" if content.strip().startswith("{") else ".txt"
     fd, path = tempfile.mkstemp(
@@ -677,7 +896,6 @@ def _persist_to_disk(content: str, base_dir: Path, tool_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def to_jsonable(value: Any) -> Any:
-    """Convert tool results to JSON-compatible data without dataclass repr noise."""
     if dataclasses.is_dataclass(value):
         return to_jsonable(dataclasses.asdict(value))
     if isinstance(value, dict):
@@ -802,12 +1020,13 @@ def _message_chars(message: dict) -> int:
 
 
 def _message_tokens(message: dict) -> int:
-    """Estimate token count for a message dict (chars / _CHARS_PER_TOKEN)."""
     return int(_message_chars(message) / _CHARS_PER_TOKEN)
 
 
 def _sha256_json(value: Any) -> str:
-    return _sha256_text(json.dumps(to_jsonable(value), ensure_ascii=False, sort_keys=True, default=str))
+    return _sha256_text(
+        json.dumps(to_jsonable(value), ensure_ascii=False, sort_keys=True, default=str)
+    )
 
 
 def _sha256_text(text: str) -> str:
