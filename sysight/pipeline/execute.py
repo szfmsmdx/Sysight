@@ -81,6 +81,8 @@ def run_execute(
     run_id: str = "",
     analyze_run_dir: Path | None = None,
     run_dir: Path | None = None,
+    exec_config: dict | None = None,
+    inject_timers: bool = False,
 ) -> ExecuteResult:
     """Apply patches, run smoke test, compare timers.
 
@@ -93,6 +95,7 @@ def run_execute(
         run_id: Run identifier for output naming.
         analyze_run_dir: Analyzer's run_dir where instrument_result.json lives.
         run_dir: Output directory for execute_result.json.
+        exec_config: Execution config dict. If None, loaded from warmup cache.
     """
     import hashlib
 
@@ -119,22 +122,34 @@ def run_execute(
         run_dir = Path.cwd() / ".sysight" / "execute-runs" / exec_run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load warmup cache for execution config
-    repo_setup = _load_repo_setup(root)
-    exec_config = repo_setup.to_execution_config() if repo_setup else {}
+    # Load execution config: explicit arg > warmup cache > empty
+    if exec_config is None:
+        repo_setup = _load_repo_setup(root)
+        exec_config = repo_setup.to_execution_config() if repo_setup else {}
 
     # Load instrument result for timer labels
     timer_labels = _load_timer_labels(analyze_run_dir)
 
     # ── Phase 0: Baseline measurement ──
+    # Prefer pre-built timer_before.json from artifacts (e.g. optimizer-bench).
+    # Fall back to live measurement only when no pre-built data exists.
     timer_before: dict[str, float] = {}
-    if exec_config.get("entry_point") or exec_config.get("minimal_run"):
+    if analyze_run_dir:
+        timer_before_path = analyze_run_dir / "timer_before.json"
+        if timer_before_path.exists():
+            try:
+                timer_before = json.loads(timer_before_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+    if not timer_before and (exec_config.get("entry_point") or exec_config.get("minimal_run")):
         timer_before = _run_and_measure(root, exec_config, errors)
 
     # ── Phase 1+2: Apply + Verify ──
     applier = PatchApplier(root)
     patch_results, verify = _apply_and_verify(
         patches, root, exec_config, timer_before, timer_labels, applier, errors,
+        inject_timers=inject_timers,
+        analyze_run_dir=analyze_run_dir,
     )
 
     elapsed_ms = (time.monotonic() - t0) * 1000
@@ -169,6 +184,9 @@ def _apply_and_verify(
     timer_labels: dict[str, str],
     applier: PatchApplier,
     errors: list[str],
+    *,
+    inject_timers: bool = False,
+    analyze_run_dir: Path | None = None,
 ) -> tuple[list[PatchResult], VerifyResult]:
     """Apply all patches, run smoke test, compare timers.
 
@@ -238,6 +256,12 @@ def _apply_and_verify(
 
     # Timer comparison
     if timer_before and (exec_config.get("entry_point") or exec_config.get("minimal_run")):
+        # Inject cuda_timer instrumentation AFTER patches are applied so
+        # _run_and_measure can capture [SYSIGHT_TIMER] output.  This must
+        # happen here (not before patch apply) because _fill_span_hashes
+        # computed hashes against the original source files.
+        if inject_timers:
+            _inject_timers_from_artifacts(root, analyze_run_dir, patches=patches)
         timer_after = _run_and_measure(root, exec_config, errors)
         verify.timer_after = timer_after
 
@@ -288,6 +312,15 @@ def _apply_and_verify(
 
 # ── Smoke test ──
 
+def _normalize_python(python_bin: str) -> str:
+    """Normalize 'python' → 'python3' on systems where 'python' doesn't exist (macOS)."""
+    if python_bin == "python":
+        import shutil
+        if shutil.which("python") is None and shutil.which("python3") is not None:
+            return "python3"
+    return python_bin
+
+
 def _run_smoke_test(
     root: Path,
     patches: list[PatchCandidate],
@@ -302,8 +335,10 @@ def _run_smoke_test(
     for patch in patches:
         for cmd in patch.validation_commands:
             try:
+                # Normalize 'python' → 'python3' for macOS compatibility
+                normalized_cmd = [_normalize_python(cmd[0])] + cmd[1:] if cmd else cmd
                 r = subprocess.run(
-                    cmd,
+                    normalized_cmd,
                     cwd=str(root),
                     capture_output=True,
                     text=True,
@@ -326,7 +361,7 @@ def _run_smoke_test(
         seen_modules.add(module)
         try:
             r = subprocess.run(
-                ["python", "-c", f"import {module}"],
+                [_normalize_python("python"), "-c", f"import {module}"],
                 cwd=str(root),
                 capture_output=True,
                 text=True,
@@ -371,13 +406,16 @@ def _run_and_measure(
     if not run_cmd:
         entry = exec_config.get("entry_point", "")
         if entry:
-            run_cmd = ["python", entry]
+            run_cmd = [_normalize_python("python"), entry]
 
     if not run_cmd:
         return {}
 
+    # Normalize 'python' → 'python3' in the command
+    run_cmd = [_normalize_python(run_cmd[0])] + run_cmd[1:]
+
     env_vars = exec_config.get("env_vars", {})
-    timeout = 120
+    timeout = 300  # generous timeout for CPU-only runs (e.g. macOS CI)
 
     import os
     env = os.environ.copy()
@@ -392,6 +430,8 @@ def _run_and_measure(
             timeout=timeout,
             env=env,
         )
+        # Parse timer output even if returncode != 0 (program may have
+        # printed [SYSIGHT_TIMER] lines before hitting a non-fatal error).
         combined_output = r.stdout + "\n" + r.stderr
         return parse_timer_log(combined_output)
     except subprocess.TimeoutExpired:
@@ -419,6 +459,8 @@ def _load_timer_labels(run_dir: Path | None) -> dict[str, str]:
     """Load timer label → finding_id mapping from instrument_result.json.
 
     Returns {finding_id: timer_label}.
+    When timers are merged (e.g. "F01+F02"), each individual finding_id
+    maps to the combined label so scoring can match any of them.
     """
     if run_dir is None:
         return {}
@@ -431,10 +473,15 @@ def _load_timer_labels(run_dir: Path | None) -> dict[str, str]:
         data = json.loads(instrument_json.read_text(encoding="utf-8"))
         result = {}
         for t in data.get("timers", []):
-            finding_id = t.get("finding_id", "")
+            finding_ids = t.get("finding_id", "")
             timer_label = t.get("timer_label", "")
-            if finding_id and timer_label:
-                result[finding_id] = timer_label
+            if finding_ids and timer_label:
+                # Split on "+" to handle merged timers — each individual
+                # finding_id maps to the same combined timer_label.
+                for fid in finding_ids.split("+"):
+                    fid = fid.strip()
+                    if fid:
+                        result[fid] = timer_label
         return result
     except (json.JSONDecodeError, OSError):
         return {}
@@ -476,6 +523,142 @@ def _write_result_json(result: ExecuteResult, run_dir: Path) -> None:
         json.dumps(data, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
     )
+
+
+def _inject_timers_from_artifacts(
+    root: Path,
+    analyze_run_dir: Path | None = None,
+    patches: list | None = None,
+) -> None:
+    """Inject cuda_timer instrumentation AFTER patches are applied.
+
+    Reads instrument_result.json (generated by LLM-driven instrument stage)
+    to get precise timer specs.  Injects timer wrappers into patched source
+    files, adjusting line numbers for patch-induced shifts.
+
+    This must happen AFTER patch application because _fill_span_hashes
+    computed hashes against the original (pre-injection) source files.
+
+    The injection is NOT tracked by PatchApplier — the caller is responsible
+    for restoring source files (e.g. via _snapshot_sources / _restore_sources).
+    """
+    # Find instrument_result.json — look in common locations
+    instrument_json = None
+    candidates = []
+    if analyze_run_dir:
+        candidates.append(analyze_run_dir / "instrument_result.json")
+    candidates.append(root / "artifacts" / "instrument_result.json")
+    for candidate in candidates:
+        if candidate.exists():
+            instrument_json = candidate
+            break
+
+    if instrument_json is None:
+        return
+
+    try:
+        data = json.loads(instrument_json.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+
+    timers = data.get("timers", [])
+    if not timers:
+        return
+
+    # Compute per-file line offset caused by patches.
+    # For each file, sum (replacement_lines - span_lines) for patches
+    # whose old_span_end is BEFORE the timer's wrap_start.
+    # Patches after the timer region don't affect its line numbers.
+    file_offsets: dict[str, list[tuple[int, int]]] = {}
+    # file_path → [(old_span_end, line_delta), ...] sorted by old_span_end
+    if patches:
+        for p in patches:
+            fp = p.file_path
+            replacement_lines = len(p.replacement.splitlines()) if p.replacement else 0
+            span_lines = p.old_span_end - p.old_span_start + 1
+            delta = replacement_lines - span_lines
+            if delta != 0:
+                file_offsets.setdefault(fp, []).append((p.old_span_end, delta))
+        for offsets in file_offsets.values():
+            offsets.sort(key=lambda x: x[0])  # sort by old_span_end ascending
+
+    def _adjust_line(original_line: int, offsets: list[tuple[int, int]]) -> int:
+        """Adjust an original line number by accumulated offsets from patches
+        whose old_span_end is BEFORE original_line."""
+        adjusted = original_line
+        for old_end, delta in offsets:
+            if old_end < original_line:
+                adjusted += delta
+        return adjusted
+
+    from sysight.utils.cuda_timer import (
+        CUDA_TIMER_MODULE_CONTENT,
+        CUDA_TIMER_MODULE_NAME,
+        CUDA_TIMER_IMPORT_LINE,
+    )
+
+    # 1. Write _sysight_timer.py to repo root
+    timer_module_path = root / f"{CUDA_TIMER_MODULE_NAME}.py"
+    timer_module_path.write_text(CUDA_TIMER_MODULE_CONTENT, encoding="utf-8")
+
+    # 2. Group timers by file, sort bottom-up within each file
+    by_file: dict[str, list[dict]] = {}
+    for t in timers:
+        fp = t.get("file", "")
+        if fp:
+            by_file.setdefault(fp, []).append(t)
+
+    for file_path, specs in by_file.items():
+        target = root / file_path
+        if not target.exists():
+            continue
+
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        offsets = file_offsets.get(file_path, [])
+
+        # Add import line at top (after any existing __future__ / docstring)
+        insert_pos = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''"):
+                continue
+            if stripped.startswith("from __future__"):
+                insert_pos = i + 1
+                continue
+            if stripped == "":
+                insert_pos = i + 1
+                continue
+            insert_pos = i
+            break
+        lines.insert(insert_pos, CUDA_TIMER_IMPORT_LINE + "\n")
+
+        # Apply wraps bottom-up (descending wrap_start) to preserve line numbers
+        specs_sorted = sorted(specs, key=lambda s: -s.get("wrap_start", 0))
+        for spec in specs_sorted:
+            ws = spec.get("wrap_start", 0)
+            we = spec.get("wrap_end", 0)
+            label = spec.get("timer_label", "region")
+
+            # Adjust line numbers for patch-induced shifts
+            if offsets:
+                ws = _adjust_line(ws, offsets)
+                we = _adjust_line(we, offsets)
+
+            if ws <= 0 or we <= 0 or ws > len(lines) or we > len(lines):
+                continue
+
+            # Indentation from the first line of the wrapped region
+            first_line = lines[ws - 1]
+            indent = first_line[: len(first_line) - len(first_line.lstrip())]
+
+            # Insert `with cuda_timer("label")():` before wrap_start,
+            # and indent the wrapped body by one level.
+            lines.insert(ws - 1, f'{indent}with cuda_timer("{label}")():\n')
+            for j in range(ws, we + 1):
+                if lines[j].strip():
+                    lines[j] = "    " + lines[j]
+
+        target.write_text("".join(lines), encoding="utf-8")
 
 
 def _print_summary(result: ExecuteResult, timer_before: dict[str, float]) -> None:

@@ -304,7 +304,7 @@ def _build_global_brief(
     machine_info = _read_machine_info(sqlite_path)
     event_inventory = _read_event_inventory(sqlite_path)
     kernel_data = capture("top_kernels", kernels, str(sqlite_path), limit=5)
-    nvtx_data = capture("nvtx_ranges", nvtx, str(sqlite_path), limit=5)
+    nvtx_data = capture("nvtx_ranges", nvtx, str(sqlite_path), limit=5, include_counts=False)
     gap_data = capture("gpu_idle_gaps", gaps, str(sqlite_path), min_gap_ns=1_000_000, limit=5)
     sync_data = capture("sync", sync, str(sqlite_path))
     memcpy_data = capture("memcpy", memcpy, str(sqlite_path))

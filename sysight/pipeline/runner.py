@@ -146,6 +146,8 @@ class PipelineRunner:
         from sysight.pipeline.instrument import run_instrument
         return run_instrument(
             findings, repo,
+            provider=provider,
+            registry=self._registry,
             run_dir=run_dir,
         )
 

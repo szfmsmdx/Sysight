@@ -50,3 +50,4 @@ profile/
 *.log
 *.tmp
 tmp/
+uv.lock

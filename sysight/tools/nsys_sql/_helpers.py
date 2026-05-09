@@ -6,6 +6,7 @@ Extracted from nsys-ai sql_cli.py and sql_shared.py.
 from __future__ import annotations
 
 import sqlite3
+import time
 from contextlib import closing, contextmanager
 from collections.abc import Iterator
 
@@ -63,10 +64,21 @@ def _load_tables(conn: sqlite3.Connection) -> tuple[set[str], bool]:
 
 
 @contextmanager
-def _open_db(sqlite_path: str) -> Iterator[tuple[sqlite3.Connection, set[str], bool]]:
+def _open_db(sqlite_path: str, query_timeout_s: float = 30.0) -> Iterator[tuple[sqlite3.Connection, set[str], bool]]:
     with closing(sqlite3.connect(sqlite_path)) as conn:
         conn.row_factory = sqlite3.Row
         all_tables, has_strings = _load_tables(conn)
+
+        # Set a progress handler to interrupt queries that run too long.
+        # SQLite calls the progress handler every N opcodes; we check elapsed
+        # wall-clock time and raise an exception if the timeout is exceeded.
+        start = time.monotonic()
+        def _progress_handler():
+            if time.monotonic() - start > query_timeout_s:
+                return 1  # non-zero = interrupt
+            return 0
+        conn.set_progress_handler(_progress_handler, 1000)
+
         yield conn, all_tables, has_strings
 
 

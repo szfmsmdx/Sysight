@@ -29,8 +29,12 @@ class NvtxResult:
     trace_duration_ns: int = 0
 
 
-def nvtx(sqlite: str, limit: int = 50) -> NvtxResult:
-    """Aggregate completed NVTX ranges by name and count contained CUDA events."""
+def nvtx(sqlite: str, limit: int = 50, include_counts: bool = True) -> NvtxResult:
+    """Aggregate completed NVTX ranges by name and count contained CUDA events.
+
+    Set include_counts=False to skip the expensive contained-event counting
+    (useful for large profiles where the JOIN queries are too slow).
+    """
     result = NvtxResult()
 
     with _open_db(sqlite) as (conn, all_tables, has_strings):
@@ -78,7 +82,16 @@ def nvtx(sqlite: str, limit: int = 50) -> NvtxResult:
         for row in rows:
             name = row["range_name"] or "unknown"
             total_ns = int(row["total_ns"] or 0)
-            counts = _contained_counts(conn, all_tables, nvtx_tbl, name_expr, join, where, name)
+            counts: dict[str, int] = {}
+            if include_counts:
+                kernel_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL")
+                runtime_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_RUNTIME")
+                memcpy_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_MEMCPY")
+                sync_tbl = _find_table(all_tables, "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION")
+                counts = _contained_counts_batched(
+                    conn, nvtx_tbl, name_expr, join, where, name,
+                    kernel_tbl, runtime_tbl, memcpy_tbl, sync_tbl,
+                )
             result.ranges.append(NvtxRangeInfo(
                 name=name,
                 count=int(row["cnt"] or 0),
@@ -96,47 +109,49 @@ def nvtx(sqlite: str, limit: int = 50) -> NvtxResult:
     return result
 
 
-def _contained_counts(
+def _contained_counts_batched(
     conn: sqlite3.Connection,
-    all_tables: set[str],
     nvtx_tbl: str,
     name_expr: str,
     join: str,
     where: str,
     range_name: str,
+    kernel_tbl: str | None,
+    runtime_tbl: str | None,
+    memcpy_tbl: str | None,
+    sync_tbl: str | None,
 ) -> dict[str, int]:
-    ranges = []
-    try:
-        for row in conn.execute(
-            f"SELECT n.start, n.[end] FROM {nvtx_tbl} n {join} "
-            f"WHERE {where} AND {name_expr} = ?",
-            (range_name,),
-        ):
-            ranges.append((int(row["start"]), int(row["end"])))
-    except sqlite3.Error:
-        return {}
+    """Count contained CUDA events for a given NVTX range name using batched JOINs.
+
+    Instead of looping over every NVTX instance and running per-interval COUNT
+    queries (which is O(instances × tables)), we use a single SQL query per
+    event table that JOINs the NVTX ranges with the event table on the time
+    containment condition.
+    """
+    counts: dict[str, int] = {}
 
     table_map = {
-        "kernel": _find_table(all_tables, "CUPTI_ACTIVITY_KIND_KERNEL"),
-        "runtime": _find_table(all_tables, "CUPTI_ACTIVITY_KIND_RUNTIME"),
-        "memcpy": _find_table(all_tables, "CUPTI_ACTIVITY_KIND_MEMCPY"),
-        "sync": _find_table(all_tables, "CUPTI_ACTIVITY_KIND_SYNCHRONIZATION"),
+        "kernel": kernel_tbl,
+        "runtime": runtime_tbl,
+        "memcpy": memcpy_tbl,
+        "sync": sync_tbl,
     }
-    counts: dict[str, int] = {}
-    for label, table in table_map.items():
-        if not table:
+
+    for label, event_tbl in table_map.items():
+        if not event_tbl:
             continue
-        total = 0
-        for start, end in ranges:
-            try:
-                row = conn.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE start >= ? AND [end] <= ?",
-                    (start, end),
-                ).fetchone()
-                total += int(row[0] or 0) if row else 0
-            except sqlite3.Error:
-                pass
-        counts[label] = total
+        try:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {nvtx_tbl} n {join} "
+                f"INNER JOIN {event_tbl} e "
+                f"ON e.start >= n.start AND e.[end] <= n.[end] "
+                f"WHERE {where} AND {name_expr} = ?",
+                (range_name,),
+            ).fetchone()
+            counts[label] = int(row[0] or 0) if row else 0
+        except sqlite3.Error:
+            counts[label] = 0
+
     return counts
 
 

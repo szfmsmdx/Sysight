@@ -1,14 +1,14 @@
-"""INSTRUMENT stage — targeted cuda_timer insertion driven by analyzer findings.
+"""INSTRUMENT stage — LLM-driven cuda_timer placement based on analyzer findings.
 
 Runs AFTER analyze. Takes the FindingSet and:
-1. Uses AST analysis to determine timer placement for each finding.
-2. Programmatically inserts cuda_timer calls into source files.
-3. Writes instrument_result.json for the optimizer verify step.
+1. Sends findings + source files to LLM for timer placement decisions.
+2. LLM reads source files, determines precise wrap_start/wrap_end for each finding.
+3. Programmatically inserts cuda_timer calls into source files.
+4. Writes instrument_result.json for the optimizer verify step.
 """
 
 from __future__ import annotations
 
-import ast
 import json
 import re
 from dataclasses import dataclass, field
@@ -51,10 +51,21 @@ def run_instrument(
     findings: LocalizedFindingSet,
     repo: str,
     *,
+    provider=None,
+    registry=None,
     verbose: bool = False,
     run_dir: Path | None = None,
 ) -> InstrumentResult:
-    """Run targeted instrumentation based on analyzer findings (AST path)."""
+    """Run LLM-driven instrumentation based on analyzer findings.
+
+    Args:
+        findings: The FindingSet from the analyze stage.
+        repo: Path to repo root.
+        provider: LLM provider (required for LLM-driven mode).
+        registry: ToolRegistry instance (required for LLM-driven mode).
+        verbose: Print LLM I/O to terminal.
+        run_dir: Output directory for instrument_result.json.
+    """
     root = Path(repo).resolve()
     errors: list[str] = []
     warnings: list[str] = []
@@ -70,15 +81,19 @@ def run_instrument(
             summary={"status": "skipped", "reason": "no findings"},
         )
 
-    timer_specs = infer_timer_specs(findings, root, warnings)
+    # ── LLM-driven timer inference ──
+    timer_specs = _llm_infer_timer_specs(
+        findings, root, provider, registry, warnings, verbose,
+    )
 
     if not timer_specs:
-        errors.append("AST inferred no timer specs")
+        errors.append("LLM inferred no timer specs")
         return InstrumentResult(
             run_id=findings.run_id, errors=errors,
             summary={"status": "failed", "reason": "no timers generated"},
         )
 
+    # ── Insert timers into source files ──
     modified_files = _insert_timers(root, timer_specs, warnings)
 
     result = InstrumentResult(
@@ -89,7 +104,7 @@ def run_instrument(
         warnings=warnings,
         summary={
             "status": "ok",
-            "method": "ast",
+            "method": "llm",
             "timer_count": len(timer_specs),
             "modified_files": modified_files,
         },
@@ -101,238 +116,115 @@ def run_instrument(
     return result
 
 
-# ── AST-driven timer inference ──────────────────────────────────────────────
+# ── LLM-driven timer inference ───────────────────────────────────────────────
 
 
-def infer_timer_specs(
+def _llm_infer_timer_specs(
     findings: LocalizedFindingSet,
     root: Path,
+    provider,
+    registry,
     warnings: list[str],
+    verbose: bool = False,
 ) -> list[TimerSpec]:
-    """Derive TimerSpec list from findings using AST analysis.
+    """Use LLM to read source files and determine timer placement.
 
-    Strategy per category:
-      - C1 (DataLoader config): find the collate_fn body, then largest For loop,
-        then enclosing function body.
-      - C2 / C7 (loops): wrap the innermost enclosing For/AsyncFor statement.
-      - Others: wrap the smallest statement containing finding.line.
+    The LLM has access to scanner_read so it can:
+    - Read source files referenced by findings
+    - Determine precise wrap_start/wrap_end for each finding
+    - Handle overlapping ranges by merging them
     """
-    by_file: dict[str, list] = {}
+    if provider is None or registry is None:
+        warnings.append("no LLM provider/registry — cannot infer timer specs")
+        return []
+
+    from sysight.agent.loop import AgentLoop, AgentTask
+    from sysight.agent.prompts.loader import PromptLoader
+    from sysight.tools.registry import ToolPolicy
+    from sysight.benchmark.debug import DebugProvider
+
+    loader = PromptLoader()
+    system_prompt = loader.build_system_prompt("instrument")
+
+    # Build findings JSON — only fields instrument LLM needs
+    findings_data = []
     for f in findings.findings:
-        if f.file_path and f.line:
-            by_file.setdefault(f.file_path, []).append(f)
-
-    specs: list[TimerSpec] = []
-    seq = 1
-
-    for file_rel, file_findings in by_file.items():
-        file_path = root / file_rel
-        if not file_path.exists():
-            warnings.append(f"AST: file not found: {file_rel}")
+        if f.status != "accepted":
             continue
-        try:
-            source = file_path.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(source, filename=str(file_path))
-        except SyntaxError as exc:
-            warnings.append(f"AST: cannot parse {file_rel}: {exc}")
-            continue
+        findings_data.append({
+            "finding_id": f.finding_id,
+            "title": f.title,
+            "file_path": f.file_path,
+            "function": f.function,
+            "line": f.line,
+            "description": f.description,
+        })
 
-        for finding in file_findings:
-            spec = _infer_one(tree, finding, file_rel, seq, warnings)
-            if spec is not None:
-                specs.append(spec)
-                seq += 1
+    if not findings_data:
+        return []
 
+    findings_json = json.dumps(findings_data, indent=2, ensure_ascii=False)
+
+    user_parts = [
+        "## Analyzer Findings\n",
+        findings_json,
+        f"\n\nRepo root: {root}",
+        "\n\n## 指引",
+        "\n- 用 `scanner_read` 的 `start`/`end` 参数只看 finding 指向的行及周围上下文",
+        "\n- 为每个 finding 确定精确的 wrap_start/wrap_end",
+        "\n- 重叠的 timer 范围必须合并（用 `+` 连接 timer_label）",
+        "\n- 只输出最终 JSON，不要输出其他内容",
+    ]
+    user_prompt = "\n".join(user_parts)
+
+    # Allow read tools — LLM decides what to read
+    policy = ToolPolicy(
+        allowed_tools={"scanner_read", "scanner_search", "scanner_files"},
+        read_only=True,
+        max_calls_per_task=30,
+    )
+
+    wrapped_provider = DebugProvider(provider, [], verbose=verbose)
+
+    loop = AgentLoop(wrapped_provider, registry, policy)
+    task = AgentTask(
+        run_id=f"instrument-{root.name}",
+        task_id=f"instrument-{findings.run_id}",
+        task_type="instrument",
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_turns=10,
+        max_wall_seconds=300,
+        max_tokens=8192,
+    )
+
+    result = loop.run(task)
+
+    if result.status != "ok":
+        warnings.append(f"instrument LLM failed: {result.status}")
+        return []
+
+    output = result.output
+    if not output:
+        warnings.append("instrument LLM returned empty output")
+        return []
+
+    return _parse_timer_specs(output)
+
+
+def _parse_timer_specs(output: dict) -> list[TimerSpec]:
+    """Parse LLM output into TimerSpec list."""
+    specs = []
+    for item in output.get("timers", []):
+        specs.append(TimerSpec(
+            finding_id=item.get("finding_id", ""),
+            timer_label=item.get("timer_label", ""),
+            file=item.get("file", ""),
+            wrap_start=int(item.get("wrap_start", 0)),
+            wrap_end=int(item.get("wrap_end", 0)),
+            reason=item.get("reason", ""),
+        ))
     return specs
-
-
-def _infer_one(
-    tree: ast.AST,
-    finding,
-    file_rel: str,
-    seq: int,
-    warnings: list[str],
-) -> TimerSpec | None:
-    line = finding.line
-    category = finding.category
-    label = f"F{seq:02d}_{_slug(finding.title or finding.finding_id)}"
-
-    if category == "C1":
-        span = _c1_span(tree, line, warnings, file_rel)
-        if span is None:
-            warnings.append(
-                f"AST: C1 finding {finding.finding_id} — no For loop found "
-                f"near line {line} in {file_rel}, skipping"
-            )
-            return None
-        start, end = span
-        return TimerSpec(
-            finding_id=finding.finding_id, timer_label=label, file=file_rel,
-            wrap_start=start, wrap_end=end,
-            reason=f"C1: DataLoader config at line {line}; timing enclosing For loop",
-        )
-
-    if category in ("C2", "C7"):
-        node = _find_enclosing_for(tree, line)
-        if node is not None:
-            end = node.end_lineno  # type: ignore[attr-defined]
-            return TimerSpec(
-                finding_id=finding.finding_id, timer_label=label, file=file_rel,
-                wrap_start=node.lineno, wrap_end=end,
-                reason=f"{category}: loop at lines {node.lineno}-{end}",
-            )
-
-    stmt = _find_stmt_at_line(tree, line)
-    if stmt is None:
-        warnings.append(
-            f"AST: no statement found at line {line} in {file_rel} "
-            f"(finding {finding.finding_id}), skipping"
-        )
-        return None
-
-    start = stmt.lineno
-    end = getattr(stmt, "end_lineno", stmt.lineno)
-    return TimerSpec(
-        finding_id=finding.finding_id, timer_label=label, file=file_rel,
-        wrap_start=start, wrap_end=end,
-        reason=f"{category}: statement at lines {start}-{end}",
-    )
-
-
-def _slug(text: str, max_len: int = 30) -> str:
-    return re.sub(r"[^\w]+", "_", text.lower()).strip("_")[:max_len]
-
-
-def _find_enclosing_for(tree: ast.AST, line: int) -> ast.For | ast.AsyncFor | None:
-    """Return the innermost For/AsyncFor whose range contains *line*."""
-    best: ast.For | ast.AsyncFor | None = None
-    best_size = float("inf")
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.For, ast.AsyncFor)):
-            continue
-        end = getattr(node, "end_lineno", node.lineno)
-        if node.lineno <= line <= end:
-            size = end - node.lineno
-            if size < best_size:
-                best, best_size = node, size  # type: ignore[assignment]
-    return best
-
-
-def _find_stmt_at_line(tree: ast.AST, line: int) -> ast.stmt | None:
-    """Return the smallest non-compound statement whose range contains *line*.
-
-    Compound nodes (For/If/With/…) are used only as fallback when no
-    non-compound statement matches.
-    """
-    _COMPOUND = (
-        ast.For, ast.AsyncFor, ast.If, ast.While, ast.With,
-        ast.AsyncWith, ast.FunctionDef, ast.AsyncFunctionDef,
-        ast.ClassDef, ast.Try,
-    )
-    best_non_compound: ast.stmt | None = None
-    best_non_compound_size = float("inf")
-    best_compound: ast.stmt | None = None
-    best_compound_size = float("inf")
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.stmt):
-            continue
-        end = getattr(node, "end_lineno", node.lineno)
-        if not (node.lineno <= line <= end):
-            continue
-        size = end - node.lineno
-        if isinstance(node, _COMPOUND):
-            if size < best_compound_size:
-                best_compound, best_compound_size = node, size
-        else:
-            if size < best_non_compound_size:
-                best_non_compound, best_non_compound_size = node, size
-    return best_non_compound if best_non_compound is not None else best_compound
-
-
-# ── C1 (DataLoader) span helpers ────────────────────────────────────────────
-
-
-def _c1_span(
-    tree: ast.AST, config_line: int, warnings: list[str], file_rel: str
-) -> tuple[int, int] | None:
-    """Three-level fallback for C1 DataLoader findings.
-
-    1. collate_fn function body.
-    2. Largest For loop in the file.
-    3. Body of the enclosing function.
-    """
-    span = _find_collate_fn_span(tree)
-    if span:
-        return span
-
-    best: ast.For | ast.AsyncFor | None = None
-    best_size = -1
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.For, ast.AsyncFor)):
-            continue
-        end = getattr(node, "end_lineno", node.lineno)
-        size = end - node.lineno
-        if size > best_size:
-            best, best_size = node, size  # type: ignore[assignment]
-    if best is not None:
-        return (best.lineno, getattr(best, "end_lineno", best.lineno))
-
-    enclosing: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-    enc_size = float("inf")
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        end = getattr(node, "end_lineno", node.lineno)
-        size = end - node.lineno
-        if node.lineno <= config_line <= end and size < enc_size:
-            enclosing, enc_size = node, size  # type: ignore[assignment]
-
-    if enclosing and enclosing.body:
-        body = enclosing.body
-        return (body[0].lineno, getattr(body[-1], "end_lineno", body[-1].lineno))
-    return None
-
-
-def _find_collate_fn_span(tree: ast.AST) -> tuple[int, int] | None:
-    """Find DataLoader(..., collate_fn=<name>) and return the referenced function's body span."""
-    local_funcs: dict[str, tuple[int, int]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            body = node.body
-            if body:
-                local_funcs[node.name] = (
-                    body[0].lineno,
-                    getattr(body[-1], "end_lineno", body[-1].lineno),
-                )
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (
-            (isinstance(func, ast.Name) and func.id == "DataLoader")
-            or (isinstance(func, ast.Attribute) and func.attr == "DataLoader")
-        ):
-            continue
-        for kw in node.keywords:
-            if kw.arg != "collate_fn":
-                continue
-            val = kw.value
-            if isinstance(val, ast.Name) and val.id in local_funcs:
-                return local_funcs[val.id]
-            if isinstance(val, ast.Lambda):
-                lbody = val.body
-                called: str | None = None
-                if isinstance(lbody, ast.Call):
-                    cf = lbody.func
-                    called = cf.id if isinstance(cf, ast.Name) else (
-                        cf.attr if isinstance(cf, ast.Attribute) else None
-                    )
-                if called and called in local_funcs:
-                    return local_funcs[called]
-                start = lbody.lineno
-                return (start, getattr(lbody, "end_lineno", start))
-    return None
 
 
 # ── Timer insertion ──────────────────────────────────────────────────────────
@@ -366,7 +258,6 @@ def _insert_timers(root: Path, specs: list[TimerSpec], warnings: list[str]) -> l
         if not pending:
             continue
 
-        pending = _merge_overlapping_specs(pending, warnings)
         new_content = _apply_timer_insertions(original, pending, warnings)
         if new_content is None:
             continue
@@ -393,35 +284,6 @@ def _ensure_timer_module(root: Path, warnings: list[str]) -> None:
         module_path.write_text(CUDA_TIMER_MODULE_CONTENT, encoding="utf-8")
     except OSError as e:
         warnings.append(f"cannot write {CUDA_TIMER_MODULE_NAME}.py: {e}")
-
-
-def _merge_overlapping_specs(specs: list[TimerSpec], warnings: list[str]) -> list[TimerSpec]:
-    """Merge overlapping [wrap_start, wrap_end] ranges into a single spec."""
-    if not specs:
-        return specs
-
-    sorted_specs = sorted(specs, key=lambda s: (s.wrap_start, -s.wrap_end))
-    merged: list[TimerSpec] = []
-    cur = sorted_specs[0]
-
-    for nxt in sorted_specs[1:]:
-        if nxt.wrap_start <= cur.wrap_end:
-            combined = cur.timer_label + "+" + nxt.timer_label
-            warnings.append(f"__merge__:{cur.timer_label}|{nxt.timer_label}|{combined}")
-            cur = TimerSpec(
-                finding_id=cur.finding_id,
-                timer_label=combined,
-                file=cur.file,
-                wrap_start=min(cur.wrap_start, nxt.wrap_start),
-                wrap_end=max(cur.wrap_end, nxt.wrap_end),
-                reason=cur.reason + " | " + nxt.reason,
-            )
-        else:
-            merged.append(cur)
-            cur = nxt
-
-    merged.append(cur)
-    return merged
 
 
 def _insert_import(source: str, import_line: str) -> str:

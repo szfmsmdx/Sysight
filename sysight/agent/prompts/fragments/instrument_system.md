@@ -16,13 +16,10 @@ with cuda_timer("finding_label")():
 # 每次 with 块结束后打印: [SYSIGHT_TIMER] finding_label: X.XXX ms
 ```
 
-> **重要**：如果 Source Code Context 中某文件已包含 `# ── SYSIGHT_TIMER_BEGIN:` 注释，说明该文件**已被注入过计时器**，**不要**对该文件中已有 SYSIGHT_TIMER_BEGIN/END 标记的代码段重复输出 timer spec。只为**尚无任何 SYSIGHT_TIMER_BEGIN 标记**的 finding 产出埋点方案。
-
-
 # 你的任务
 
-对每个 finding，你需要确定：
-1. **timer_label**：计时器标签，格式为 `F{N}_{简短描述}`（如 `F01_forward_pass`）
+对每个 finding，用 `scanner_read` 阅读目标文件，然后确定：
+1. **timer_label**：计时器标签，格式为 `F{N}_{简短描述}`（如 `F01_attention_mask`）
 2. **wrap_start**：被 `with cuda_timer()():` 包裹的**第一行**行号（1-based）
 3. **wrap_end**：被包裹的**最后一行**行号（1-based，inclusive）
 4. **reason**：为什么选择这个范围来计时
@@ -51,12 +48,13 @@ with cuda_timer("finding_label")():
 - `wrap_end` 必须是同一缩进级别的最后一行
 - 不得把 `for`、`if`、`with`、`def`、`class` 等控制流/定义头行包含在范围内
 - 如果 finding 指向整个 for 循环（含循环体），计时范围是**循环体**（`for` 行下一行到循环体最后一行），**不含 `for` 行本身**
+- **计时范围应精确覆盖 finding 指出的性能问题代码段**，不要扩大到整个函数体
 
 # 原则
 
 - 计时范围应精确覆盖 finding 指出的性能问题代码段
 - 如果 finding 指向的是某个配置值（如 `num_workers=0`），计时范围应包含使用该配置的代码段（如整个 DataLoader 迭代循环体）
-- **若多个 findings 的 wrap 范围完全相同或有重叠**（例如两个 finding 都指向同一行），**必须合并为单个 timer**，`timer_label` 格式为 `F{N}_{描述}+F{M}_{描述}`，`finding_id` 填第一个，`reason` 用 ` | ` 分隔各自原因。**不得**为重叠范围输出多个独立 timer——那会导致代码嵌套损坏。
+- **若多个 findings 的 wrap 范围完全相同或有重叠**（例如两个 finding 都指向同一行），**必须合并为单个 timer**，`timer_label` 格式为 `F{N}_{描述}+F{M}_{描述}`，`finding_id` 用 `+` 连接所有 finding_id（如 `"C5:xxx+C2:yyy"`），`reason` 用 ` | ` 分隔各自原因。**不得**为重叠范围输出多个独立 timer——那会导致代码嵌套损坏。
 - 如果多个 findings 指向同一函数的**不同行**，可以分别计时（不重叠则各自输出）
 - 标签必须唯一，不得重复
 

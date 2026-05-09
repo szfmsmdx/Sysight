@@ -143,7 +143,19 @@ class OptimizerBenchmarkRunner:
                 run_dir=case_out,
             )
 
-            # Run execute (apply patches, smoke test, timer comparison)
+            # Build exec_config from case structure (no warmup cache needed)
+            exec_config = _build_case_exec_config(case_dir)
+
+            # Snapshot source files BEFORE any modification so restore
+            # reverts everything (patches + timers) back to original.
+            _snapshot_sources(case_dir)
+
+            # Run execute (apply patches, smoke test, timer comparison).
+            # inject_timers=True tells execute to inject cuda_timer AFTER
+            # patches are applied but BEFORE the "after" measurement.
+            # This ordering is critical: _fill_span_hashes computed hashes
+            # against original source files, so timer injection must not
+            # happen before patch application.
             from sysight.pipeline.execute import run_execute
             result = run_execute(
                 patches,
@@ -151,12 +163,17 @@ class OptimizerBenchmarkRunner:
                 run_id=findings.run_id,
                 analyze_run_dir=artifacts_dir,
                 run_dir=case_out,
+                exec_config=exec_config,
+                inject_timers=True,
             )
 
             elapsed_s = time.monotonic() - t0
 
+            # Load timer_labels for Performance scoring
+            timer_labels = _load_timer_labels(artifacts_dir)
+
             # Score against ground truth
-            score = self._score_case(truth, result, case_out)
+            score = self._score_case(truth, result, timer_labels, case_out)
 
             return CaseResult(
                 case_id=case_id,
@@ -176,6 +193,9 @@ class OptimizerBenchmarkRunner:
                 errors=[f"{type(e).__name__}: {e}"],
                 elapsed_s=elapsed_s,
             )
+        finally:
+            # Always restore source files to original state
+            _restore_sources(case_dir)
 
     def _load_findings(self, analyze_raw_path: Path):
         """Load findings from pre-built analyze_raw.json."""
@@ -212,7 +232,7 @@ class OptimizerBenchmarkRunner:
             return None
         return create_provider(cfg)
 
-    def _score_case(self, truth: dict, result, case_out: Path) -> dict:
+    def _score_case(self, truth: dict, result, timer_labels: dict[str, str], case_out: Path) -> dict:
         """Score optimizer output against ground truth.
 
         Uses the same scoring logic as score_optimizer.py but inline
@@ -239,16 +259,15 @@ class OptimizerBenchmarkRunner:
                 correctness = 0
 
         # ── 2. Performance (30) ──
+        # Map finding_id → timer_label → delta_pct using timer_labels from instrument_result.json
         performance = 0
         if real_ids:
             delta_pct = getattr(verify, 'delta_pct', {})
             perf_scores = []
             for fid in real_ids:
-                delta = None
-                for label, pct in delta_pct.items():
-                    if fid in label or label in fid:
-                        delta = pct
-                        break
+                # Look up timer label for this finding_id
+                label = timer_labels.get(fid, fid)
+                delta = delta_pct.get(label)
                 if delta is not None and delta < -5.0:
                     perf_scores.append(1.0)
                 elif delta is not None and delta < 0:
@@ -381,3 +400,104 @@ class OptimizerBenchmarkRunner:
             json.dumps(summary, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+
+def _load_timer_labels(artifacts_dir: Path) -> dict[str, str]:
+    """Load timer label → finding_id mapping from instrument_result.json.
+
+    Returns {finding_id: timer_label}.
+    When timers are merged (e.g. "F01+F02"), each individual finding_id
+    maps to the combined label so scoring can match any of them.
+    """
+    instrument_json = artifacts_dir / "instrument_result.json"
+    if not instrument_json.exists():
+        return {}
+
+    try:
+        data = json.loads(instrument_json.read_text(encoding="utf-8"))
+        result = {}
+        for t in data.get("timers", []):
+            finding_id = t.get("finding_id", "")
+            timer_label = t.get("timer_label", "")
+            if finding_id and timer_label:
+                # Split on "+" to handle merged timers — each individual
+                # finding_id maps to the same combined timer_label.
+                for fid in finding_id.split("+"):
+                    fid = fid.strip()
+                    if fid:
+                        result[fid] = timer_label
+        return result
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+# ── Source snapshot / restore (for automatic cleanup after execute) ──
+
+_SNAPSHOTS: dict[str, dict[str, str]] = {}  # case_dir → {rel_path: original_content}
+
+
+def _snapshot_sources(case_dir: Path) -> None:
+    """Snapshot all .py files under case_dir/src/ for later restore."""
+    src_dir = case_dir / "src"
+    if not src_dir.is_dir():
+        return
+    snap: dict[str, str] = {}
+    for py_file in src_dir.rglob("*.py"):
+        rel = str(py_file.relative_to(case_dir))
+        snap[rel] = py_file.read_text(encoding="utf-8")
+    _SNAPSHOTS[str(case_dir.resolve())] = snap
+
+
+def _restore_sources(case_dir: Path) -> None:
+    """Restore all previously snapshotted source files."""
+    key = str(case_dir.resolve())
+    snap = _SNAPSHOTS.pop(key, None)
+    if not snap:
+        return
+    for rel, content in snap.items():
+        (case_dir / rel).write_text(content, encoding="utf-8")
+    # Also remove the injected _sysight_timer.py
+    timer_path = case_dir / "_sysight_timer.py"
+    if timer_path.exists():
+        timer_path.unlink()
+
+
+def _build_case_exec_config(case_dir: Path) -> dict:
+    """Build exec_config from a benchmark case directory structure.
+
+    Optimizer-bench cases don't have warmup caches, but their structure is
+    known: a ``run.py`` entry point and a ``configs/`` directory.  This
+    function synthesizes a minimal exec_config so the EXECUTE stage can
+    run smoke tests and timer comparisons.
+    """
+    run_py = case_dir / "run.py"
+    config_dir = case_dir / "configs"
+
+    # Find the first .yaml config
+    config_file = ""
+    if config_dir.is_dir():
+        for f in sorted(config_dir.iterdir()):
+            if f.suffix in (".yaml", ".yml"):
+                config_file = f.name
+                break
+
+    if run_py.exists():
+        entry_point = f"python run.py"
+        minimal_run = ["python", "run.py"]
+        if config_file:
+            entry_point += f" --config configs/{config_file}"
+            minimal_run.extend(["--config", f"configs/{config_file}"])
+        return {
+            "entry_point": entry_point,
+            "minimal_run": minimal_run,
+            "test_commands": [],
+            "build_commands": [],
+            "env_vars": {},
+            "constraints": [],
+            "source": "benchmark_case",
+        }
+
+    return {}
+
+
+

@@ -1,8 +1,13 @@
-"""cuda_timer — lightweight GPU timing utility based on torch.cuda.Event.
+"""cuda_timer — lightweight GPU/CPU timing utility.
 
 The Instrument stage writes a single ``_sysight_timer.py`` file at the repo
 root (or src root) and then adds one ``import`` line to each instrumented
 file.  This avoids duplicating the class definition in every file.
+
+On CUDA-capable machines the timer uses ``torch.cuda.Event`` for GPU-precise
+measurement.  On CPU-only machines (macOS, CI) it falls back to
+``time.perf_counter()``, producing the same ``[SYSIGHT_TIMER]`` output format
+so that the EXECUTE stage can parse timer logs identically on any platform.
 
 Constants exported:
   CUDA_TIMER_MODULE_CONTENT  — the full content of _sysight_timer.py
@@ -16,43 +21,65 @@ from __future__ import annotations
 CUDA_TIMER_MODULE_NAME = "_sysight_timer"
 
 # Full content of the helper module.
+# The module auto-detects CUDA availability and picks the right timer backend.
 CUDA_TIMER_MODULE_CONTENT = '''\
 # ── Sysight cuda_timer (auto-injected, safe to delete after optimization) ──
 from __future__ import annotations
 
 import contextlib
-import torch
+import time
+
+try:
+    import torch
+
+    _HAS_CUDA = torch.cuda.is_available()
+except Exception:
+    _HAS_CUDA = False
 
 
 class _CudaTimer:
-    """Per-region GPU timer backed by torch.cuda.Event.
+    """Per-region timer.
+
+    Uses ``torch.cuda.Event`` when CUDA is available, otherwise falls back
+    to ``time.perf_counter()`` (wall-clock).  Both backends produce the same
+    ``[SYSIGHT_TIMER]`` log format.
 
     Usage::
 
         timer = _CudaTimer("forward")
         with timer():
             output = model(input)
-
-    All recorded times are printed with the ``[SYSIGHT_TIMER]`` prefix.
     """
     _registry: list["_CudaTimer"] = []
 
     def __init__(self, label: str) -> None:
         self.label = label
-        self._start = torch.cuda.Event(enable_timing=True)
-        self._end = torch.cuda.Event(enable_timing=True)
         self.elapsed_ms: list[float] = []
+        if _HAS_CUDA:
+            self._start_evt = torch.cuda.Event(enable_timing=True)
+            self._end_evt = torch.cuda.Event(enable_timing=True)
+        else:
+            self._start_evt = None
+            self._end_evt = None
+            self._start_ns: int = 0
         _CudaTimer._registry.append(self)
 
     @contextlib.contextmanager
     def __call__(self):  # type: ignore[override]
-        self._start.record()
+        if _HAS_CUDA:
+            self._start_evt.record()
+        else:
+            self._start_ns = time.perf_counter_ns()
         try:
             yield
         finally:
-            self._end.record()
-            torch.cuda.synchronize()
-            ms = self._start.elapsed_time(self._end)
+            if _HAS_CUDA:
+                self._end_evt.record()
+                torch.cuda.synchronize()
+                ms = self._start_evt.elapsed_time(self._end_evt)
+            else:
+                elapsed_ns = time.perf_counter_ns() - self._start_ns
+                ms = elapsed_ns / 1_000_000.0
             self.elapsed_ms.append(ms)
             print(f"[SYSIGHT_TIMER] {self.label}: {ms:.3f} ms")
 
