@@ -97,7 +97,7 @@ _DEFAULT_CONTEXT_WINDOW = 1_000_000
 
 # Utilization thresholds (fraction of context window)
 _MICROCOMPACT_UTILIZATION = 0.50   # Level 0: clear compactable tool results
-_COMPACT_THRESHOLD_RATIO  = 0.70   # Level 2: time-based compaction
+_COMPACT_THRESHOLD_RATIO  = 0.90   # Level 2: time-based compaction
 _SNIP_THRESHOLD_RATIO     = 0.80   # Level 2.5: deterministic snip
 _HARD_LIMIT_RATIO         = 0.95   # Level 3: aggressive pressure
 
@@ -146,6 +146,7 @@ class ContextPolicy:
     model_name: str = ""
 
     # Token budget (0 → auto-compute)
+    soft_token_limit: int = 0       # compatibility alias for 90% of context
     compact_token_limit: int = 0    # Level 2 threshold
     snip_token_limit: int = 0       # Level 2.5 threshold
     hard_token_limit: int = 0       # Level 3 threshold
@@ -171,6 +172,11 @@ class ContextPolicy:
         if self.compact_token_limit > 0:
             return self.compact_token_limit
         return int(self._context_window() * _COMPACT_THRESHOLD_RATIO)
+
+    def effective_soft_limit(self) -> int:
+        if self.soft_token_limit > 0:
+            return self.soft_token_limit
+        return int(self._context_window() * 0.90)
 
     def effective_snip_limit(self) -> int:
         if self.snip_token_limit > 0:
@@ -688,8 +694,6 @@ class AgentContext:
         """Chars of this message as it would be sent (compact if available)."""
         if stored.is_cleared:
             return len(json.dumps(stored.message, ensure_ascii=False, default=str))
-        if stored.compact_message and stored.compact_chars > 0:
-            return stored.compact_chars
         return stored.full_chars
 
     def _estimate_tokens(self) -> int:
@@ -903,7 +907,7 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [to_jsonable(v) for v in value]
     if isinstance(value, Path):
-        return str(value)
+        return value.as_posix()
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)

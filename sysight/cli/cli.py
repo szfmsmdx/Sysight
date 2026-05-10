@@ -7,6 +7,7 @@ Commands:
   sysight analyze  <profile> --repo <repo>
   sysight optimize <analysis.json> --repo <repo>
   sysight learn    <run-id>
+  sysight agent-loop <profile> --repo <repo>
   sysight full     <profile> --repo <repo>
   sysight tool     <category> <name> [args...]
 """
@@ -53,6 +54,8 @@ def main(argv: list[str] | None = None):
     p.add_argument("run_id", help="Analyze run_id (or path to analyze_raw.json)")
     p.add_argument("--repo", required=True, help="Path to repo root")
     p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal (always logged to optimize_debug.log)")
+    p.add_argument("--max-trials", type=int, default=5, help="Maximum optimizer trial iterations")
+    p.add_argument("--legacy-patches", action="store_true", help="Use legacy patch batch + execute flow")
 
     # bench-optimize
     p = sub.add_parser("bench-optimize", help="Run optimizer benchmark against optimizer-bench cases")
@@ -64,6 +67,25 @@ def main(argv: list[str] | None = None):
     # learn
     p = sub.add_parser("learn", help="Post-session learning")
     p.add_argument("run_id", help="Run ID to process")
+    p.add_argument("--repo", default="", help="Optional repo root for workspace namespace")
+
+    # outer agent loop
+    p = sub.add_parser("agent-loop", help="Run repeated analyze -> optimize -> learn loops")
+    p.add_argument("profile", help="Path to initial .sqlite profile")
+    p.add_argument("--repo", required=True, help="Path to repo root")
+    p.add_argument("--max-loops", type=int, default=2, help="Maximum outer loop iterations")
+    p.add_argument("--max-trials", type=int, default=5, help="Optimizer trials per outer loop")
+    p.add_argument("--stage-wall-seconds", type=int, default=1800, help="Wall-clock limit for one LLM sub-stage; 0 disables")
+    p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal")
+    p.add_argument("--no-profile-refresh", action="store_true", help="Reuse the input profile between outer loops")
+    p.add_argument(
+        "--profile-command",
+        default="",
+        help=(
+            "Optional profile command template. Supports {repo}, {output}, "
+            "{input_profile}, {sqlite}, {nsys_rep}, {iteration}."
+        ),
+    )
 
     # full pipeline
     p = sub.add_parser("full", help="Run the full pipeline")
@@ -90,6 +112,7 @@ def main(argv: list[str] | None = None):
         "optimize": _cmd_optimize,
         "bench-optimize": _cmd_bench_optimize,
         "learn": _cmd_learn,
+        "agent-loop": _cmd_agent_loop,
         "full": _cmd_full,
         "tool": _cmd_tool,
     }
@@ -154,9 +177,13 @@ def _cmd_warmup(args):
 
 def _cmd_analyze(args):
     registry, provider_factory, knowledge = _setup()
+    from sysight.pipeline.warmup import load_or_run_repo_setup
+    repo_setup = load_or_run_repo_setup(args.repo, knowledge)
     if args.dump_prompt or args.no_run:
         from sysight.pipeline.analyze import build_analyze_first_turn
-        bundle = build_analyze_first_turn(args.profile, args.repo, registry, knowledge)
+        bundle = build_analyze_first_turn(
+            args.profile, args.repo, registry, knowledge, repo_setup=repo_setup,
+        )
         if args.dump_prompt:
             _write_prompt_dump(args.dump_prompt, bundle)
         if args.no_run:
@@ -177,6 +204,7 @@ def _cmd_analyze(args):
     from sysight.pipeline.analyze import run_analyze
     result = run_analyze(
         args.profile, args.repo, registry, provider, knowledge,
+        repo_setup=repo_setup,
         verbose=getattr(args, 'debug', False),
     )
     # Output location already printed by run_analyze; print run_id for scripting
@@ -194,10 +222,15 @@ def _resolve_analyze_raw(run_id_or_path: str) -> Path:
         candidate = p / "analyze_raw.json"
         if candidate.exists():
             return candidate
-    # run_id lookup in .sysight/analysis-runs/
-    candidate = Path.cwd() / ".sysight" / "analysis-runs" / run_id_or_path / "analyze_raw.json"
-    if candidate.exists():
-        return candidate
+    # run_id lookup in current cache location, then legacy location.
+    from sysight.utils.cache import cache_dir
+    for base in (
+        cache_dir("analysis-runs"),
+        Path.cwd() / ".sysight" / "analysis-runs",
+    ):
+        candidate = base / run_id_or_path / "analyze_raw.json"
+        if candidate.exists():
+            return candidate
     print(f"Error: cannot resolve analyze_raw.json from '{run_id_or_path}'", file=sys.stderr)
     sys.exit(1)
 
@@ -205,7 +238,7 @@ def _resolve_analyze_raw(run_id_or_path: str) -> Path:
 def _load_findings(run_id_or_path: str):
     """Parse analyze_raw.json (by run_id or path) into LocalizedFindingSet."""
     path = _resolve_analyze_raw(run_id_or_path)
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
     from sysight.types.findings import LocalizedFindingSet, LocalizedFinding
     return LocalizedFindingSet(
         run_id=data.get("run_id", ""),
@@ -229,6 +262,13 @@ def _load_findings(run_id_or_path: str):
             if f.get("status") == "accepted"
         ],
     )
+
+
+def _load_measurement_plan(run_id_or_path: str):
+    path = _resolve_analyze_raw(run_id_or_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    from sysight.types.optimization import MeasurementPlan
+    return MeasurementPlan.from_dict(data.get("measurement_plan") or {})
 
 
 def _cmd_instrument(args):
@@ -301,6 +341,37 @@ def _cmd_optimize(args):
     findings = _load_findings(args.run_id)
     raw_path = _resolve_analyze_raw(args.run_id)
     analyze_run_dir = raw_path.parent  # .sysight/analysis-runs/<run_id>/
+    from sysight.pipeline.warmup import load_or_run_repo_setup
+    repo_setup = load_or_run_repo_setup(args.repo, knowledge)
+
+    if not getattr(args, "legacy_patches", False):
+        measurement_plan = _load_measurement_plan(args.run_id)
+        if not measurement_plan.run_command:
+            measurement_plan.run_command = repo_setup.minimal_run
+        if not measurement_plan.is_valid():
+            print("Error: analyze_raw.json has no valid measurement_plan", file=sys.stderr)
+            sys.exit(1)
+        from sysight.pipeline.optimize import run_optimize_trials
+        result = run_optimize_trials(
+            findings,
+            measurement_plan,
+            args.repo,
+            registry,
+            provider,
+            repo_setup=repo_setup,
+            knowledge=knowledge,
+            verbose=getattr(args, 'debug', False),
+            max_trials=getattr(args, "max_trials", 5),
+        )
+        print(json.dumps({
+            "run_id": result.run_id,
+            "worktree_path": result.worktree_path,
+            "best_commit": result.best_commit,
+            "accepted_count": result.accepted_count,
+            "rejected_count": result.rejected_count,
+            "errors": result.errors,
+        }, indent=2, ensure_ascii=False, default=str))
+        return
 
     from sysight.pipeline.optimize import run_optimize
     patches = run_optimize(
@@ -348,15 +419,51 @@ def _cmd_bench_optimize(args):
 
 
 def _cmd_learn(args):
-    _, _, knowledge = _setup()
+    _, provider_factory, knowledge = _setup()
+    provider = _provider_fallback(provider_factory, "learn", "optimize", "analyze")
     from sysight.pipeline.learn import run_learn
-    result = run_learn(args.run_id, knowledge)
+    result = run_learn(args.run_id, knowledge, provider, repo=getattr(args, "repo", ""))
     print(json.dumps({
         "run_id": result.run_id,
-        "worklog": result.worklog[:500],
-        "experiences": len(result.experiences),
+        "summary": result.summary,
+        "worklog_path": result.worklog_path,
+        "updates": len(result.memory_updates),
         "errors": result.errors,
     }, indent=2, ensure_ascii=False))
+
+
+def _cmd_agent_loop(args):
+    registry, provider_factory, knowledge = _setup()
+    from sysight.pipeline.agent_loop import run_agent_loop
+    result = run_agent_loop(
+        args.profile,
+        args.repo,
+        registry,
+        provider_factory,
+        knowledge,
+        max_loops=getattr(args, "max_loops", 2),
+        max_trials=getattr(args, "max_trials", 5),
+        verbose=getattr(args, "debug", False),
+        refresh_profiles=not getattr(args, "no_profile_refresh", False),
+        profile_command=getattr(args, "profile_command", ""),
+        stage_wall_seconds=getattr(args, "stage_wall_seconds", 1800),
+    )
+    print(json.dumps({
+        "loop_id": result.loop_id,
+        "run_dir": result.run_dir,
+        "iterations": len(result.iterations),
+        "final_repo": result.final_repo,
+        "final_profile": result.final_profile,
+        "errors": result.errors,
+    }, indent=2, ensure_ascii=False, default=str))
+
+
+def _provider_fallback(provider_factory, *stages: str):
+    for stage in stages:
+        provider = provider_factory(stage)
+        if provider:
+            return provider
+    return None
 
 
 def _cmd_full(args):

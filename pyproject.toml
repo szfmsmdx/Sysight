@@ -20,5 +20,6 @@ testpaths = [
     "test/test_types",
     "test/test_tools",
     "test/test_wiki",
+    "test/test_pipeline",
     "test/test_agent",
 ]

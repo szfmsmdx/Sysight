@@ -442,3 +442,115 @@ instrument → execute 改为内存传递 `TimerSpec[]`。
 4. **角色分解**：不同阶段使用不同的 system prompt 和工具集，而非单一通用 agent。
 
 5. **验证确定性**：EXECUTE 阶段的验证完全确定性（smoke test + timer 对比），不依赖 LLM 判断。
+
+---
+
+## 八、2026-05-10 Agent Loop v1 落地记录
+
+### 8.1 本阶段目标
+
+将 optimizer 从单次 patch 生成推进为可持续迭代的外层 agent loop：
+
+- 每轮执行 `analyze -> optimize trials -> learn -> profile refresh`
+- patch 只是 trial 小循环，外层 loop 负责持续推进 repo 和 profile 状态
+- 每轮都记录 worklog、指标变化、accepted/rejected trial、learn 总结
+- 中间产物统一进入 `.sysight/cache`，避免污染目标 workspace
+
+### 8.2 已实现模块
+
+- `sysight/pipeline/agent_loop.py`
+  - 新增外层循环编排：多轮 analyze/optimize/learn/profile refresh
+  - accepted patch 后推进下一轮 repo 到最佳 worktree
+  - profile refresh 支持默认 nsys 和 `--profile-command` 模板
+  - 每轮写入 `agent_loop_result.json` 和 `worklog.csv`
+  - 支持 `--stage-wall-seconds`，避免单阶段无限卡住
+
+- `sysight/pipeline/optimize.py`
+  - 新增 `run_optimize_trials`
+  - 每个 trial 创建 worktree、应用 patch、运行端到端 measurement
+  - 指标变好则 commit，指标不变/回退则 reset 到最近有效 commit
+  - trial 级别写入 `trials.jsonl`、`worklog.md`、`worklog.csv`
+  - optimizer 读取 workspace Wiki/worklog，避免重复失败实验
+
+- `sysight/pipeline/analyze.py`
+  - analyzer 输出新增 `measurement_plan`
+  - measurement plan 由 LLM 根据 repo 日志/入口命令判断端到端指标
+  - analyzer 输出和 debug 日志移动到 `.sysight/cache/analysis-runs`
+  - 支持 stage wall-clock 上限
+
+- `sysight/pipeline/learn.py`
+  - 每轮固定写 workspace worklog
+  - LLM learn 可读取现有 Wiki，并用 memory tools 写入 overview/experience
+  - provider 缺失时仍保留 deterministic worklog
+
+- `sysight/pipeline/worklog.py`
+  - 新增 CSV worklog helper
+  - 全局记录路径：`.sysight/worklog/agent_loop.csv`
+
+- `sysight/pipeline/measure.py`
+  - 新增端到端命令执行与日志指标提取
+  - 支持 regex samples、aggregation、lower_is_better、success threshold
+
+- `sysight/utils/cache.py`
+  - 统一 `.sysight/cache` 路径
+  - warmup/analyze/optimizer/agent-loop 产物统一进入 cache
+
+### 8.3 稳定性修复
+
+- `AgentLoop` 支持 JSON repair：第一次输出非 JSON、第二次修复成功时任务继续算成功。
+- analyzer 超时或未返回 measurement plan 时，optimizer 使用 warmup 入口命令生成 fallback plan。
+- analyzer 未返回 findings 时，生成 `C0:end_to_end` fallback finding，保证 optimizer 仍可做端到端优化探索。
+- profile refresh 无论成功/失败都会写 `.profile_refresh.json` 诊断文件。
+- optimizer/learn 的 memory namespace 固定到原始 repo，避免临时 worktree namespace 导致重复实验。
+- 清理了目标 workspace 下的 `.sysight` 残留，中间产物保持在主项目 `.sysight/cache`。
+- 修复 `.sysight/worklog/agent_loop.csv` 中早期 LLM 中文摘要的 mojibake 编码问题。
+
+### 8.4 真实测试记录
+
+测试 repo：
+
+- `workspace/nanogpt-sysight`
+- 初始 profile：`profile/nanogpt-sysight/baseline.sqlite`
+- 环境：`conda run -n pytorch`
+
+关键结果：
+
+- `loop-e30ea01d-1778414517`
+  - 第 1 轮 accepted 1 个 trial
+  - `iteration_ms: 31.8917 -> 21.6502`
+  - 提升约 `32.11%`
+  - profile 交接产物生成成功：`profiles/iter-002.sqlite`
+
+- `loop-e30ea01d-1778423570`
+  - 完整跑通 2 轮 analyze -> optimize -> learn
+  - 两轮均生成 optimizer worktree、measurement、trial、worklog
+  - 两个 trial 均被正确 rejected，并记录回退原因和指标回归
+
+验证命令：
+
+```powershell
+pytest test/test_pipeline/test_agent_loop.py test/test_pipeline/test_optimize_trials.py test/test_pipeline/test_measure.py test/test_pipeline/test_warmup.py test/test_agent/test_context.py -q
+```
+
+结果：
+
+```text
+60 passed
+```
+
+### 8.5 当前已知限制
+
+- 当前 Windows 非管理员环境下，`nsys profile` 会因部分 provider 需要管理员权限而失败。
+- 已通过 `--profile-command` 验证 profile 交接链路，但真实二轮 nsys refresh 仍需要管理员权限或外部提供可运行 profile command。
+- 当 analyzer 被 wall-clock 截断时，fallback finding 能保证链路不空跑，但输出质量依赖 Wiki/worklog 是否足够完整。
+- metric 当前默认使用 mean，短训练中的冷启动 spike 会明显影响结果；后续可以让 analyzer 更主动选择 `median` 或 `drop_first_n`。
+
+### 8.6 下一步建议
+
+- 让 analyzer 在生成 measurement plan 时更明确判断：
+  - 是否需要丢弃 warmup/cold-start samples
+  - 使用 mean/median/min 哪种 aggregation
+  - 端到端指标是否来自真实训练日志、benchmark 脚本或 profile NVTX 阶段
+- 给 optimizer prompt 加强“先读 workspace worklog，避免重复已 rejected/已 applied 实验”的约束。
+- 将 profile refresh 的 nsys 权限失败转为更清晰的用户提示，并建议管理员终端或自定义 `--profile-command`。
+- 增加 agent loop 级别的 resume 能力：从某个 `agent_loop_result.json` 继续下一轮。

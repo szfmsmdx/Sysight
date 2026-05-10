@@ -62,7 +62,7 @@ def list_files(
 
     for p in _walk(root):
         rel = p.relative_to(root)
-        rel_str = str(rel)
+        rel_str = rel.as_posix()
 
         # ext filter
         if norm_ext and p.suffix.lower() != norm_ext:

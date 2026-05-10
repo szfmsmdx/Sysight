@@ -61,13 +61,18 @@ class OpenAICompatibleProvider:
             "messages": self._build_messages(request),
         }
         thinking = self._config.thinking
+        if thinking is None and self._config.model.startswith("deepseek-v4"):
+            thinking = {"type": "enabled"}
         if thinking is not None:
             body["thinking"] = thinking
-        if not _thinking_enabled(thinking):
+        thinking_enabled = _thinking_enabled(thinking)
+        if not thinking_enabled:
             body["temperature"] = self._config.temperature
 
         reasoning_effort = self._config.reasoning_effort
-        if reasoning_effort:
+        if thinking_enabled and not reasoning_effort and self._config.model.startswith("deepseek-v4"):
+            reasoning_effort = "max"
+        if thinking_enabled and reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
 
         # Per-request override takes priority, then config

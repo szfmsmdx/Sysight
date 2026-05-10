@@ -105,9 +105,36 @@ def _warmup_cache_path(root: Path) -> Path:
     resolved = root.resolve()
     dir_name = re.sub(r"[^A-Za-z0-9_.-]", "_", resolved.name)[:32]
     short_hash = hashlib.sha1(str(resolved).encode(), usedforsecurity=False).hexdigest()[:8]
-    cache_dir = Path.cwd() / ".sysight" / "warmup-caches"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    from sysight.utils.cache import cache_dir
+    cache_dir = cache_dir("warmup-caches")
     return cache_dir / f"{dir_name}-{short_hash}.json"
+
+
+def _legacy_warmup_cache_path(root: Path) -> Path:
+    import hashlib
+    resolved = root.resolve()
+    dir_name = re.sub(r"[^A-Za-z0-9_.-]", "_", resolved.name)[:32]
+    short_hash = hashlib.sha1(str(resolved).encode(), usedforsecurity=False).hexdigest()[:8]
+    return Path.cwd() / ".sysight" / "warmup-caches" / f"{dir_name}-{short_hash}.json"
+
+
+def load_or_run_repo_setup(
+    repo: str,
+    knowledge=None,
+    *,
+    force: bool = False,
+) -> RepoSetup:
+    """Return a usable RepoSetup, reusing warmup cache whenever possible."""
+    root = Path(repo).resolve()
+    cache_path = _warmup_cache_path(root)
+    if not force:
+        cached = RepoSetup.load_cache(cache_path)
+        if cached and cached.is_fresh():
+            return cached
+        cached = RepoSetup.load_cache(_legacy_warmup_cache_path(root))
+        if cached and cached.is_fresh():
+            return cached
+    return run_warmup(str(root), knowledge, force=force).repo_setup
 
 
 def run_warmup(
@@ -947,8 +974,13 @@ def _infer_constraints(facts: WarmupFacts) -> list[str]:
 
 def _populate_repo_setup(root: Path, repo_setup: RepoSetup, facts: WarmupFacts,
                          warnings: list[str], errors: list[str]) -> None:
-    repo_setup.entry_point = facts.primary_command
-    repo_setup.minimal_run = _minimal_run_tokens(facts)
+    preferred_entry = _preferred_sysight_entry(root)
+    if preferred_entry is not None:
+        repo_setup.entry_point = preferred_entry[0]
+        repo_setup.minimal_run = preferred_entry[1]
+    else:
+        repo_setup.entry_point = facts.primary_command
+        repo_setup.minimal_run = _minimal_run_tokens(facts)
     repo_setup.build_commands = _build_commands(root)
     repo_setup.test_commands = _test_commands(root)
     repo_setup.constraints = facts.constraints[:]
@@ -993,6 +1025,20 @@ def _minimal_run_tokens(facts: WarmupFacts) -> list[str]:
         if "torch.distributed.launch" in command:
             return parts
     return []
+
+
+def _preferred_sysight_entry(root: Path) -> tuple[str, list[str]] | None:
+    """Prefer an explicit repo-provided Sysight run script when available."""
+    candidates = [
+        ("python scripts/sysight_run.py", ["python", "scripts/sysight_run.py"]),
+        ("bash scripts/sysight_run.sh", ["bash", "scripts/sysight_run.sh"]),
+        ("powershell -File scripts/sysight_run.ps1", ["powershell", "-File", "scripts/sysight_run.ps1"]),
+    ]
+    for entry, cmd in candidates:
+        script_path = root / cmd[-1]
+        if script_path.exists():
+            return entry, cmd
+    return None
 
 
 def _build_commands(root: Path) -> list[list[str]]:

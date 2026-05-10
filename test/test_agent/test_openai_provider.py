@@ -84,6 +84,44 @@ class TestOpenAICompatibleProvider(unittest.TestCase):
         self.assertIn("<REDACTED>", response.error.message)
         self.assertFalse(response.error.retryable)
 
+    def test_deepseek_v4_no_reasoning_effort_when_thinking_disabled(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"choices":[{"message":{"content":"{}"},'
+                    b'"finish_reason":"stop"}],"usage":{"prompt_tokens":1,'
+                    b'"completion_tokens":2}}'
+                )
+
+        def fake_urlopen(req, timeout):
+            captured.update(__import__("json").loads(req.data.decode("utf-8")))
+            return FakeResponse()
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            provider = OpenAICompatibleProvider(LLMConfig(
+                provider="openai",
+                model="deepseek-v4-pro",
+                api_key="test",
+                base_url="https://api.deepseek.com/v1",
+                thinking={"type": "disabled"},
+            ))
+            provider.complete(LLMRequest(messages=[{"role": "user", "content": "hi"}]))
+        finally:
+            urllib.request.urlopen = original
+
+        self.assertEqual(captured["thinking"], {"type": "disabled"})
+        self.assertNotIn("reasoning_effort", captured)
+
 
 if __name__ == "__main__":
     unittest.main()

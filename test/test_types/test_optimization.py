@@ -2,7 +2,11 @@
 
 import unittest
 
-from sysight.types.optimization import compute_span_hash
+from sysight.types.optimization import (
+    MeasurementPlan,
+    MetricSpec,
+    compute_span_hash,
+)
 
 
 class TestComputeSpanHash(unittest.TestCase):
@@ -19,6 +23,25 @@ class TestComputeSpanHash(unittest.TestCase):
 
     def test_empty_string_hashes(self):
         self.assertEqual(len(compute_span_hash("")), 12)
+
+
+class TestMeasurementPlan(unittest.TestCase):
+    def test_first_metric_becomes_primary(self):
+        plan = MeasurementPlan.from_dict({
+            "run_command": ["python", "run.py"],
+            "metrics": [{"name": "iter_ms", "regex": r"iter (\d+) ms"}],
+        })
+
+        self.assertTrue(plan.is_valid())
+        self.assertEqual(plan.primary_metric.name, "iter_ms")
+        self.assertTrue(plan.metrics[0].primary)
+
+    def test_metric_spec_defaults(self):
+        metric = MetricSpec.from_dict({"name": "throughput", "regex": r"tok/s=(\d+)"})
+
+        self.assertEqual(metric.group, 1)
+        self.assertEqual(metric.aggregation, "mean")
+        self.assertTrue(metric.lower_is_better)
 
 
 if __name__ == "__main__":

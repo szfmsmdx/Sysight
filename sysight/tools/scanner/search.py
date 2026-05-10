@@ -89,7 +89,7 @@ def search(
             m = pattern.search(line)
             if m:
                 matches.append(SearchMatch(
-                    path=str(p.relative_to(root)),
+                    path=p.relative_to(root).as_posix(),
                     line=lineno,
                     column=m.start() + 1,
                     text=line.rstrip(),

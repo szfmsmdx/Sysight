@@ -87,6 +87,7 @@ class AgentLoop:
         if not policy.model_name and hasattr(self._provider, 'model'):
             policy = ContextPolicy(
                 model_name=getattr(self._provider, 'model', ''),
+                soft_token_limit=policy.soft_token_limit,
                 compact_token_limit=policy.compact_token_limit,
                 snip_token_limit=policy.snip_token_limit,
                 hard_token_limit=policy.hard_token_limit,
@@ -280,11 +281,13 @@ class AgentLoop:
                         )
 
                 output = {}
+                parsed_json = False
                 raw = response.content
                 parse_error = None
                 if raw:
                     try:
                         output = self._extract_json(raw)
+                        parsed_json = True
                     except json.JSONDecodeError as e:
                         parse_error = str(e)
                         errors.append(f"schema_error: {parse_error}")
@@ -305,7 +308,7 @@ class AgentLoop:
                 return AgentResult(
                     run_id=task.run_id, task_id=task.task_id,
                     backend=self._provider.name, model=getattr(self._provider, 'model', ''),
-                    status="ok" if not errors else "schema_error",
+                    status="ok" if parsed_json or not errors else "schema_error",
                     output=output, raw_content=raw,
                     tool_calls=tool_calls_log,
                     usage={

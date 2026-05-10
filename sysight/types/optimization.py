@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Literal
 
 
@@ -30,6 +30,152 @@ class PatchCandidate:
     replacement: str = ""
     rationale: str = ""
     validation_commands: list[list[str]] = field(default_factory=list)
+
+
+@dataclass
+class MetricSpec:
+    """How to extract one end-to-end metric from program logs."""
+    name: str = ""
+    regex: str = ""
+    group: int = 1
+    aggregation: Literal["mean", "median", "min", "max", "last"] = "mean"
+    lower_is_better: bool = True
+    primary: bool = False
+    drop_first_n: int = 0
+    unit: str = ""
+    source: str = "stdout_stderr"
+    rationale: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MetricSpec":
+        return cls(
+            name=str(data.get("name", "")),
+            regex=str(data.get("regex", "")),
+            group=int(data.get("group", 1) or 1),
+            aggregation=str(data.get("aggregation", "mean") or "mean"),
+            lower_is_better=bool(data.get("lower_is_better", True)),
+            primary=bool(data.get("primary", False)),
+            drop_first_n=max(0, int(data.get("drop_first_n", 0) or 0)),
+            unit=str(data.get("unit", "")),
+            source=str(data.get("source", "stdout_stderr") or "stdout_stderr"),
+            rationale=str(data.get("rationale", "")),
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class MeasurementPlan:
+    """End-to-end measurement contract used by the optimizer trial loop."""
+    run_command: list[str] = field(default_factory=list)
+    timeout_s: int = 600
+    repeats: int = 1
+    warmup_runs: int = 0
+    metrics: list[MetricSpec] = field(default_factory=list)
+    env_vars: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+    success_threshold_pct: float = 0.0
+    source: str = ""
+    rationale: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "MeasurementPlan":
+        data = data or {}
+        metrics = [
+            MetricSpec.from_dict(item)
+            for item in data.get("metrics", [])
+            if isinstance(item, dict)
+        ]
+        plan = cls(
+            run_command=[str(x) for x in data.get("run_command", [])],
+            timeout_s=max(1, int(data.get("timeout_s", 600) or 600)),
+            repeats=max(1, int(data.get("repeats", 1) or 1)),
+            warmup_runs=max(0, int(data.get("warmup_runs", 0) or 0)),
+            metrics=metrics,
+            env_vars={str(k): str(v) for k, v in dict(data.get("env_vars", {}) or {}).items()},
+            cwd=str(data.get("cwd", "") or ""),
+            success_threshold_pct=float(data.get("success_threshold_pct", 0.0) or 0.0),
+            source=str(data.get("source", "")),
+            rationale=str(data.get("rationale", "")),
+        )
+        plan.ensure_primary()
+        return plan
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["metrics"] = [m.to_dict() for m in self.metrics]
+        return data
+
+    def ensure_primary(self) -> None:
+        if self.metrics and not any(m.primary for m in self.metrics):
+            self.metrics[0].primary = True
+
+    @property
+    def primary_metric(self) -> MetricSpec | None:
+        for metric in self.metrics:
+            if metric.primary:
+                return metric
+        return self.metrics[0] if self.metrics else None
+
+    def is_valid(self) -> bool:
+        return bool(self.run_command and self.primary_metric and self.primary_metric.regex)
+
+
+@dataclass
+class MeasurementResult:
+    """The deterministic result of running a MeasurementPlan."""
+    status: Literal["ok", "error"] = "error"
+    metric_values: dict[str, float] = field(default_factory=dict)
+    samples: dict[str, list[float]] = field(default_factory=dict)
+    primary_metric: str = ""
+    primary_value: float | None = None
+    stdout_path: str = ""
+    stderr_path: str = ""
+    errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "MeasurementResult":
+        data = data or {}
+        return cls(
+            status=data.get("status", "error"),
+            metric_values={str(k): float(v) for k, v in dict(data.get("metric_values", {}) or {}).items()},
+            samples={
+                str(k): [float(x) for x in v]
+                for k, v in dict(data.get("samples", {}) or {}).items()
+            },
+            primary_metric=str(data.get("primary_metric", "")),
+            primary_value=(
+                None if data.get("primary_value") is None else float(data.get("primary_value"))
+            ),
+            stdout_path=str(data.get("stdout_path", "")),
+            stderr_path=str(data.get("stderr_path", "")),
+            errors=[str(x) for x in data.get("errors", [])],
+        )
+
+
+@dataclass
+class TrialResult:
+    """One optimizer experiment evaluated against the current best metric."""
+    trial_id: str = ""
+    status: Literal["accepted", "rejected", "error", "skipped"] = "rejected"
+    patch_ids: list[str] = field(default_factory=list)
+    finding_ids: list[str] = field(default_factory=list)
+    commit_before: str = ""
+    commit_after: str = ""
+    primary_metric: str = ""
+    metric_before: float | None = None
+    metric_after: float | None = None
+    delta_pct: float | None = None
+    reason: str = ""
+    summary: str = ""
+    measurement_errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass

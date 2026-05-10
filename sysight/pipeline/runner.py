@@ -38,6 +38,8 @@ class PipelineRunner:
         errors: list[str] = []
         stages: list[str] = []
 
+        warmup_result = None
+
         # 0. WARMUP
         try:
             warmup_result = self.run_warmup(repo)
@@ -49,7 +51,10 @@ class PipelineRunner:
         # 1. ANALYZE
         try:
             analyze_provider = self._provider_factory("analyze")
-            analyze_result = self.run_analyze(profile, repo, analyze_provider)
+            analyze_result = self.run_analyze(
+                profile, repo, analyze_provider,
+                repo_setup=warmup_result.repo_setup if warmup_result else None,
+            )
             stages.append("analyze")
         except Exception as e:
             errors.append(f"analyze: {e}")
@@ -70,12 +75,13 @@ class PipelineRunner:
 
         # 1.2 LEARN (from analyze findings)
         try:
-            learn_provider = self._provider_factory("learn")
+            learn_provider = self._provider_fallback("learn", "optimize", "analyze")
             findings_json = _serialize_findings(analyze_result.finding_set)
             self.run_learn(
                 analyze_result.run_id,
                 learn_provider,
                 findings_json=findings_json,
+                repo=repo,
             )
             stages.append("learn")
         except Exception as e:
@@ -84,8 +90,11 @@ class PipelineRunner:
         # 2. OPTIMIZE (plan only — no file changes)
         try:
             optimize_provider = self._provider_factory("optimize")
-            patches = self.run_optimize(
+            patches = []
+            optimize_loop_result = self.run_optimize(
                 analyze_result.finding_set, repo, optimize_provider,
+                measurement_plan=analyze_result.measurement_plan,
+                repo_setup=warmup_result.repo_setup if warmup_result else None,
             )
             stages.append("optimize")
         except Exception as e:
@@ -111,7 +120,7 @@ class PipelineRunner:
 
         # 3.1 LEARN (from analyze findings + execute patches)
         try:
-            learn_provider = self._provider_factory("learn")
+            learn_provider = self._provider_fallback("learn", "optimize", "analyze")
             findings_json = _serialize_findings(analyze_result.finding_set)
             patches_json = _serialize_patches(
                 execute_result.patches if execute_result else []
@@ -121,6 +130,7 @@ class PipelineRunner:
                 learn_provider,
                 findings_json=findings_json,
                 patches_json=patches_json,
+                repo=repo,
             )
             if "learn" not in stages:
                 stages.append("learn")
@@ -130,7 +140,11 @@ class PipelineRunner:
         return PipelineResult(
             run_id=analyze_result.run_id,
             findings=[f.__dict__ for f in analyze_result.finding_set.findings],
-            patches=[p.__dict__ for p in (execute_result.patches if execute_result else [])],
+            patches=(
+                [t.to_dict() for t in optimize_loop_result.trials]
+                if 'optimize_loop_result' in locals() else
+                [p.__dict__ for p in (execute_result.patches if execute_result else [])]
+            ),
             errors=errors, stages_completed=stages,
         )
 
@@ -138,9 +152,12 @@ class PipelineRunner:
         from sysight.pipeline.warmup import run_warmup
         return run_warmup(repo, self._knowledge)
 
-    def run_analyze(self, profile: str, repo: str, provider):
+    def run_analyze(self, profile: str, repo: str, provider, repo_setup=None):
         from sysight.pipeline.analyze import run_analyze
-        return run_analyze(profile, repo, self._registry, provider, self._knowledge)
+        return run_analyze(
+            profile, repo, self._registry, provider, self._knowledge,
+            repo_setup=repo_setup,
+        )
 
     def run_instrument(self, findings, repo: str, provider, run_dir=None):
         from sysight.pipeline.instrument import run_instrument
@@ -151,10 +168,16 @@ class PipelineRunner:
             run_dir=run_dir,
         )
 
-    def run_optimize(self, findings, repo: str, provider):
-        from sysight.pipeline.optimize import run_optimize
-        return run_optimize(
-            findings, repo, self._registry, provider,
+    def run_optimize(self, findings, repo: str, provider,
+                     measurement_plan=None, repo_setup=None):
+        from sysight.pipeline.optimize import run_optimize_trials
+        if measurement_plan is None:
+            from sysight.types.optimization import MeasurementPlan
+            measurement_plan = MeasurementPlan()
+        return run_optimize_trials(
+            findings, measurement_plan, repo, self._registry, provider,
+            repo_setup=repo_setup,
+            knowledge=self._knowledge,
         )
 
     def run_execute(self, patches, repo: str, *,
@@ -168,13 +191,22 @@ class PipelineRunner:
         )
 
     def run_learn(self, run_id: str, provider=None,
-                  findings_json: str = "", patches_json: str = ""):
+                  findings_json: str = "", patches_json: str = "",
+                  repo: str = ""):
         from sysight.pipeline.learn import run_learn
         return run_learn(
             run_id, self._knowledge, provider,
             findings_json=findings_json,
             patches_json=patches_json,
+            repo=repo,
         )
+
+    def _provider_fallback(self, *stages: str):
+        for stage in stages:
+            provider = self._provider_factory(stage)
+            if provider:
+                return provider
+        return None
 
 
 def _serialize_findings(finding_set) -> str:

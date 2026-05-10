@@ -151,8 +151,8 @@ class FTSIndex:
                 end = text.find("---", 3)
                 if end != -1:
                     body = text[end + 3:]
-            rel = md.relative_to(self._wiki_dir)
-            self.chunk_page(str(rel), body)
+            rel = md.relative_to(self._wiki_dir).as_posix()
+            self.chunk_page(rel, body)
 
     @staticmethod
     def _extract_snippet(content: str, query: str, context: int = 60) -> str:

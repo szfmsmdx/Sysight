@@ -68,6 +68,10 @@ class ToolRegistry:
         if policy.read_only and not tool.read_only:
             return ToolResult(tool_name=name, status="policy_denied", error=f"Tool {name} is not read-only")
 
+        self._call_counts["_total"] = self._call_counts.get("_total", 0) + 1
+        if policy.max_calls_per_task > 0 and self._call_counts["_total"] > policy.max_calls_per_task:
+            return ToolResult(tool_name=name, status="policy_denied", error="Policy max calls exceeded")
+
         self._call_counts[name] = self._call_counts.get(name, 0) + 1
         if self._call_counts[name] > tool.max_calls_per_task:
             return ToolResult(tool_name=name, status="policy_denied", error="Max calls exceeded")
@@ -135,5 +139,15 @@ class ToolRegistry:
 
 LEARN_POLICY = ToolPolicy(
     allowed_tools={"memory_search", "memory_read", "memory_write", "memory_append", "memory_replace"},
+    read_only=False,
+)
+
+ANALYZE_POLICY = ToolPolicy(
+    allowed_tools={"scanner_*", "nsys_sql_*", "memory_search", "memory_read"},
+    read_only=True,
+)
+
+OPTIMIZE_POLICY = ToolPolicy(
+    allowed_tools={"scanner_*", "sandbox_*"},
     read_only=False,
 )

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,8 @@ from pathlib import Path
 from sysight.agent.loop import AgentLoop, AgentTask
 from sysight.benchmark.debug import DebugProvider
 from sysight.types.findings import LocalizedFinding, LocalizedFindingSet
+from sysight.types.optimization import MeasurementPlan
+from sysight.types.repo_setup import RepoSetup
 
 
 @dataclass
@@ -29,6 +32,7 @@ class AnalyzeResult:
     context_stats: dict = field(default_factory=dict)
     provider_error: dict = field(default_factory=dict)
     evidence_pack: dict = field(default_factory=dict)
+    measurement_plan: MeasurementPlan = field(default_factory=MeasurementPlan)
     elapsed_ms: float = 0
     backoff_ms: float = 0
 
@@ -39,8 +43,10 @@ def run_analyze(
     registry,
     provider,
     knowledge=None,
+    repo_setup: RepoSetup | None = None,
     run_id: str = "",
     verbose: bool = False,
+    max_wall_seconds: int = 0,
 ) -> AnalyzeResult:
     """Analyze a profile and produce a LocalizedFindingSet.
 
@@ -52,6 +58,12 @@ def run_analyze(
     root = Path(repo).resolve()
     sqlite_path = Path(profile).resolve()
     ns = knowledge.workspace_namespace(repo_root=str(root)) if knowledge else "default"
+    if repo_setup is None:
+        try:
+            from sysight.pipeline.warmup import load_or_run_repo_setup
+            repo_setup = load_or_run_repo_setup(str(root), knowledge)
+        except Exception:
+            repo_setup = RepoSetup()
 
     if not run_id:
         # Stable short hash from profile path + repo path
@@ -61,7 +73,8 @@ def run_analyze(
         run_id = f"run-{digest}"
 
     # Create output directory
-    run_dir = Path.cwd() / ".sysight" / "analysis-runs" / run_id
+    from sysight.utils.cache import cache_dir
+    run_dir = cache_dir("analysis-runs", run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Build prompt bundle (shared with build_analyze_first_turn)
@@ -71,6 +84,7 @@ def run_analyze(
         ns=ns,
         registry=registry,
         knowledge=knowledge,
+        repo_setup=repo_setup,
     )
     evidence_pack = bundle["evidence_pack"]
     system_prompt = bundle["system_prompt"]
@@ -88,15 +102,17 @@ def run_analyze(
         run_id=run_id, task_id=f"{run_id}-analyze",
         task_type="analyze",
         system_prompt=system_prompt, user_prompt=user_prompt,
-        max_turns=50, max_wall_seconds=0,
+        max_turns=50, max_wall_seconds=max_wall_seconds,
     )
 
     result = loop.run(task)
 
     # 4. Parse output
     finding_set = LocalizedFindingSet(run_id=run_id)
+    measurement_plan = MeasurementPlan()
     if result.output:
         finding_set = _parse_finding_set(result.output, run_id)
+        measurement_plan = _parse_measurement_plan(result.output, repo_setup)
 
     # 5. Validate findings
     accepted, rejected = _validate_findings(finding_set.findings, root)
@@ -132,6 +148,7 @@ def run_analyze(
         "context_stats": result.context_stats,
         "provider_error": result.provider_error,
         "evidence_pack": evidence_pack,
+        "measurement_plan": measurement_plan.to_dict(),
         "elapsed_ms": result.elapsed_ms,
         "backoff_ms": result.backoff_ms,
     }
@@ -181,6 +198,7 @@ def run_analyze(
         context_stats=result.context_stats,
         provider_error=result.provider_error,
         evidence_pack=evidence_pack,
+        measurement_plan=measurement_plan,
         elapsed_ms=result.elapsed_ms,
         backoff_ms=result.backoff_ms,
     )
@@ -191,11 +209,18 @@ def build_analyze_first_turn(
     repo: str,
     registry=None,
     knowledge=None,
+    repo_setup: RepoSetup | None = None,
 ) -> dict:
     """Build the exact first-turn analyze request without calling an LLM."""
     root = Path(repo).resolve()
     sqlite_path = Path(profile).resolve()
     ns = knowledge.workspace_namespace(repo_root=str(root)) if knowledge else "default"
+    if repo_setup is None:
+        try:
+            from sysight.pipeline.warmup import load_or_run_repo_setup
+            repo_setup = load_or_run_repo_setup(str(root), knowledge)
+        except Exception:
+            repo_setup = RepoSetup()
 
     bundle = _build_analyze_bundle(
         sqlite_path=sqlite_path,
@@ -203,6 +228,7 @@ def build_analyze_first_turn(
         ns=ns,
         registry=registry,
         knowledge=knowledge,
+        repo_setup=repo_setup,
     )
     tools = registry.as_openai_tools(_make_analyze_policy()) if registry else []
     return {
@@ -228,6 +254,7 @@ def _build_analyze_bundle(
     ns: str,
     registry=None,
     knowledge=None,
+    repo_setup: RepoSetup | None = None,
 ) -> dict:
     """Build the prompt bundle (system + user + evidence_pack) shared by
     run_analyze and build_analyze_first_turn."""
@@ -244,6 +271,7 @@ def _build_analyze_bundle(
         sqlite_path=sqlite_path,
         repo_root=root,
         namespace=ns,
+        repo_setup=repo_setup or RepoSetup(),
     )
     return {
         "system_prompt": system_prompt,
@@ -835,22 +863,72 @@ def _build_analyze_user_prompt(
     sqlite_path: Path,
     repo_root: Path,
     namespace: str,
+    repo_setup: RepoSetup,
 ) -> str:
     workspace_path = next(
         (ref["path"] for ref in memory_refs if ref.get("label") == "warmup_overview" and ref.get("path")),
         "",
     )
 
-    parts = [global_brief]
+    parts = [global_brief, _repo_setup_block(repo_setup)]
     if workspace_path:
         parts.append(f"workspace_path: {workspace_path}")
 
     parts.extend([
         _memory_refs_block(memory_refs, namespace),
+        _measurement_plan_block(),
+        "Follow the SOP and output one JSON object containing both `measurement_plan` and `findings`.",
         "按 SOP 挖掘所有可优化点，只输出 JSON findings。",
     ])
 
     return "\n".join(part for part in parts if part)
+
+
+def _repo_setup_block(repo_setup: RepoSetup) -> str:
+    data = repo_setup.to_execution_config()
+    return (
+        "## Warmup Repo Setup\n"
+        f"- entry_point: `{data.get('entry_point', '')}`\n"
+        f"- minimal_run: `{data.get('minimal_run', [])}`\n"
+        f"- test_commands: `{data.get('test_commands', [])}`\n"
+        f"- metric_grep_hint: `{repo_setup.metric_grep}`\n"
+        f"- metric_lower_is_better_hint: `{repo_setup.metric_lower_is_better}`\n"
+        f"- constraints: `{data.get('constraints', [])}`"
+    )
+
+
+def _measurement_plan_block() -> str:
+    return """## Measurement Plan Required
+In addition to findings, output a `measurement_plan` object.
+Use the warmup command as the default run command. Read repo logging,
+progress bars, benchmark scripts, or metric code to decide which terminal
+metric best measures end-to-end performance.
+
+Prefer full iteration/step/throughput metrics over partial forward/backward
+timing unless the repo has no end-to-end metric. Use regex group 1 for the
+numeric value.
+
+Schema:
+{
+  "measurement_plan": {
+    "run_command": ["python", "train.py"],
+    "timeout_s": 600,
+    "repeats": 1,
+    "warmup_runs": 0,
+    "success_threshold_pct": 0.0,
+    "metrics": [{
+      "name": "iteration_ms",
+      "primary": true,
+      "regex": "iteration.*?(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*ms",
+      "group": 1,
+      "aggregation": "mean",
+      "drop_first_n": 0,
+      "lower_is_better": true,
+      "unit": "ms",
+      "rationale": "why this measures end-to-end effect"
+    }]
+  }
+}"""
 
 
 def _memory_refs_block(memory_refs: list[dict], namespace: str) -> str:
@@ -961,6 +1039,23 @@ def _parse_finding_set(data: dict, run_id: str) -> LocalizedFindingSet:
         summary=data.get("summary", ""),
         findings=findings,
     )
+
+
+def _parse_measurement_plan(data: dict, repo_setup: RepoSetup | None = None) -> MeasurementPlan:
+    plan = MeasurementPlan.from_dict(data.get("measurement_plan") or {})
+    repo_setup = repo_setup or RepoSetup()
+    if not plan.run_command:
+        if repo_setup.minimal_run:
+            plan.run_command = repo_setup.minimal_run[:]
+        elif repo_setup.entry_point:
+            try:
+                plan.run_command = shlex.split(repo_setup.entry_point)
+            except ValueError:
+                plan.run_command = repo_setup.entry_point.split()
+    if not plan.env_vars:
+        plan.env_vars = dict(repo_setup.env_vars)
+    plan.ensure_primary()
+    return plan
 
 
 def _validate_findings(

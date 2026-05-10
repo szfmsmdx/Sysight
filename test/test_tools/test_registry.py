@@ -98,6 +98,7 @@ class TestToolRegistry(unittest.TestCase):
         result = self.reg.execute("test.echo_ro", {}, policy)
         self.assertEqual(result.status, "policy_denied")
         self.assertIn("Max calls", result.error)
+        ECHO_TOOL_RO.max_calls_per_task = 50
 
     def test_reset_call_counts(self):
         ECHO_TOOL_RO.max_calls_per_task = 1
@@ -106,6 +107,15 @@ class TestToolRegistry(unittest.TestCase):
         self.reg.reset_call_counts()
         result = self.reg.execute("test.echo_ro", {}, policy)
         self.assertEqual(result.status, "ok")
+        ECHO_TOOL_RO.max_calls_per_task = 50
+
+    def test_execute_policy_max_calls_total(self):
+        policy = ToolPolicy(allowed_tools={"test.*"}, read_only=True, max_calls_per_task=2)
+        self.assertEqual(self.reg.execute("test.echo_ro", {}, policy).status, "ok")
+        self.assertEqual(self.reg.execute("test.noarg", {}, policy).status, "ok")
+        denied = self.reg.execute("test.echo_ro", {}, policy)
+        self.assertEqual(denied.status, "policy_denied")
+        self.assertIn("Policy max calls exceeded", denied.error)
 
     def test_list_read_only(self):
         tools = self.reg.list_read_only()

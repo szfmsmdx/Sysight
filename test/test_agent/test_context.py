@@ -1277,6 +1277,35 @@ class _RepeatingProvider:
         )
 
 
+class _RepairJsonProvider:
+    """First final response is prose; second final response is valid JSON."""
+
+    def __init__(self):
+        self.requests = []
+
+    @property
+    def name(self):
+        return "repair-json"
+
+    @property
+    def model(self):
+        return "fake"
+
+    def complete(self, request):
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return LLMResponse(
+                content="I inspected the repo and will now summarize.",
+                finish_reason="stop",
+                usage=UsageInfo(prompt_tokens=10, output_tokens=5),
+            )
+        return LLMResponse(
+            content=json.dumps({"summary": "fixed", "findings": []}),
+            finish_reason="stop",
+            usage=UsageInfo(prompt_tokens=20, output_tokens=3),
+        )
+
+
 class TestAgentContextIntegration(unittest.TestCase):
     """End-to-end tests with AgentLoop and fake providers."""
 
@@ -1371,6 +1400,19 @@ class TestAgentContextIntegration(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         for req in provider.requests:
             _assert_openai_tool_protocol(req.messages)
+
+    def test_json_repair_turn_success_is_ok(self):
+        """A recovered JSON formatting error should not fail the whole task."""
+        provider = _RepairJsonProvider()
+        loop = AgentLoop(provider, ToolRegistry(), ToolPolicy(allowed_tools=set(), read_only=True))
+        result = loop.run(AgentTask(
+            run_id="r1", task_id="t1", task_type="optimize",
+            user_prompt="return JSON", max_turns=2,
+        ))
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.output["summary"], "fixed")
+        self.assertTrue(any("schema_error" in e for e in result.errors))
+        self.assertEqual(len(provider.requests), 2)
 
 
 # ---------------------------------------------------------------------------
