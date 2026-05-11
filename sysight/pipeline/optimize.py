@@ -11,6 +11,7 @@ Does NOT modify source files.  That is the EXECUTE stage's job.
 
 from __future__ import annotations
 
+import atexit
 import json
 import shlex
 import sys
@@ -101,6 +102,9 @@ def run_optimize_trials(
         _write_loop_result_json(result, run_dir)
         return result
 
+    # Register at-exit cleanup so the worktree is removed even on crashes/signals.
+    atexit.register(_remove_trial_worktree, root, worktree)
+
     bootstrap_error = _run_repo_setup_bootstrap(worktree, repo_setup)
     if bootstrap_error:
         errors.append(bootstrap_error)
@@ -156,6 +160,7 @@ def run_optimize_trials(
     )
 
     rejected_streak = 0
+    last_measurement_paths: dict[str, str] = {}  # stdout_path/stderr_path of previous trial
     for idx in range(1, max_trials + 1):
         trial_id = f"trial-{idx:03d}"
         action, summary, patches = _run_trial_optimize_loop(
@@ -164,6 +169,7 @@ def run_optimize_trials(
             knowledge=knowledge,
             max_wall_seconds=max_agent_wall_seconds,
             memory_repo=memory_repo,
+            last_measurement_paths=last_measurement_paths,
         )
         if action == "stop" or not patches:
             trial = TrialResult(
@@ -200,7 +206,7 @@ def run_optimize_trials(
             rejected_streak += 1
             result.trials.append(trial)
             _append_trial_logs(run_dir, trial)
-            if rejected_streak >= 2:
+            if rejected_streak >= 3:
                 break
             continue
 
@@ -213,11 +219,17 @@ def run_optimize_trials(
             rejected_streak += 1
             result.trials.append(trial)
             _append_trial_logs(run_dir, trial)
-            if rejected_streak >= 2:
+            if rejected_streak >= 3:
                 break
             continue
 
         after = run_measurement(worktree, measurement_plan, run_dir / "measurements", trial_id)
+        # Record measurement output paths for the next trial's LLM context
+        last_measurement_paths = {
+            "trial_id": trial_id,
+            "stdout_path": after.stdout_path,
+            "stderr_path": after.stderr_path,
+        }
         accepted, delta_pct, reason = compare_measurements(best_measurement, after, measurement_plan)
         trial.metric_after = after.primary_value
         trial.delta_pct = delta_pct
@@ -253,12 +265,22 @@ def run_optimize_trials(
         result.trials.append(trial)
         _append_trial_logs(run_dir, trial)
         _write_loop_result_json(result, run_dir)
-        if rejected_streak >= 2:
+        if rejected_streak >= 3:
             break
 
     _write_loop_result_json(result, run_dir)
-    print(f"\n  Optimizer trial output -> {run_dir}", file=sys.stderr)
-    print(f"  Worktree             -> {worktree}", file=sys.stderr)
+
+    # Clean up the temporary worktree now that we are done; also remove the
+    # atexit handler so it won't fire a second time on normal exit.
+    try:
+        atexit.unregister(_remove_trial_worktree)
+        _remove_trial_worktree(root, worktree)
+        print(f"\n  Optimizer trial output -> {run_dir}", file=sys.stderr)
+        print(f"  Worktree cleaned up  -> {worktree}", file=sys.stderr)
+    except Exception as _cleanup_err:
+        print(f"\n  Optimizer trial output -> {run_dir}", file=sys.stderr)
+        print(f"  Worktree (cleanup failed, will retry at exit) -> {worktree}", file=sys.stderr)
+
     return result
 
 
@@ -450,6 +472,7 @@ def _run_trial_optimize_loop(
     knowledge=None,
     max_wall_seconds: int = 0,
     memory_repo: str = "",
+    last_measurement_paths: dict[str, str] | None = None,
 ) -> tuple[str, str, list[PatchCandidate]]:
     """Ask the LLM for one optimization experiment."""
     from sysight.agent.loop import AgentLoop, AgentTask
@@ -470,6 +493,7 @@ def _run_trial_optimize_loop(
         constraints=constraints,
         memory_brief=memory_brief,
         compact=False,
+        last_measurement_paths=last_measurement_paths,
     )
 
     policy = ToolPolicy(
@@ -499,6 +523,7 @@ def _run_trial_optimize_loop(
             constraints=constraints,
             memory_brief=memory_brief,
             compact=True,
+            last_measurement_paths=last_measurement_paths,
         )
         retry_task = AgentTask(
             run_id=f"optimize-{root.name}",
@@ -597,18 +622,83 @@ def _trials_for_prompt(previous_trials: list[TrialResult], *, compact: bool) -> 
 
 def _derive_environment_constraints(previous_trials: list[TrialResult]) -> list[str]:
     constraints: list[str] = []
+
+    def _add(msg: str) -> None:
+        if msg not in constraints:
+            constraints.append(msg)
+
     for trial in previous_trials:
         if trial.status != "rejected":
             continue
         joined = " ".join([trial.reason, *trial.measurement_errors]).lower()
-        if "triton_key" in joined:
-            msg = "torch.compile is currently broken in this environment (triton_key ImportError); avoid compile-based experiments."
-            if msg not in constraints:
-                constraints.append(msg)
-        if "timed out" in joined:
-            msg = "Prefer low-risk experiments that keep the measurement command within timeout."
-            if msg not in constraints:
-                constraints.append(msg)
+
+        # torch.compile / triton unavailable
+        if "triton_key" in joined or (
+            "torch.compile" in joined and "import" in joined
+        ):
+            _add(
+                "torch.compile is currently broken in this environment "
+                "(triton/triton_key ImportError); avoid compile-based experiments."
+            )
+
+        # Out-of-memory
+        if any(k in joined for k in ("out of memory", "cuda out of memory", "oom", "memoryerror")):
+            _add(
+                "The environment is memory-constrained; avoid experiments that increase "
+                "peak GPU/CPU memory (e.g. larger batch sizes, extra model copies, "
+                "storing full activation tensors)."
+            )
+
+        # MPS (Apple Metal) backend limitations
+        if any(k in joined for k in (
+            "mps", "metal performance shader", "not implemented for 'mps'",
+            "mps backend", "mps device"
+        )):
+            _add(
+                "This environment uses the MPS (Apple Metal) backend. "
+                "Some CUDA-specific ops (e.g. custom CUDA kernels, torch.compile with triton, "
+                "nccl collectives) are unavailable; avoid experiments that require CUDA-only features."
+            )
+
+        # Import / module not found errors
+        if any(k in joined for k in ("modulenotfounderror", "importerror", "no module named")):
+            # Extract the module name when possible for a more targeted hint
+            import re
+            m = re.search(r"no module named ['\"]?([a-zA-Z0-9_\.]+)", joined)
+            if m:
+                module = m.group(1).split(".")[0]
+                _add(
+                    f"Module '{module}' is not available in this environment; "
+                    f"avoid experiments that import or depend on '{module}'."
+                )
+            else:
+                _add(
+                    "An import failed in this environment; avoid adding new third-party "
+                    "dependencies that may not be installed."
+                )
+
+        # Measurement timeout
+        if "timed out" in joined or "timeout" in joined:
+            _add(
+                "Prefer low-risk experiments that keep the measurement command within timeout; "
+                "avoid changes that significantly increase per-step latency (e.g. heavy "
+                "synchronous I/O, large recompilations)."
+            )
+
+        # CUDA not available (running on CPU-only or MPS)
+        if any(k in joined for k in ("cuda is not available", "no cuda", "cuda not available")):
+            _add(
+                "CUDA is not available in this environment; avoid any experiment that "
+                "requires a CUDA device (e.g. .cuda() calls, CUDA streams, cuDNN ops)."
+            )
+
+        # Syntax / runtime errors from bad patches
+        if any(k in joined for k in ("syntaxerror", "indentationerror", "invalid syntax")):
+            _add(
+                "A previous patch introduced a Python syntax error; double-check indentation "
+                "and syntax before submitting patches."
+            )
+
     return constraints
 
 
@@ -657,6 +747,7 @@ def _build_trial_user_prompt(
     constraints: list[str],
     memory_brief: dict,
     compact: bool,
+    last_measurement_paths: dict[str, str] | None = None,
 ) -> str:
     parts = [
         "## Objective",
@@ -678,6 +769,15 @@ def _build_trial_user_prompt(
         "## Previous Trials",
         json.dumps(_trials_for_prompt(previous_trials, compact=compact), indent=2, ensure_ascii=False),
     ]
+    if last_measurement_paths and last_measurement_paths.get("stdout_path"):
+        parts.extend([
+            "",
+            "## Previous Trial Measurement Output",
+            f"The measurement output files from trial `{last_measurement_paths.get('trial_id', 'previous')}` are saved at:",
+            f"- stdout: `{last_measurement_paths['stdout_path']}`",
+            f"- stderr: `{last_measurement_paths.get('stderr_path', '')}`",
+            "Use `scanner_read` on these paths if you need to inspect the actual program output, error messages, or metric lines.",
+        ])
     if memory_brief:
         parts.extend([
             "",
@@ -697,6 +797,8 @@ def _build_trial_user_prompt(
         '{"action":"patch","summary":"why this experiment should improve the primary metric","patches":[...]}',
         'or {"action":"stop","summary":"why no useful next experiment remains","patches":[]}.',
         "Patch objects use the existing PatchCandidate schema. Do not compute old_span_hash.",
+        'Each patch must include "depends_on": [] (list of patch_ids this patch depends on, empty if none).',
+        "Use depends_on when patch-B edits code introduced by patch-A in the same trial.",
     ])
     return "\n".join(parts)
 
@@ -713,6 +815,9 @@ def _parse_patch_candidates(output: dict) -> list[PatchCandidate]:
         if isinstance(finding_ids, str):
             finding_ids = [finding_ids]
 
+        depends_on = item.get("depends_on", [])
+        if isinstance(depends_on, str):
+            depends_on = [depends_on] if depends_on else []
         patches.append(PatchCandidate(
             patch_id=item.get("patch_id", f"patch-{len(patches)+1}"),
             finding_ids=finding_ids,
@@ -723,6 +828,7 @@ def _parse_patch_candidates(output: dict) -> list[PatchCandidate]:
             replacement=item.get("replacement", ""),
             rationale=item.get("rationale", ""),
             validation_commands=item.get("validation_commands", []),
+            depends_on=depends_on,
         ))
     return patches
 
@@ -833,8 +939,64 @@ def _git_reset_to(repo: Path, commit: str) -> None:
     _run_git(repo, ["clean", "-fd"])
 
 
+def _remove_trial_worktree(root: Path, worktree: Path) -> None:
+    """Remove a git worktree and prune its associated branch (best-effort)."""
+    try:
+        _run_git(root, ["worktree", "remove", "--force", str(worktree)])
+    except Exception:
+        # Fallback: manual directory removal + prune
+        import shutil
+        try:
+            shutil.rmtree(worktree, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            _run_git(root, ["worktree", "prune"])
+        except Exception:
+            pass
+    # Delete the temporary branch (name is embedded in the worktree HEAD)
+    try:
+        branch_ref = (worktree / ".git" / "HEAD")
+        if branch_ref.exists():
+            ref_line = branch_ref.read_text().strip()
+            if ref_line.startswith("ref: refs/heads/"):
+                branch = ref_line[len("ref: refs/heads/"):]
+                if branch.startswith("sysight/opt-"):
+                    _run_git(root, ["branch", "-D", branch])
+    except Exception:
+        pass
+
+
+def _topological_sort_patches(patches: list[PatchCandidate]) -> list[PatchCandidate]:
+    """Sort patches respecting depends_on ordering.
+
+    Patches that are depended upon come first. Within the same dependency level,
+    patches are grouped by file and sorted by descending line number so that
+    applying later lines first doesn't shift earlier line references.
+    """
+    id_to_patch = {p.patch_id: p for p in patches}
+    order: list[PatchCandidate] = []
+    seen: set[str] = set()
+
+    def visit(p: PatchCandidate) -> None:
+        if p.patch_id in seen:
+            return
+        seen.add(p.patch_id)
+        for dep_id in p.depends_on:
+            dep = id_to_patch.get(dep_id)
+            if dep:
+                visit(dep)
+        order.append(p)
+
+    for patch in patches:
+        visit(patch)
+    return order
+
+
 def _apply_trial_patches(applier, patches: list[PatchCandidate], root: Path) -> str:
-    for patch in sorted(patches, key=lambda p: (p.file_path, -p.old_span_start)):
+    # First resolve dependency order, then sort same-file patches by descending line
+    ordered = _topological_sort_patches(patches)
+    for patch in sorted(ordered, key=lambda p: (p.file_path, -p.old_span_start)):
         _normalize_patch_indentation(root, patch)
         if not patch.old_span_hash:
             return f"missing old_span_hash for {patch.patch_id}"

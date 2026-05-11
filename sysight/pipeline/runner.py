@@ -81,7 +81,7 @@ class PipelineRunner:
             errors.append(f"instrument: {e}")
             # non-fatal — continue without instrumentation
 
-        # 1.2 LEARN (from analyze findings)
+        # 1.2 LEARN(1) — post-analyze: workspace structure facts only
         try:
             learn_provider = self._provider_fallback("learn", "optimize", "analyze")
             findings_json = _serialize_findings(analyze_result.finding_set)
@@ -90,6 +90,7 @@ class PipelineRunner:
                 learn_provider,
                 findings_json=findings_json,
                 repo=repo,
+                learn_stage="post_analyze",
             )
             stages.append("learn")
         except Exception as e:
@@ -119,7 +120,7 @@ class PipelineRunner:
             )
 
         # 3. EXECUTE is integrated into run_optimize_trials (trial loop).
-        # 3.1 LEARN (from analyze findings + optimize trial results)
+        # 3.1 LEARN(2) — post-optimize: worklog + experience update, overview corrections only
         try:
             learn_provider = self._provider_fallback("learn", "optimize", "analyze")
             findings_json = _serialize_findings(analyze_result.finding_set)
@@ -130,6 +131,7 @@ class PipelineRunner:
                 findings_json=findings_json,
                 patches_json=patches_json,
                 repo=repo,
+                learn_stage="post_optimize",
             )
             if "learn" not in stages:
                 stages.append("learn")
@@ -194,13 +196,14 @@ class PipelineRunner:
 
     def run_learn(self, run_id: str, provider=None,
                   findings_json: str = "", patches_json: str = "",
-                  repo: str = ""):
+                  repo: str = "", learn_stage: str = ""):
         from sysight.pipeline.learn import run_learn
         return run_learn(
             run_id, self._knowledge, provider,
             findings_json=findings_json,
             patches_json=patches_json,
             repo=repo,
+            learn_stage=learn_stage,
         )
 
     def _provider_fallback(self, *stages: str):

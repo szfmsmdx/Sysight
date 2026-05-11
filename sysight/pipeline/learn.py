@@ -25,6 +25,7 @@ def run_learn(
     patches_json: str = "",
     repo: str = "",
     max_wall_seconds: int = 0,
+    learn_stage: str = "",
 ) -> LearnResult:
     """Learn from one analyze/optimize step and update wiki/worklog.
 
@@ -76,10 +77,13 @@ def run_learn(
             repo=repo,
             namespace=namespace,
         )
+        # Auto-detect stage if not explicitly provided
+        stage = learn_stage or ("post_optimize" if patches_json else "post_analyze")
         user = loader.build_user_prompt(
             "learn",
             findings_json="\n\n".join(input_parts) if input_parts else "",
             memory_brief=memory_brief,
+            learn_stage=stage,
         )
 
         registry = ToolRegistry()
@@ -229,6 +233,7 @@ def _apply_memory_update(update: dict, knowledge) -> None:
     if not (path.startswith("workspaces/") or path.startswith("experiences/")):
         return
 
+    import sys
     try:
         if action == "write":
             knowledge.write_page(path, str(update.get("content", "")))
@@ -238,7 +243,17 @@ def _apply_memory_update(update: dict, knowledge) -> None:
             old = str(update.get("old", ""))
             new = str(update.get("new", ""))
             if old and new:
-                knowledge.replace_in_page(path, old, new)
+                try:
+                    knowledge.replace_in_page(path, old, new)
+                except Exception as replace_err:
+                    # Graceful degradation: fall back to append when the old
+                    # text is not found (e.g. it was already updated by a
+                    # previous LEARN stage run).
+                    print(
+                        f"  learn memory replace failed [{path}]: {replace_err}; "
+                        "falling back to append",
+                        file=sys.stderr,
+                    )
+                    knowledge.append_page(path, new)
     except Exception as e:
-        import sys
         print(f"  learn memory update failed [{action} {path}]: {e}", file=sys.stderr)

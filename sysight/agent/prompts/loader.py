@@ -54,6 +54,7 @@ class PromptLoader:
         pre_injected_sql: str = "",
         memory_brief: str = "",
         findings_json: str = "",
+        learn_stage: str = "",
     ) -> str:
         """Assemble the user message with context."""
 
@@ -78,7 +79,32 @@ class PromptLoader:
             parts.append("请按 SOP 逐步调查，最后输出 Instrumentation JSON。")
 
         elif task_type == "learn":
-            parts.append("请根据以下分析结果更新 wiki 知识。")
+            if learn_stage == "post_analyze":
+                parts.append(
+                    "## 当前阶段：LEARN(1) — analyze 后知识沉淀\n\n"
+                    "本次 LEARN 在 ANALYZE 之后运行，**没有 patch 试验结果**。\n\n"
+                    "**写入范围（本阶段严格限定）**：\n"
+                    "- `workspaces/<namespace>/overview.md`：只写入从 findings 中归纳出的"
+                    "长期稳定事实（repo 结构、入口链路、核心模块），**禁止写入性能数字或行号**。\n"
+                    "- `experiences/<slug>.md`：只写跨 workspace 可复用的通用经验。\n"
+                    "- **禁止**写入 worklog、具体优化结论，或预先描述尚未发生的优化。\n"
+                )
+            elif learn_stage == "post_optimize":
+                parts.append(
+                    "## 当前阶段：LEARN(2) — optimize 后知识沉淀\n\n"
+                    "本次 LEARN 在 OPTIMIZE 之后运行，输入包含 findings **和** patch 试验结果。\n\n"
+                    "**写入范围（本阶段严格限定）**：\n"
+                    "- `workspaces/<namespace>/overview.md`：**仅修正**因 patch 而失效的已有描述"
+                    "（用 `memory_replace`），不新增大段内容。\n"
+                    "- `workspaces/<namespace>/worklog.md`：补充 accepted/rejected 试验摘要，"
+                    "包括效果和拒绝原因，格式为追加行。\n"
+                    "- `experiences/<slug>.md`：把本次试验中发现的通用优化规律写成经验条目，"
+                    "禁止写入具体行号或数字。\n"
+                    "- **禁止**重复写入 LEARN(1) 已沉淀的内容，避免与上一阶段产生冲突或覆盖。\n"
+                )
+            else:
+                parts.append("请根据以下分析结果更新 wiki 知识。")
+
             if findings_json:
                 parts.append(f"## 分析结果\n\n{findings_json}")
             if memory_brief:

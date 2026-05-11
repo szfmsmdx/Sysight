@@ -20,6 +20,8 @@ class PatchCandidate:
     several related issues (e.g. same-file findings merged into one edit).
     old_span_hash is computed code-side after LLM returns — the LLM
     should NOT attempt to compute it.
+    depends_on lists patch_ids that must be applied before this patch
+    (e.g. when patch-B edits a function introduced by patch-A).
     """
     patch_id: str
     finding_ids: list[str] = field(default_factory=list)
@@ -30,6 +32,7 @@ class PatchCandidate:
     replacement: str = ""
     rationale: str = ""
     validation_commands: list[list[str]] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -70,12 +73,12 @@ class MeasurementPlan:
     """End-to-end measurement contract used by the optimizer trial loop."""
     run_command: list[str] = field(default_factory=list)
     timeout_s: int = 600
-    repeats: int = 1
+    repeats: int = 3
     warmup_runs: int = 0
     metrics: list[MetricSpec] = field(default_factory=list)
     env_vars: dict[str, str] = field(default_factory=dict)
     cwd: str = ""
-    success_threshold_pct: float = 0.0
+    success_threshold_pct: float = 1.0
     source: str = ""
     rationale: str = ""
 
@@ -90,12 +93,12 @@ class MeasurementPlan:
         plan = cls(
             run_command=[str(x) for x in data.get("run_command", [])],
             timeout_s=max(1, int(data.get("timeout_s", 600) or 600)),
-            repeats=max(1, int(data.get("repeats", 1) or 1)),
+            repeats=max(1, int(data.get("repeats", 3) or 3)),
             warmup_runs=max(0, int(data.get("warmup_runs", 0) or 0)),
             metrics=metrics,
             env_vars={str(k): str(v) for k, v in dict(data.get("env_vars", {}) or {}).items()},
             cwd=str(data.get("cwd", "") or ""),
-            success_threshold_pct=float(data.get("success_threshold_pct", 0.0) or 0.0),
+            success_threshold_pct=float(data.get("success_threshold_pct", 1.0) or 0.0),
             source=str(data.get("source", "")),
             rationale=str(data.get("rationale", "")),
         )

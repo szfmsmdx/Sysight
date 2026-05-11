@@ -32,11 +32,24 @@ def append(path: str, content: str) -> MemoryWriteResult:
 
 
 def replace(path: str, old: str, new: str, count: int = 1) -> MemoryWriteResult:
-    """Replace text inside a wiki page."""
+    """Replace text inside a wiki page.
+
+    If the old text is not found the operation gracefully falls back to
+    appending the new text so the information is never silently dropped.
+    """
+    import sys
     from sysight.wiki.store import WikiRepository
     repo = WikiRepository()
-    repo.replace_in_page(path, old, new, count=int(count))
-    return MemoryWriteResult(path=path, action="replace")
+    try:
+        repo.replace_in_page(path, old, new, count=int(count))
+        return MemoryWriteResult(path=path, action="replace")
+    except Exception as e:
+        print(
+            f"  memory_replace failed [{path}]: {e}; falling back to append",
+            file=sys.stderr,
+        )
+        repo.append_page(path, new)
+        return MemoryWriteResult(path=path, action="append")
 
 
 WRITE_TOOL = ToolDef(

@@ -75,7 +75,8 @@
       "old_span_end": 替换结束行（1-based，inclusive）,
       "replacement": "完整替换代码（不包含行号）",
       "rationale": "一句话说明修改原因",
-      "validation_commands": [["python", "-c", "compile(open('src/xxx.py').read(), 'xxx.py', 'exec')"]]
+      "validation_commands": [["python", "-c", "compile(open('src/xxx.py').read(), 'xxx.py', 'exec')"]],
+      "depends_on": []
     }
   ]
 }
@@ -88,5 +89,6 @@
 - `replacement` 是完整的、可直接替换的代码，缩进与原代码一致
 - `validation_commands` 用 `compile()` 做语法检查即可，不需要真正 import（避免依赖问题）
 - **不需要计算 old_span_hash**，系统会自动计算
+- `depends_on` 是数组，填写本 patch 必须在其之后应用的其他 `patch_id`（通常为跨文件调用关系，如 patch-B 调用了 patch-A 新增的函数，则 patch-B 的 `depends_on: ["patch-A-id"]`）；无依赖关系时填空数组 `[]`
 - 如果某个 finding 不值得修复，**不要为它生成 patch**（跳过即可）
 - 如果所有 finding 都不值得修复，输出 `{"patches": []}`

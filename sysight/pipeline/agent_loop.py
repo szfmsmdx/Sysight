@@ -170,9 +170,16 @@ def run_agent_loop(
             _record_iteration(run_dir, result, item)
             break
 
-        if item.accepted_count > 0 and item.worktree_path:
-            current_repo = Path(item.worktree_path).resolve()
-            result.final_repo = str(current_repo)
+        if item.accepted_count > 0 and item.best_commit:
+            # The optimizer worktree has already been cleaned up by the time we
+            # reach here.  Cherry-pick the best accepted commit into the main
+            # workspace so the next iteration sees the optimised code.
+            cherry_err = _cherry_pick_commit(root, item.best_commit)
+            if cherry_err:
+                item.errors.append(f"cherry-pick best_commit into workspace failed: {cherry_err}")
+            else:
+                result.final_repo = str(root)
+            current_repo = root
 
         learn_provider = _provider_fallback(provider_factory, "learn", "optimize", "analyze")
         learn_summary = _learn_iteration(
@@ -209,6 +216,87 @@ def run_agent_loop(
 
     _write_result(run_dir, result)
     return result
+
+
+def _cherry_pick_commit(root: Path, commit: str) -> str:
+    """Cherry-pick *commit* into *root*.  Returns an error string on failure.
+
+    Uses ``--no-commit`` so that we can inspect the staging area before
+    committing.  On failure we call ``git reset HEAD`` (not cherry-pick
+    --abort, which is only valid inside an interactive cherry-pick session)
+    to leave the working tree clean.
+    """
+    try:
+        # Fall back to a synthetic identity when the repo has no user config
+        # (common on fresh CI / server environments).
+        _env = _git_env_with_identity(root)
+
+        pick = subprocess.run(
+            ["git", "-C", str(root), "cherry-pick", "--no-commit", commit],
+            capture_output=True,
+            text=True,
+            env=_env,
+        )
+        if pick.returncode != 0:
+            # Restore the index/worktree to HEAD — works even when git is not
+            # in an interactive cherry-pick session.
+            subprocess.run(
+                ["git", "-C", str(root), "reset", "--hard", "HEAD"],
+                capture_output=True,
+                env=_env,
+            )
+            return (pick.stderr or pick.stdout).strip()
+
+        # Retrieve the original commit message for the new commit.
+        show = subprocess.run(
+            ["git", "-C", str(root), "log", "-1", "--format=%B", commit],
+            capture_output=True,
+            text=True,
+            env=_env,
+        )
+        msg = show.stdout.strip() or f"Apply optimized commit {commit[:12]}"
+        commit_result = subprocess.run(
+            ["git", "-C", str(root), "commit", "--allow-empty", "-m", msg],
+            capture_output=True,
+            text=True,
+            env=_env,
+        )
+        if commit_result.returncode != 0:
+            subprocess.run(
+                ["git", "-C", str(root), "reset", "--hard", "HEAD"],
+                capture_output=True,
+                env=_env,
+            )
+            return (commit_result.stderr or commit_result.stdout).strip()
+        return ""
+    except Exception as exc:
+        return str(exc)
+
+
+def _git_env_with_identity(root: Path) -> dict:
+    """Return os.environ extended with a fallback git user identity.
+
+    On fresh server/CI environments ``git commit`` fails if user.name and
+    user.email are not configured.  We inject safe defaults only when the
+    repo config (or global ~/.gitconfig) does not already provide them.
+    """
+    import os
+    env = os.environ.copy()
+    for key, cfg_key, default in [
+        ("GIT_AUTHOR_NAME",    "user.name",  "sysight"),
+        ("GIT_AUTHOR_EMAIL",   "user.email", "sysight@localhost"),
+        ("GIT_COMMITTER_NAME", "user.name",  "sysight"),
+        ("GIT_COMMITTER_EMAIL","user.email", "sysight@localhost"),
+    ]:
+        if key in env:
+            continue  # already set in the environment
+        probe = subprocess.run(
+            ["git", "-C", str(root), "config", cfg_key],
+            capture_output=True, text=True,
+        )
+        if not probe.stdout.strip():
+            env[key] = default
+    return env
 
 
 def _load_repo_setup(root: Path, knowledge, errors: list[str]) -> RepoSetup:
