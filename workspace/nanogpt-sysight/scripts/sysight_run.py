@@ -19,15 +19,35 @@ def _ensure_dataset(root: Path) -> None:
     subprocess.check_call([sys.executable, str(data_dir / "prepare.py")], cwd=str(root))
 
 
+def _detect_device() -> str:
+    """Return the best available device: cuda > mps > cpu."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     _ensure_dataset(root)
+
+    # Auto-detect device when caller args don't already specify one.
+    extra_args = list(sys.argv[1:])
+    if not any(a.startswith("--device") for a in extra_args):
+        device = _detect_device()
+        extra_args = [f"--device={device}"] + extra_args
+
     cmd = [
         sys.executable,
         "train.py",
         "config/sysight_baseline.py",
-        "--enable_nvtx=True",
-        *sys.argv[1:],
+        "--enable_nvtx=False",  # nvtx requires CUDA; harmless on other backends
+        *extra_args,
     ]
     proc = subprocess.run(cmd, cwd=str(root))
     return int(proc.returncode)
