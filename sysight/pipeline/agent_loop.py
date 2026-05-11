@@ -261,7 +261,9 @@ def _run_optimize_iteration(
     memory_repo: Path,
 ):
     from sysight.pipeline.optimize import run_optimize_trials
-    finding_set, measurement_plan = _optimizer_inputs_from_analyze(analyze_result, repo_setup)
+    finding_set, measurement_plan = _optimizer_inputs_from_analyze(
+        analyze_result, repo_setup, repo=str(repo)
+    )
     return run_optimize_trials(
         finding_set,
         measurement_plan,
@@ -278,11 +280,36 @@ def _run_optimize_iteration(
     )
 
 
-def _optimizer_inputs_from_analyze(analyze_result, repo_setup: RepoSetup):
+def _optimizer_inputs_from_analyze(analyze_result, repo_setup: RepoSetup, repo: str = ""):
+    import subprocess as _sp
+    from pathlib import Path as _Path
     finding_set = analyze_result.finding_set
     measurement_plan = analyze_result.measurement_plan or MeasurementPlan()
     if not measurement_plan.run_command:
         measurement_plan.run_command = repo_setup.minimal_run[:]
+    # Replace generic 'python'/'python3' with the venv interpreter from warmup cache
+    if (
+        measurement_plan.run_command
+        and measurement_plan.run_command[0] in ("python", "python3")
+        and repo_setup.minimal_run
+        and repo_setup.minimal_run[0] not in ("python", "python3")
+    ):
+        measurement_plan.run_command = [
+            repo_setup.minimal_run[0]
+        ] + measurement_plan.run_command[1:]
+    # Compute cwd relative to git root (for worktree compatibility)
+    if not measurement_plan.cwd and repo:
+        repo_abs = _Path(repo).resolve()
+        git_out = _sp.run(
+            ["git", "-C", str(repo_abs), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True,
+        )
+        if git_out.returncode == 0:
+            git_root = _Path(git_out.stdout.strip())
+            try:
+                measurement_plan.cwd = str(repo_abs.relative_to(git_root))
+            except ValueError:
+                pass  # repo is the git root itself — cwd stays empty
     if not measurement_plan.metrics:
         metric = _fallback_metric_from_repo_setup(repo_setup)
         if metric:

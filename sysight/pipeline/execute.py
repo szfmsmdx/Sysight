@@ -312,12 +312,24 @@ def _apply_and_verify(
 
 # ── Smoke test ──
 
-def _normalize_python(python_bin: str) -> str:
-    """Normalize 'python' → 'python3' on systems where 'python' doesn't exist (macOS)."""
-    if python_bin == "python":
-        import shutil
-        if shutil.which("python") is None and shutil.which("python3") is not None:
-            return "python3"
+def _normalize_python(python_bin: str, exec_config: dict | None = None) -> str:
+    """Normalize 'python' → best available python on this system.
+
+    Priority:
+    1. If exec_config provides minimal_run[0] that looks like a real interpreter, use it.
+    2. 'python' → 'python3' on macOS where bare 'python' doesn't exist.
+    3. Return as-is.
+    """
+    if python_bin in ("python", "python3"):
+        # Check if exec_config provides a configured interpreter (e.g. venv path)
+        if exec_config:
+            mr = exec_config.get("minimal_run") or []
+            if mr and mr[0] not in ("python", "python3"):
+                return str(mr[0])  # e.g. /path/to/.venv/bin/python3
+        if python_bin == "python":
+            import shutil
+            if shutil.which("python") is None and shutil.which("python3") is not None:
+                return "python3"
     return python_bin
 
 
@@ -332,11 +344,12 @@ def _run_smoke_test(
     import checks and test_commands from warmup.
     """
     # Try patch-provided validation commands first
+    has_validation_cmds = any(p.validation_commands for p in patches)
     for patch in patches:
         for cmd in patch.validation_commands:
             try:
-                # Normalize 'python' → 'python3' for macOS compatibility
-                normalized_cmd = [_normalize_python(cmd[0])] + cmd[1:] if cmd else cmd
+                # Normalize 'python' → configured interpreter (e.g. venv) for macOS compatibility
+                normalized_cmd = [_normalize_python(cmd[0], exec_config)] + cmd[1:] if cmd else cmd
                 r = subprocess.run(
                     normalized_cmd,
                     cwd=str(root),
@@ -350,27 +363,30 @@ def _run_smoke_test(
                 return False, "", str(e)
 
     # Fallback: import check for each modified file
-    seen_modules: set[str] = set()
-    for patch in patches:
-        fp = patch.file_path
-        if not fp.endswith(".py"):
-            continue
-        module = fp.replace("/", ".").replace("\\", ".").removesuffix(".py")
-        if module in seen_modules:
-            continue
-        seen_modules.add(module)
-        try:
-            r = subprocess.run(
-                [_normalize_python("python"), "-c", f"import {module}"],
-                cwd=str(root),
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if r.returncode != 0:
-                return False, r.stdout, r.stderr
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+    # Skip when LLM already provided explicit validation_commands — those are more
+    # precise (compile-check only) and avoid running module-level code at import.
+    if not has_validation_cmds:
+        seen_modules: set[str] = set()
+        for patch in patches:
+            fp = patch.file_path
+            if not fp.endswith(".py"):
+                continue
+            module = fp.replace("/", ".").replace("\\", ".").removesuffix(".py")
+            if module in seen_modules:
+                continue
+            seen_modules.add(module)
+            try:
+                r = subprocess.run(
+                    [_normalize_python("python", exec_config), "-c", f"import {module}"],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if r.returncode != 0:
+                    return False, r.stdout, r.stderr
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
 
     # Also run test_commands from warmup if available
     test_commands = exec_config.get("test_commands", [])
@@ -412,7 +428,7 @@ def _run_and_measure(
         return {}
 
     # Normalize 'python' → 'python3' in the command
-    run_cmd = [_normalize_python(run_cmd[0])] + run_cmd[1:]
+    run_cmd = [_normalize_python(run_cmd[0], exec_config)] + run_cmd[1:]
 
     env_vars = exec_config.get("env_vars", {})
     timeout = 300  # generous timeout for CPU-only runs (e.g. macOS CI)

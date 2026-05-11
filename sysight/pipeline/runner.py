@@ -33,7 +33,14 @@ class PipelineRunner:
         self._provider_factory = provider_factory
         self._knowledge = knowledge
 
-    def run_full(self, profile: str, repo: str) -> PipelineResult:
+    def run_full(
+        self,
+        profile: str,
+        repo: str,
+        *,
+        verbose: bool = False,
+        max_trials: int = 5,
+    ) -> PipelineResult:
         """Run all stages end-to-end."""
         errors: list[str] = []
         stages: list[str] = []
@@ -54,6 +61,7 @@ class PipelineRunner:
             analyze_result = self.run_analyze(
                 profile, repo, analyze_provider,
                 repo_setup=warmup_result.repo_setup if warmup_result else None,
+                verbose=verbose,
             )
             stages.append("analyze")
         except Exception as e:
@@ -63,7 +71,7 @@ class PipelineRunner:
         # 1.1 INSTRUMENT (targeted NVTX tagging based on findings)
         try:
             instrument_provider = self._provider_factory("instrument")
-            instrument_result = self.run_instrument(
+            self.run_instrument(
                 analyze_result.finding_set, repo,
                 instrument_provider,
                 run_dir=analyze_result.run_dir,
@@ -87,14 +95,19 @@ class PipelineRunner:
         except Exception as e:
             errors.append(f"learn(after analyze): {e}")
 
-        # 2. OPTIMIZE (plan only — no file changes)
+        # 2. OPTIMIZE — iterative patch trials with measurement loop
+        optimize_loop_result = None
         try:
             optimize_provider = self._provider_factory("optimize")
-            patches = []
+            repo_setup_obj = warmup_result.repo_setup if warmup_result else None
+            measurement_plan = analyze_result.measurement_plan
+            _normalize_measurement_plan(measurement_plan, repo, repo_setup_obj)
             optimize_loop_result = self.run_optimize(
                 analyze_result.finding_set, repo, optimize_provider,
-                measurement_plan=analyze_result.measurement_plan,
-                repo_setup=warmup_result.repo_setup if warmup_result else None,
+                measurement_plan=measurement_plan,
+                repo_setup=repo_setup_obj,
+                verbose=verbose,
+                max_trials=max_trials,
             )
             stages.append("optimize")
         except Exception as e:
@@ -105,26 +118,12 @@ class PipelineRunner:
                 errors=errors, stages_completed=stages,
             )
 
-        # 3. EXECUTE (apply patches, smoke test, timer comparison)
-        execute_result = None
-        if patches:
-            try:
-                execute_result = self.run_execute(
-                    patches, repo,
-                    run_id=analyze_result.run_id,
-                    analyze_run_dir=analyze_result.run_dir,
-                )
-                stages.append("execute")
-            except Exception as e:
-                errors.append(f"execute: {e}")
-
-        # 3.1 LEARN (from analyze findings + execute patches)
+        # 3. EXECUTE is integrated into run_optimize_trials (trial loop).
+        # 3.1 LEARN (from analyze findings + optimize trial results)
         try:
             learn_provider = self._provider_fallback("learn", "optimize", "analyze")
             findings_json = _serialize_findings(analyze_result.finding_set)
-            patches_json = _serialize_patches(
-                execute_result.patches if execute_result else []
-            )
+            patches_json = _serialize_optimize_result(optimize_loop_result)
             self.run_learn(
                 analyze_result.run_id,
                 learn_provider,
@@ -135,15 +134,14 @@ class PipelineRunner:
             if "learn" not in stages:
                 stages.append("learn")
         except Exception as e:
-            errors.append(f"learn(after execute): {e}")
+            errors.append(f"learn(after optimize): {e}")
 
         return PipelineResult(
             run_id=analyze_result.run_id,
             findings=[f.__dict__ for f in analyze_result.finding_set.findings],
             patches=(
                 [t.to_dict() for t in optimize_loop_result.trials]
-                if 'optimize_loop_result' in locals() else
-                [p.__dict__ for p in (execute_result.patches if execute_result else [])]
+                if optimize_loop_result else []
             ),
             errors=errors, stages_completed=stages,
         )
@@ -152,11 +150,12 @@ class PipelineRunner:
         from sysight.pipeline.warmup import run_warmup
         return run_warmup(repo, self._knowledge)
 
-    def run_analyze(self, profile: str, repo: str, provider, repo_setup=None):
+    def run_analyze(self, profile: str, repo: str, provider, repo_setup=None, verbose: bool = False):
         from sysight.pipeline.analyze import run_analyze
         return run_analyze(
             profile, repo, self._registry, provider, self._knowledge,
             repo_setup=repo_setup,
+            verbose=verbose,
         )
 
     def run_instrument(self, findings, repo: str, provider, run_dir=None):
@@ -169,7 +168,8 @@ class PipelineRunner:
         )
 
     def run_optimize(self, findings, repo: str, provider,
-                     measurement_plan=None, repo_setup=None):
+                     measurement_plan=None, repo_setup=None,
+                     verbose: bool = False, max_trials: int = 5):
         from sysight.pipeline.optimize import run_optimize_trials
         if measurement_plan is None:
             from sysight.types.optimization import MeasurementPlan
@@ -178,6 +178,8 @@ class PipelineRunner:
             findings, measurement_plan, repo, self._registry, provider,
             repo_setup=repo_setup,
             knowledge=self._knowledge,
+            verbose=verbose,
+            max_trials=max_trials,
         )
 
     def run_execute(self, patches, repo: str, *,
@@ -209,6 +211,43 @@ class PipelineRunner:
         return None
 
 
+def _normalize_measurement_plan(measurement_plan, repo: str, repo_setup) -> None:
+    """Apply the same cwd + python-interpreter fixes as _cmd_optimize.
+
+    Mutates measurement_plan in-place.
+    """
+    import subprocess as _sp
+    from pathlib import Path as _Path
+    if measurement_plan is None:
+        return
+    if not measurement_plan.run_command and repo_setup and repo_setup.minimal_run:
+        measurement_plan.run_command = repo_setup.minimal_run[:]
+    # Replace generic 'python'/'python3' with the venv interpreter from warmup cache
+    if (
+        measurement_plan.run_command
+        and measurement_plan.run_command[0] in ("python", "python3")
+        and repo_setup
+        and repo_setup.minimal_run
+        and repo_setup.minimal_run[0] not in ("python", "python3")
+    ):
+        measurement_plan.run_command = [
+            repo_setup.minimal_run[0]
+        ] + measurement_plan.run_command[1:]
+    # Compute cwd relative to git root (for worktree compatibility)
+    if not measurement_plan.cwd:
+        repo_abs = _Path(repo).resolve()
+        git_out = _sp.run(
+            ["git", "-C", str(repo_abs), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True,
+        )
+        if git_out.returncode == 0:
+            git_root = _Path(git_out.stdout.strip())
+            try:
+                measurement_plan.cwd = str(repo_abs.relative_to(git_root))
+            except ValueError:
+                pass  # repo is the git root itself — cwd stays empty
+
+
 def _serialize_findings(finding_set) -> str:
     return json.dumps({
         "summary": finding_set.summary,
@@ -228,3 +267,18 @@ def _serialize_patches(patches) -> str:
          "diff": getattr(p, "diff", "")}
         for p in patches
     ], indent=2, ensure_ascii=False)
+
+
+def _serialize_optimize_result(optimize_loop_result) -> str:
+    """Serialize OptimizeLoopResult to JSON for LEARN stage consumption."""
+    if optimize_loop_result is None:
+        return json.dumps([], ensure_ascii=False)
+    return json.dumps({
+        "run_id": optimize_loop_result.run_id,
+        "best_commit": optimize_loop_result.best_commit,
+        "accepted_count": optimize_loop_result.accepted_count,
+        "rejected_count": optimize_loop_result.rejected_count,
+        "baseline": optimize_loop_result.baseline.to_dict() if hasattr(optimize_loop_result.baseline, "to_dict") else {},
+        "best_measurement": optimize_loop_result.best_measurement.to_dict() if hasattr(optimize_loop_result.best_measurement, "to_dict") else {},
+        "trials": [t.to_dict() for t in optimize_loop_result.trials],
+    }, indent=2, ensure_ascii=False, default=str)

@@ -143,10 +143,27 @@ def _resolve_workdir(root: Path, cwd: str, errors: list[str]) -> Path | None:
 
 
 def _normalize_command(cmd: list[str]) -> list[str]:
+    """Normalize the first token of cmd to a usable python interpreter.
+
+    Priority:
+    1. If cmd[0] is an absolute path, use as-is.
+    2. 'python' / 'python3' → prefer the active venv's python if $VIRTUAL_ENV is set.
+    3. 'python' → 'python3' on systems where bare 'python' doesn't exist (macOS).
+    """
     if not cmd:
         return []
-    if cmd[0] == "python" and shutil.which("python") is None and shutil.which("python3"):
-        return ["python3"] + cmd[1:]
+    first = cmd[0]
+    if first in ("python", "python3"):
+        # Prefer the active virtual environment interpreter
+        import os
+        venv = os.environ.get("VIRTUAL_ENV", "")
+        if venv:
+            venv_python = Path(venv) / "bin" / "python3"
+            if venv_python.exists():
+                return [str(venv_python)] + cmd[1:]
+        # Fallback: python → python3 when bare python doesn't exist
+        if first == "python" and shutil.which("python") is None and shutil.which("python3"):
+            return ["python3"] + cmd[1:]
     return cmd
 
 

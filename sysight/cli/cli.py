@@ -55,7 +55,6 @@ def main(argv: list[str] | None = None):
     p.add_argument("--repo", required=True, help="Path to repo root")
     p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal (always logged to optimize_debug.log)")
     p.add_argument("--max-trials", type=int, default=5, help="Maximum optimizer trial iterations")
-    p.add_argument("--legacy-patches", action="store_true", help="Use legacy patch batch + execute flow")
 
     # bench-optimize
     p = sub.add_parser("bench-optimize", help="Run optimizer benchmark against optimizer-bench cases")
@@ -91,6 +90,8 @@ def main(argv: list[str] | None = None):
     p = sub.add_parser("full", help="Run the full pipeline")
     p.add_argument("profile", help="Path to .sqlite profile")
     p.add_argument("--repo", required=True, help="Path to repo root")
+    p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal")
+    p.add_argument("--max-trials", type=int, default=5, help="Maximum optimizer trial iterations")
 
     # tool (for external agent use)
     p = sub.add_parser("tool", help="Execute a single tool directly")
@@ -339,58 +340,62 @@ def _cmd_optimize(args):
         sys.exit(1)
 
     findings = _load_findings(args.run_id)
-    raw_path = _resolve_analyze_raw(args.run_id)
-    analyze_run_dir = raw_path.parent  # .sysight/analysis-runs/<run_id>/
     from sysight.pipeline.warmup import load_or_run_repo_setup
     repo_setup = load_or_run_repo_setup(args.repo, knowledge)
 
-    if not getattr(args, "legacy_patches", False):
-        measurement_plan = _load_measurement_plan(args.run_id)
-        if not measurement_plan.run_command:
-            measurement_plan.run_command = repo_setup.minimal_run
-        if not measurement_plan.is_valid():
-            print("Error: analyze_raw.json has no valid measurement_plan", file=sys.stderr)
-            sys.exit(1)
-        from sysight.pipeline.optimize import run_optimize_trials
-        result = run_optimize_trials(
-            findings,
-            measurement_plan,
-            args.repo,
-            registry,
-            provider,
-            repo_setup=repo_setup,
-            knowledge=knowledge,
-            verbose=getattr(args, 'debug', False),
-            max_trials=getattr(args, "max_trials", 5),
+    measurement_plan = _load_measurement_plan(args.run_id)
+    if not measurement_plan.run_command:
+        measurement_plan.run_command = repo_setup.minimal_run
+    # Override run_command python with the configured interpreter from warmup cache
+    # (repo_setup.minimal_run[0] may be an absolute venv path, e.g. /path/.venv/bin/python3)
+    if (
+        measurement_plan.run_command
+        and measurement_plan.run_command[0] in ("python", "python3")
+        and repo_setup.minimal_run
+        and repo_setup.minimal_run[0] not in ("python", "python3")
+    ):
+        measurement_plan.run_command = (
+            [repo_setup.minimal_run[0]] + measurement_plan.run_command[1:]
         )
-        print(json.dumps({
-            "run_id": result.run_id,
-            "worktree_path": result.worktree_path,
-            "best_commit": result.best_commit,
-            "accepted_count": result.accepted_count,
-            "rejected_count": result.rejected_count,
-            "errors": result.errors,
-        }, indent=2, ensure_ascii=False, default=str))
-        return
-
-    from sysight.pipeline.optimize import run_optimize
-    patches = run_optimize(
-        findings, args.repo, registry, provider,
+    # When measurement_plan.cwd is empty, set it to the repo path relative to
+    # the git root so that run_optimize_trials (which clones the whole git repo
+    # into a worktree) can correctly resolve the cwd inside the worktree.
+    if not measurement_plan.cwd:
+        import subprocess as _sp
+        _repo_abs = Path(args.repo).resolve()
+        _git_root_out = _sp.run(
+            ["git", "-C", str(_repo_abs), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True,
+        )
+        if _git_root_out.returncode == 0:
+            _git_root = Path(_git_root_out.stdout.strip())
+            try:
+                measurement_plan.cwd = str(_repo_abs.relative_to(_git_root))
+            except ValueError:
+                pass  # repo is the git root itself — cwd can stay empty
+    if not measurement_plan.is_valid():
+        print("Error: analyze_raw.json has no valid measurement_plan", file=sys.stderr)
+        sys.exit(1)
+    from sysight.pipeline.optimize import run_optimize_trials
+    result = run_optimize_trials(
+        findings,
+        measurement_plan,
+        args.repo,
+        registry,
+        provider,
+        repo_setup=repo_setup,
+        knowledge=knowledge,
         verbose=getattr(args, 'debug', False),
+        max_trials=getattr(args, "max_trials", 5),
     )
-
-    if not patches:
-        print("No patches generated.", file=sys.stderr)
-        return
-
-    from sysight.pipeline.execute import run_execute
-    result = run_execute(
-        patches, args.repo,
-        run_id=findings.run_id,
-        analyze_run_dir=analyze_run_dir,
-    )
-    # run_id already printed by run_execute; print result for scripting
-    print(result.run_id)
+    print(json.dumps({
+        "run_id": result.run_id,
+        "worktree_path": result.worktree_path,
+        "best_commit": result.best_commit,
+        "accepted_count": result.accepted_count,
+        "rejected_count": result.rejected_count,
+        "errors": result.errors,
+    }, indent=2, ensure_ascii=False, default=str))
 
 
 def _cmd_bench_optimize(args):
@@ -422,7 +427,17 @@ def _cmd_learn(args):
     _, provider_factory, knowledge = _setup()
     provider = _provider_fallback(provider_factory, "learn", "optimize", "analyze")
     from sysight.pipeline.learn import run_learn
-    result = run_learn(args.run_id, knowledge, provider, repo=getattr(args, "repo", ""))
+
+    # Auto-load findings_json and patches_json from persisted run artifacts
+    findings_json = ""
+    patches_json = ""
+    try:
+        raw_path = _resolve_analyze_raw(args.run_id)
+        findings_json = raw_path.read_text(encoding="utf-8")
+    except SystemExit:
+        pass  # run_id may not have an analyze_raw.json (e.g. optimize-only run)
+
+    result = run_learn(args.run_id, knowledge, provider, findings_json=findings_json, patches_json=patches_json, repo=getattr(args, "repo", ""))
     print(json.dumps({
         "run_id": result.run_id,
         "summary": result.summary,
@@ -471,7 +486,12 @@ def _cmd_full(args):
 
     from sysight.pipeline.runner import PipelineRunner
     runner = PipelineRunner(registry, provider_factory, knowledge)
-    result = runner.run_full(args.profile, args.repo)
+    result = runner.run_full(
+        args.profile,
+        args.repo,
+        verbose=getattr(args, "debug", False),
+        max_trials=getattr(args, "max_trials", 5),
+    )
 
     print(json.dumps({
         "run_id": result.run_id,
