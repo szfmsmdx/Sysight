@@ -56,13 +56,6 @@ def main(argv: list[str] | None = None):
     p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal (always logged to optimize_debug.log)")
     p.add_argument("--max-trials", type=int, default=5, help="Maximum optimizer trial iterations")
 
-    # bench-optimize
-    p = sub.add_parser("bench-optimize", help="Run optimizer benchmark against optimizer-bench cases")
-    p.add_argument("cases", nargs="*", default=["case_1"], help="Case IDs to run (default: case_1)")
-    p.add_argument("--all", action="store_true", help="Run all cases")
-    p.add_argument("--debug", action="store_true", help="Print LLM I/O to terminal (always logged to optimize_debug.log)")
-    p.add_argument("--bench-dir", default="optimizer-bench", help="Path to optimizer-bench directory")
-
     # learn
     p = sub.add_parser("learn", help="Post-session learning")
     p.add_argument("run_id", help="Run ID to process")
@@ -111,7 +104,6 @@ def main(argv: list[str] | None = None):
         "analyze": _cmd_analyze,
         "instrument": _cmd_instrument,
         "optimize": _cmd_optimize,
-        "bench-optimize": _cmd_bench_optimize,
         "learn": _cmd_learn,
         "agent-loop": _cmd_agent_loop,
         "full": _cmd_full,
@@ -396,31 +388,6 @@ def _cmd_optimize(args):
         "rejected_count": result.rejected_count,
         "errors": result.errors,
     }, indent=2, ensure_ascii=False, default=str))
-
-
-def _cmd_bench_optimize(args):
-    """Run optimizer benchmark."""
-    from sysight.benchmark.optimizer_runner import OptimizerBenchmarkRunner
-
-    case_ids = args.cases
-    if args.all:
-        bench_dir = Path(args.bench_dir)
-        cases_dir = bench_dir / "cases"
-        if cases_dir.is_dir():
-            case_ids = sorted(
-                d.name for d in cases_dir.iterdir()
-                if d.is_dir() and d.name.startswith("case_")
-            )
-        if not case_ids:
-            print("Error: no cases found", file=sys.stderr)
-            sys.exit(1)
-
-    runner = OptimizerBenchmarkRunner(
-        bench_dir=args.bench_dir,
-        debug=getattr(args, 'debug', False),
-    )
-    result = runner.run(case_ids)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def _cmd_learn(args):

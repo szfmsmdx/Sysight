@@ -1,1 +1,1 @@
-"""Benchmark runner — test WARMUP + ANALYZE stages against nsys-bench cases."""
+"""Benchmark utilities — DebugProvider for LLM I/O logging."""

@@ -2,7 +2,6 @@ import unittest
 
 from sysight.agent.provider import LLMErrorInfo, LLMRequest, LLMResponse
 from sysight.benchmark.debug import DebugProvider
-from sysight.benchmark.runner import BenchmarkRunner, CaseResult
 
 
 class FakeProvider:
@@ -62,38 +61,6 @@ class TestBenchmarkDebug(unittest.TestCase):
         self.assertIn("reason-3", log[0]["response"]["extra"]["reasoning_content"])
         self.assertNotIn("more lines", str(log[0]))
         self.assertNotIn("more chars", str(log[0]))
-
-    def test_formatted_debug_log_does_not_collapse_lines(self):
-        runner = BenchmarkRunner(debug=True)
-        result = CaseResult(case_id="case_x", status="ok", score=0, total=1)
-        result.debug_log = [{
-            "turn": 1,
-            "request": {
-                "tools": ["scanner_read"],
-                "system_prompt": "\n".join(f"system-{i}" for i in range(20)),
-                "messages": [
-                    {"role": "user", "content": "\n".join(f"user-{i}" for i in range(20))},
-                    {"role": "tool", "content": "\n".join(f"tool-{i}" for i in range(20))},
-                ],
-            },
-            "response": {
-                "finish_reason": "stop",
-                "usage": {"prompt_tokens": 1, "output_tokens": 2},
-                "content": "\n".join(f"response-{i}" for i in range(20)),
-                "tool_calls": [],
-                "extra": {"reasoning_content": "\n".join(f"reason-{i}" for i in range(20))},
-            },
-        }]
-
-        text = runner._format_debug_log(result)
-
-        self.assertIn("system-19", text)
-        self.assertIn("user-19", text)
-        self.assertIn("tool-19", text)
-        self.assertIn("response-19", text)
-        self.assertIn("reason-19", text)
-        self.assertNotIn("more lines", text)
-        self.assertNotIn("more chars", text)
 
     def test_debug_provider_records_structured_error(self):
         log = []
