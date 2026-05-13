@@ -143,30 +143,6 @@ docs/               设计文档
 
 ---
 
-## 基准测试结果
-
-### 分析能力（SOTA）
-
-| Case | 场景 | 得分 | 满分 | 准确率 |
-|---|---|:---:|:---:|:---:|
-| case_1 | 单卡训练（DataLoader + 同步 + 计算浪费） | 15 | 16 | 94% |
-| case_2 | 多卡 DDP（通信 + 同步 + 配置） | 17 | 17 | 100% |
-| case_3 | 推理服务（KV cache + batching） | 12 | 17 | 71% |
-| case_4 | 混合精度训练（AMP + checkpoint） | 9 | 16 | 56% |
-| case_5 | Pipeline 并行（micro-batch + 调度） | 17 | 17 | 100% |
-| case_6 | 多模态训练（vision + text + fusion） | 15 | 17 | 88% |
-
-### 优化能力评分维度
-
-| 维度 | 权重 | 含义 |
-|---|:---:|---|
-| Correctness | 40 | patch apply 成功 + smoke test 通过 |
-| Performance | 30 | timer delta < −5% 满分，< 0 半分 |
-| Judgment | 20 | 正确接受真 finding、拒绝假 finding（F1） |
-| Minimality | 10 | patch 行数在合理范围内 |
-
----
-
 ## 依赖层级
 
 ```
