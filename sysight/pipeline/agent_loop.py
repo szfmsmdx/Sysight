@@ -282,20 +282,23 @@ def _git_env_with_identity(root: Path) -> dict:
     """
     import os
     env = os.environ.copy()
-    for key, cfg_key, default in [
-        ("GIT_AUTHOR_NAME",    "user.name",  "sysight"),
-        ("GIT_AUTHOR_EMAIL",   "user.email", "sysight@localhost"),
-        ("GIT_COMMITTER_NAME", "user.name",  "sysight"),
-        ("GIT_COMMITTER_EMAIL","user.email", "sysight@localhost"),
+    # Query user.name and user.email once each, then apply to both AUTHOR and COMMITTER.
+    for cfg_key, default, author_key, committer_key in [
+        ("user.name",  "sysight",           "GIT_AUTHOR_NAME",  "GIT_COMMITTER_NAME"),
+        ("user.email", "sysight@localhost",  "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"),
     ]:
-        if key in env:
-            continue  # already set in the environment
+        needs_fallback = author_key not in env or committer_key not in env
+        if not needs_fallback:
+            continue
         probe = subprocess.run(
             ["git", "-C", str(root), "config", cfg_key],
             capture_output=True, text=True,
         )
-        if not probe.stdout.strip():
-            env[key] = default
+        value = probe.stdout.strip() or default
+        if author_key not in env:
+            env[author_key] = value
+        if committer_key not in env:
+            env[committer_key] = value
     return env
 
 

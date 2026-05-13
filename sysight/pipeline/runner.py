@@ -263,15 +263,6 @@ def _serialize_findings(finding_set) -> str:
     }, indent=2, ensure_ascii=False)
 
 
-def _serialize_patches(patches) -> str:
-    return json.dumps([
-        {"patch_id": p.patch_id, "finding_ids": p.finding_ids,
-         "status": p.status, "reason": getattr(p, "reason", ""),
-         "diff": getattr(p, "diff", "")}
-        for p in patches
-    ], indent=2, ensure_ascii=False)
-
-
 def _serialize_optimize_result(optimize_loop_result) -> str:
     """Serialize OptimizeLoopResult to JSON for LEARN stage consumption."""
     if optimize_loop_result is None:
