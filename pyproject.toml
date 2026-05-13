@@ -22,4 +22,5 @@ testpaths = [
     "test/test_wiki",
     "test/test_pipeline",
     "test/test_agent",
+    "test/test_benchmark",
 ]

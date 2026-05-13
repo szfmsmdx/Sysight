@@ -38,7 +38,10 @@ repositories-wiki/
 
 # 运行时
 .sysight/
-profile/
+profile/*
+!profile/.gitkeep
+workspace/*
+!workspace/.gitkeep
 
 # nsys profile 原始文件（体积大）
 *.nsys-rep

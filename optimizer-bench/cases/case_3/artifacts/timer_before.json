@@ -1,8 +1,0 @@
-{
-  "F01_kv_cache_buffer": 15.67,
-  "F02_flash_attention": 12.34,
-  "F03_torch_compile": 28.91,
-  "F04_cuda_graph": 8.23,
-  "F05_sampling_sync": 3.45,
-  "F06_fp16_weights": 28.91
-}

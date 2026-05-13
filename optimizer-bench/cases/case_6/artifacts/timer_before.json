@@ -1,7 +1,0 @@
-{
-  "F01_cross_attn_cache": 8.45,
-  "F02_parallel_encoders": 22.34,
-  "F03_inference_mode": 5.67,
-  "F04_redundant_eval": 6.78,
-  "F05_gpu_metrics": 0.12
-}

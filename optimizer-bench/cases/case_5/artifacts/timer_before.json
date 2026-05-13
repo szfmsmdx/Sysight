@@ -1,7 +1,0 @@
-{
-  "F01_amp_autocast": 34.56,
-  "F02_loss_division": 34.56,
-  "F03_step_timing": 34.56,
-  "F04_zero_grad_timing": 34.56,
-  "F05_channels_last": 2.34
-}

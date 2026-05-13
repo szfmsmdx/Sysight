@@ -1,208 +1,233 @@
 # Sysight
 
-AI 驱动的 GPU 性能分析与优化工具。输入 Nsight Systems profile + 目标仓库源码，自动定位性能瓶颈、生成优化 patch、积累可复用的性能经验。
+给一份 nsys profile 和一个代码仓库，自动完成"找问题 → 定位源码 → 生成 patch → 沙箱验证 → 积累经验"的完整闭环，无需人工介入。
 
-## 背景
+在 nanoGPT Shakespeare 字符级训练任务上实测：定位到三处 CPU 端瓶颈，生成 4 个 patch，两轮迭代将单步迭代时间从 **14.12ms 压缩到 12.96ms（提升 8.2%）**。完整记录见 [docs/summary.md](docs/summary.md)。
 
-GPU 性能优化有两个难点：profile 数据量巨大（一个 8-GPU training step 可能产生数十 GB 的 trace），而且从"某个 kernel 耗时长"到"改哪行代码"之间隔着很长的推理链。
-
-Sysight 用一个确定性的分析管道预处理 profile 数据，然后把结构化的 evidence 交给 LLM 做源码级定位。分析结果不是一次性的——通过的 wiki 系统积累下来，下次分析同一个 repo 时自动注入上下文，越用越强。
+---
 
 ## 工作流
 
 ```
-WARMUP（每个 repo 一次）
-  scanner_files → 找入口点 → 试跑 → RepoSetup → wiki
-
-ANALYZE（每个 profile 一次）
-  nsys_sql + classify → C1-C7 分类 → AgentLoop(LLM + scanner)
-  → LocalizedFindingSet → 验证 → wiki + ledger
-
-OPTIMIZE（每个 session N 次）
-  逐 finding: LLM → PatchCandidate → sandbox(apply+validate+measure)
-  → keep/revert → ledger
-
-LEARN（每个 session 后）
-  ledger 记账 → benchmark 评分 → worklog → 经验提取
+nsys profile (.sqlite)  +  代码仓库
+            │
+            ▼
+   ┌─────────────────┐
+   │    WARMUP       │  扫描仓库：入口命令、热路径、配置
+   └────────┬────────┘
+            │ RepoSetup
+            ▼
+   ┌─────────────────┐
+   │    ANALYZE      │  LLM + nsys_sql 工具 → LocalizedFindingSet
+   └────────┬────────┘    （文件 : 函数 : 行号 + 证据链）
+            │
+            ▼
+   ┌─────────────────┐
+   │    OPTIMIZE     │  LLM 读源码、判断真伪、生成 patch 计划
+   └────────┬────────┘
+            │ PatchCandidate[]
+            ▼
+   ┌─────────────────┐
+   │    EXECUTE      │  git worktree 沙箱 → apply → smoke test → 测量
+   └────────┬────────┘    delta > 0 则 accept，否则 revert
+            │
+            ▼
+   ┌─────────────────┐
+   │     LEARN       │  LLM 将 finding + patch 结果写入 wiki
+   └─────────────────┘    （下一轮自动参考）
 ```
 
-四个阶段可以独立运行，也通过 `pipeline/runner.py` 串联。
+Pipeline 硬编码：LLM 只在推理环节参与（analyze、plan、learn），文件扫描、patch apply、性能测量全由代码执行。
+
+---
+
+## 能力
+
+| 能力 | 说明 |
+|---|---|
+| **Profile 分析** | 自动查询 nsys SQLite，C1–C7 七类瓶颈分类，输出带文件行号的 finding |
+| **源码定位** | 每个 finding 精确到 `文件:函数:行号`，附 profile 证据链 |
+| **Patch 生成** | LLM 判断真伪，对确认问题生成最小化 patch |
+| **沙箱验证** | 独立 git worktree apply → smoke test → 计时对比 → 接受或回滚 |
+| **知识积累** | 每轮结果写入 wiki，下一轮自动注入，不重复踩坑 |
+| **基准测试** | 6 个分析 case + 6 个优化 case，量化能力评估 |
+
+---
+
+## 七类性能问题（C1–C7）
+
+| 类别 | 名称 | 典型场景 |
+|---|---|---|
+| **C1** | Host Scheduling | `DataLoader num_workers=0`、`pin_memory=False` |
+| **C2** | Kernel Launch Overhead | Python 循环触发大量小 CUDA kernel |
+| **C3** | Synchronization | `.item()`、`.cpu()`、`cudaDeviceSynchronize()` 阻塞 |
+| **C4** | Memory Copy | 热路径中的 `.to(device)`、多余的 H2D/D2H |
+| **C5** | Compute Inefficiency | 重复计算、可消除的 `clone`/`cat`/`contiguous` |
+| **C6** | Communication | all_reduce/all_gather 配置不当，DDP/FSDP overlap 不足 |
+| **C7** | Python Pipeline | DataLoader 内逐 sample 循环、热路径 JSON 序列化 |
+
+---
+
+## 安装
+
+```bash
+git clone <repo-url> && cd Sysight
+pip install -e .
+```
+
+需要 Python ≥ 3.10。
+
+---
+
+## 配置
+
+创建 `.sysight/config.yaml`：
+
+```yaml
+analyze:
+  provider: openai_compatible
+  model: "deepseek-v3"
+  api_key: "$DEEPSEEK_API_KEY"        # 支持 $ENV_VAR 引用
+  base_url: "https://api.deepseek.com/v1"
+  temperature: 0
+
+optimize:
+  provider: anthropic
+  model: "claude-sonnet-4-5"
+  api_key: "$ANTHROPIC_API_KEY"
+```
+
+支持的 provider：`openai_compatible`（OpenAI、DeepSeek、Groq、vLLM 等）、`anthropic`。
+
+---
+
+## 快速上手
+
+```bash
+# 完整 pipeline（多轮迭代）
+sysight agent-loop --repo ./my-training-repo --profile profiles/trace.sqlite
+
+# 分步运行
+sysight warmup ./my-training-repo
+sysight analyze profiles/trace.sqlite --repo ./my-training-repo
+sysight optimize <run_id> --repo ./my-training-repo
+
+# 单工具调用
+sysight tool scanner_files ./my-training-repo
+sysight tool nsys_sql_kernels profiles/trace.sqlite --limit 20
+```
+
+---
 
 ## 项目结构
 
 ```
 sysight/
-  types/          共享数据类（零依赖，所有模块共用）
-  tools/          工具注册中心 + 26 个工具实现
-    registry.py   ToolRegistry / ToolDef / ToolPolicy
-    scanner/      源码静态分析（files, search, read, symbols, callers, variants）
-    nsys_sql/     Nsight Systems SQLite 查询（kernels, sync, memcpy, nccl, overlap, gaps, launch）
-    sandbox/      Git worktree 隔离执行（create, exec, apply, validate, measure, commit, revert）
-    memory/       知识库搜索（search, read——子 agent 只读）
-    classify.py   C1-C7 瓶颈分类
-  wiki/           知识库（workspace wiki + 经验 wiki + FTS + ledger + promotion + skills）
-  agent/          LLM 抽象层
-    provider.py   LLMProvider 协议 + LLMConfig
-    loop.py       AgentLoop（tool-calling 循环 + stop conditions）
-    prompts/      PromptLoader + 7 个 prompt fragment
-    providers/    OpenAI-compatible / Anthropic / Replay 三种后端
-    config_loader.py  YAML config 加载
-  pipeline/       四阶段编排（warmup, analyze, optimize, learn）+ PipelineRunner
-  cli/            统一 CLI 入口 + MCP server 适配器
-  utils/          内部工具（security, repo, render, text）
+├── types/          共享 dataclass（零依赖，所有模块共用）
+├── tools/          工具注册中心 + 所有 LLM 可调用工具
+│   ├── scanner/    源码工具：files、search、read、symbols、callers
+│   ├── nsys_sql/   nsys SQLite 工具：kernels、sync、memcpy、nccl、overlap、gaps
+│   ├── sandbox/    git worktree 隔离：create、apply、validate、measure、commit
+│   └── memory/     wiki 只读工具（子 agent 只读）
+├── wiki/           知识管理：store、FTS 索引、ledger、promotion
+├── agent/          LLM 抽象层：providers、AgentLoop、上下文压缩
+├── pipeline/       阶段编排：warmup、analyze、optimize、execute、learn
+├── benchmark/      Analyze Benchmark + Optimize Benchmark runner
+├── cli/            统一 CLI 入口 + MCP server 适配器
+└── utils/          安全、repo 工具、渲染、文本
+
+test/               单元测试 + 集成测试
+workspace/          目标仓库挂载目录
+docs/               设计文档
 ```
 
-## 各模块职责
+---
 
-### `types/`
+## 基准测试结果
 
-所有模块共享的 dataclass 定义。不 import 任何 `sysight.*` 模块。
+### 分析能力（SOTA）
 
-- `evidence.py` — GpuDeviceInfo, BottleneckReport, EvidenceWindow, ProfileEvidence
-- `findings.py` — LocalizedFinding, LocalizedFindingSet, MemoryUpdate + `make_finding_id()`
-- `optimization.py` — PatchCandidate, PatchResult, ExecutionConfig + `compute_span_hash()`
-- `repo_setup.py` — RepoSetup
-- `memory.py` — MemoryPage, MemoryBrief
+| Case | 场景 | 得分 | 满分 | 准确率 |
+|---|---|:---:|:---:|:---:|
+| case_1 | 单卡训练（DataLoader + 同步 + 计算浪费） | 15 | 16 | 94% |
+| case_2 | 多卡 DDP（通信 + 同步 + 配置） | 17 | 17 | 100% |
+| case_3 | 推理服务（KV cache + batching） | 12 | 17 | 71% |
+| case_4 | 混合精度训练（AMP + checkpoint） | 9 | 16 | 56% |
+| case_5 | Pipeline 并行（micro-batch + 调度） | 17 | 17 | 100% |
+| case_6 | 多模态训练（vision + text + fusion） | 15 | 17 | 88% |
 
-### `tools/`
+### 优化能力评分维度
 
-ToolRegistry 注册中心 + 所有可被 LLM 调用的工具。每个工具是纯函数 + ToolDef wrapper。
+| 维度 | 权重 | 含义 |
+|---|:---:|---|
+| Correctness | 40 | patch apply 成功 + smoke test 通过 |
+| Performance | 30 | timer delta < −5% 满分，< 0 半分 |
+| Judgment | 20 | 正确接受真 finding、拒绝假 finding（F1） |
+| Minimality | 10 | patch 行数在合理范围内 |
 
-| 工具组 | 工具数 | 只读 | 功能 |
-|--------|--------|------|------|
-| scanner | 7 | ✓ | 源码文件列举、全文搜索、按行读取、符号解析、调用者/被调用者分析、变体查找 |
-| nsys_sql | 7 | ✓ | SQLite profile 查询：kernels、sync、memcpy、nccl、overlap、gaps、launch |
-| sandbox | 8 | ✗ | Git worktree 隔离：create、exec、apply（含 hash 验证）、validate、measure、commit、revert、destroy |
-| memory | 2 | ✓ | 知识库搜索和读取（子 agent 只读，写入由 parent 控制） |
-| classify | 1 | ✓ | 确定性 C1-C7 瓶颈分类 |
+---
 
-ToolPolicy 按阶段控制：ANALYZE 只能调用只读工具，OPTIMIZE 可以使用 sandbox 工具（在隔离 worktree 中操作）。
+## 依赖层级
 
-### `wiki/`
-
-知识管理系统。Markdown 文件是 source of truth，SQLite 是 rebuildable index。
-
-- `store.py` — WikiRepository：CRUD、YAML frontmatter、命名空间隔离、signal page
-- `index.py` — FTSIndex：全文搜索（当前 grep fallback，计划升级 SQLite FTS5）
-- `brief.py` — `build_memory_brief()`：生成 ≤200 行的压缩上下文注入 LLM prompt
-- `ledger.py` — RunLedger：SQLite 记录 runs、findings、patches、benchmark、candidates
-- `promotion.py` — CandidateValidator：5 条门控规则，benchmark scope 不能 promote 到 global
-- `skills.py` — SkillRegistry：发现和加载 `.sysight/skills/<name>/SKILL.md`
-
-写入权限由 parent 进程控制。子 agent 只能通过 `memory_search` / `memory_read` 读取。
-
-### `agent/`
-
-LLM 抽象层。通过 YAML config 驱动，不需要改代码切换 provider。
-
-- `provider.py` — LLMProvider 协议 + LLMConfig/LLMRequest/LLMResponse + `create_provider()` factory
-- `providers/openai_compatible.py` — 一个类处理 OpenAI / DeepSeek / Groq / vLLM 等所有 OpenAI 兼容 API
-- `providers/anthropic.py` — Anthropic Messages API
-- `providers/replay.py` — 测试用 replay backend
-- `loop.py` — AgentLoop：多轮 tool-calling 循环，stop conditions（max_turns, max_time, repeated_calls）
-- `prompts/loader.py` — PromptLoader：按 task_type 组装 fragment，benchmark hints 默认不加载
-- `prompts/fragments/` — 7 个 .md fragment（common_role, evidence_sop, optimizer_sop, output_schema, safety, benchmark_hints）
-- `config_loader.py` — 零依赖 YAML 解析 + `$ENV_VAR` 引用
-
-### `pipeline/`
-
-阶段编排。每个阶段可独立运行，通过 PipelineRunner 串联。
-
-- `warmup.py` — `run_warmup()`：scanner 探索 repo，产出 RepoSetup，写入 workspace wiki
-- `analyze.py` — `run_analyze()`：classify → AgentLoop → 验证 → wiki + ledger
-- `optimize.py` — `run_optimize()`：逐 finding → LLM → sandbox → keep/revert → ledger
-- `learn.py` — `run_learn()`：ledger 记账 + benchmark 评分 + 可选 LLM worklog/经验提取
-- `runner.py` — `PipelineRunner`：WARMUP → ANALYZE → OPTIMIZE → LEARN
-
-### `cli/`
-
-- `cli.py` — 统一 CLI：`sysight warmup/analyze/optimize/learn/full/tool`
-- `mcp_server.py` — MCP 适配器（只读工具 + memory read）
-
-### `utils/`
-
-- `security.py` — 路径包含检查、安全校验
-- `repo.py` — git helpers（worktree 创建/清理、commit hash）
-- `render.py` — 终端报告渲染
-- `text.py` — CJK 文本格式化
-
-## 快速开始
-
-### 安装
-
-```bash
-pip install -e .
+```
+types/        ← 零依赖
+  ↑
+tools/        ← 依赖 types/
+  ↑
+wiki/         ← 依赖 types/ + tools/memory
+  ↑
+agent/        ← 依赖 types/ + tools/
+  ↑
+pipeline/     ← 依赖以上全部
+  ↑
+cli/          ← 依赖 pipeline/
 ```
 
-### 配置
+内层不 import 外层，跨层依赖通过 Protocol 注入。
 
-编辑 `.sysight/config.yaml`：
-
-```yaml
-analyze:
-  provider: "openai"
-  model: "deepseek-v4-pro"
-  api_key: "sk-..."
-  base_url: "https://api.deepseek.com/v1"
-  temperature: 0
-
-optimize:
-  provider: "anthropic"
-  model: "claude-sonnet-4-6"
-  api_key: "sk-ant-..."
-```
-
-`api_key` 支持 `$ENV_VAR` 引用。不填 `max_tokens` 则不设限。
-
-### 使用
-
-```bash
-# 探索 repo
-sysight warmup ./my-model
-
-# 分析 profile
-sysight analyze trace.sqlite --repo ./my-model
-
-# 单工具调用
-sysight tool scanner_files .
-sysight tool nsys_sql_kernels trace.sqlite --limit 10
-```
+---
 
 ## 测试
 
 ```bash
-# 非 HTTP 测试（<0.2s）
-python3 -m unittest discover -s test/test_types -v
-python3 -m unittest discover -s test/test_tools -v
-python3 -m unittest discover -s test/test_wiki -v
+# 单元测试（无网络，< 1s）
+pytest test/test_types test/test_tools test/test_wiki -q
 
-# HTTP 集成测试（需要 .sysight/config.yaml 配好 API key）
-python3 -m unittest test.test_agent.test_agent_loop.TestAgentLoopIntegration -v
+# Pipeline + Agent 测试
+pytest test/test_pipeline test/test_agent -q
+
+# 全量
+pytest -q
+
+# HTTP 集成测试（需要在 .sysight/config.yaml 配置 API key）
+pytest test/test_agent/test_agent_loop.py::TestAgentLoopIntegration -v
 ```
 
-不包含 smoke test。测试要么验证真实计算逻辑，要么通过真实 HTTP 调用验证端到端行为。
+---
 
-## 依赖方向
+## 文档
 
-```
-types/          ← 零依赖
-  ↑
-tools/          ← 只依赖 types/
-  ↑
-wiki/           ← 依赖 types/ + tools/memory
-  ↑
-agent/          ← 依赖 types/ + tools/
-  ↑
-pipeline/       ← 依赖以上全部
-  ↑
-cli/            ← 依赖 pipeline/
-```
+| 文件 | 内容 |
+|---|---|
+| [docs/01-overview.md](docs/01-overview.md) | 项目总览与文档导航 |
+| [docs/02-pipeline.md](docs/02-pipeline.md) | Pipeline 设计：5 阶段编排与数据流 |
+| [docs/03-analyzer.md](docs/03-analyzer.md) | Analyzer：profile 引擎 + scanner |
+| [docs/04-optimizer.md](docs/04-optimizer.md) | Optimizer：代码生成、沙箱验证与 patch 应用 |
+| [docs/05-agent-context.md](docs/05-agent-context.md) | Agent 层：AgentLoop 与渐进式上下文压缩 |
+| [docs/06-wiki-memory.md](docs/06-wiki-memory.md) | Wiki Memory：存储设计与 LEARN 阶段 |
+| [docs/07-benchmark.md](docs/07-benchmark.md) | 基准测试：分析 bench + 优化 bench |
+| [docs/summary.md](docs/summary.md) | Demo 实录：nanoGPT 两轮 pipeline 完整记录 |
 
-内层不 import 外层。跨层依赖通过 Protocol 注入。
+---
 
-## 相关项目
+## 致谢
 
-- [nsys-ai](https://github.com/GindaChen/nsys-ai) — Junda Chen 的 Nsight Systems agent 分析工具，本项目的重要灵感来源
-- [nsys-bench](https://github.com/szfmsmdx/nsys-bench) — benchmark 用例和 ground truth
-- [llmwiki](https://github.com/kennyatgithub/llmwiki) — LLM-maintained knowledge workspace，FTS5 + 引用图的参考来源
-- [repositories-wiki](https://github.com/szfmsmdx/repositories-wiki) — 从源码自动生成 wiki，update-wiki skill 的参考来源
+- [nsys-ai](https://github.com/GindaChen/nsys-ai) — nsys SQLite 分析思路，本项目的重要灵感来源
+- [MiniCode](https://github.com/LiuMengxuan04/MiniCode) — agentic coding 框架参考
+- [nsys-bench](https://github.com/szfmsmdx/nsys-bench) — benchmark 用例与 ground truth
+
+---
+
+## License
+
+MIT
